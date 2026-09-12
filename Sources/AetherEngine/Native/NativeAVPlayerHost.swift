@@ -595,9 +595,12 @@ final class NativeAVPlayerHost {
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.duration=\(item.duration.seconds.isFinite ? String(format: "%.2f", item.duration.seconds) : "indef")", category: .engine)
                 EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.appliesPerFrameHDRDisplayMetadata=\(item.appliesPerFrameHDRDisplayMetadata)", category: .engine)
             } else if item.status == .readyToPlay {
-                // HLS: asset.tracks is empty; dump item.tracks for audio codec/layout. Route not warned yet: stereo-idle sinks (Continuous Audio off) read ch=2 until first .playing (issue #24).
-                Task { @MainActor in
-                    await Self.dumpPlayerItemTracks(item, sid: sid)
+                // Route inspection is cheap and thread-safe. Defer the async
+                // item-track format-description dump until playback has
+                // started: requesting the still-forming HLS audio track here
+                // can occupy the main actor for several seconds and postpone
+                // both the first visible frame and the ready-state handler.
+                Task.detached(priority: .utility) {
                     Self.dumpAudioRoute(sid: sid, phase: "readyToPlay, route may still be negotiating")
                 }
             }
@@ -681,6 +684,7 @@ final class NativeAVPlayerHost {
                     Task { @MainActor [weak self] in
                         try? await Task.sleep(nanoseconds: 2_500_000_000)
                         guard let self = self, let item = self.playerItem else { return }
+                        await Self.dumpPlayerItemTracks(item, sid: sid, phase: "after playback started")
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
                         await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
                         await Self.warnIfEAC3SurroundOnStereoRoute(
@@ -2029,11 +2033,13 @@ final class NativeAVPlayerHost {
         }
     }
 
-    /// Dump item.tracks at readyToPlay (HLS: asset.tracks is empty; item.tracks has the resolved list after playlist+init.mp4 parse). Channel layout tag diagnoses multichannel-routing path.
-    private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int) async {
+    /// Dump item.tracks after playback starts (HLS: asset.tracks is empty;
+    /// item.tracks has the resolved list after playlist+init.mp4 parse).
+    /// Channel layout tag diagnoses the multichannel-routing path.
+    private static func dumpPlayerItemTracks(_ item: AVPlayerItem, sid: Int, phase: String) async {
         let tracks = item.tracks
         if tracks.isEmpty {
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks empty (readyToPlay)", category: .engine)
+            EngineLog.emit("[NativeAVPlayerHost] #\(sid) item.tracks empty (\(phase))", category: .engine)
             return
         }
         for itemTrack in tracks {
@@ -2060,7 +2066,7 @@ final class NativeAVPlayerHost {
             }
             EngineLog.emit(
                 "[NativeAVPlayerHost] #\(sid) item.\(trackLabel) codec='\(fourcc)' "
-                + "enabled=\(itemTrack.isEnabled)\(extra) (readyToPlay)",
+                + "enabled=\(itemTrack.isEnabled)\(extra) (\(phase))",
                 category: .engine
             )
         }
