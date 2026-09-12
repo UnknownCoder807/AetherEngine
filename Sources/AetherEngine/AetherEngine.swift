@@ -4398,7 +4398,10 @@ public final class AetherEngine: ObservableObject {
         var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
             codecID: detectedCodecID,
             fieldOrder: detectedFieldOrder,
-            av1Available: VTCapabilityProbe.av1Available,
+            // The VideoToolbox AV1 probe can take several seconds on Apple TV.
+            // It has no bearing on H.264/HEVC routing, so preserve its lazy
+            // once-per-process behaviour until an AV1 stream actually needs it.
+            av1Available: detectedCodecID == AV_CODEC_ID_AV1 && VTCapabilityProbe.av1Available,
             spsIndicatesInterlaced: spsIndicatesInterlaced,
             stereo3DType: containerStereoType
         )
