@@ -4202,7 +4202,9 @@ final class SoftwarePlaybackHost {
             let lead = lastEnqueuedAudioPtsSec.isFinite
                 ? lastEnqueuedAudioPtsSec - aOut.currentTimeSeconds : 0
             pauseArmOpen = AudioLookaheadPolicy.pauseArmOpens(wasOpen: pauseArmOpen, lead: lead)
-            guard pauseArmOpen, isPlaying() || rebuffering else { return }
+            // Snappier: a post-seek hold starts before the pause arm opens.
+            // Keep checking its resume condition while the source catches up.
+            guard pauseArmOpen || rebuffering, isPlaying() || rebuffering else { return }
             switch AudioLookaheadPolicy.clockAction(
                 rebuffering: rebuffering,
                 lastFedAudioPTS: lastEnqueuedAudioPtsSec,
@@ -4295,6 +4297,24 @@ final class SoftwarePlaybackHost {
                     // The lead is zero again after a seek, so the latch has to earn itself back:
                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
                     pauseArmOpen = false
+                    // Snappier: the seek anchored the clock AT the target and started it, but the
+                    // demuxer lands at or before the target, on an index-less MPEG-TS (Xtream
+                    // catch-up) often 15-30 s before it. The clock then ran away from the data:
+                    // every decoded sample was already in its past (aLead -26 s, enq=+0), and the
+                    // picture stayed frozen until the source read had out-run real time by the
+                    // whole landing gap. Park the clock at the target instead and let the rebuffer
+                    // resume rule start it once audio holds its resume lead past the target. The
+                    // window above has closed, so seek() is done with the clock by now. A paused
+                    // landing stays paused (rate 0 already).
+                    if isPlaying(), clockArmed(), let aOut = audioOutput {
+                        rebuffering = true
+                        aOut.pause()
+                        EngineLog.emit(
+                            "[SWHost] post-seek hold: clock parked at "
+                            + "\(String(format: "%.3f", aOut.currentTimeSeconds))s until audio reaches it",
+                            category: .swPlayback
+                        )
+                    }
                 }
                 if backgroundAudioOnly() {
                     // A full parked queue cannot drain off-screen. Retire it before any read gate,
