@@ -352,6 +352,13 @@ final class SoftwarePlaybackHost {
         set { feedLock.lock(); _clockSessionZero = newValue; feedLock.unlock() }
     }
 
+    /// Snappier: what the published VOD position is short of the source (raw clock) axis. Callers
+    /// that hold a published-axis target and need its source PTS (subtitle harvest anchors, the
+    /// engine's post-seek `sourceTime`) add this. 0 for live and for zero-based sources.
+    var sourceAxisOffset: Double {
+        isLive ? 0 : max(0, clockSessionZero)
+    }
+
     /// Bumped at every seek; demux loop re-checks around blocking readPacket to discard stale pre-seek packets that would clear the skip threshold (visible fast-forward burst).
     nonisolated(unsafe) private var _seekGeneration: UInt64 = 0
     nonisolated private var seekGeneration: UInt64 {
@@ -1216,6 +1223,26 @@ final class SoftwarePlaybackHost {
     func seek(to seconds: Double) async -> Demuxer.RepositionOutcome {
         guard !stopRequested else { return .superseded }
         guard let dem = demuxer else { return .stalled }
+        // Snappier: `seconds` is on the PUBLISHED axis, which for VOD is the raw clock minus
+        // `clockSessionZero` (#107). A mid-stream-cut source (an Xtream `/timeshift/` catch-up TS
+        // whose first PTS is hours in) re-anchors with a non-zero session zero, so the target has
+        // to be mapped back onto the source axis before it reaches the packet cache, the demuxer,
+        // the skip thresholds and the synchronizer. Without this a scrub to 1,570 s on a source
+        // starting at 11,448 s sought the demuxer to before the file's first packet (it restarted
+        // at byte 36), anchored the clock at 1,570 s, and every decoded frame sat ~9,880 s in the
+        // future: audio silent, picture frozen, while the seek reported `landed`. Live keeps its
+        // own axis (`sessionStartPts`, applied in `seekLiveDVR`). 0 for zero-based sources, so
+        // those are unchanged.
+        let sessionZero = sourceAxisOffset
+        let sourceSeconds = seconds + sessionZero
+        if sessionZero > 0 {
+            EngineLog.emit(
+                "[SWHost] seek session=\(String(format: "%.3f", seconds))s "
+                + "-> source=\(String(format: "%.3f", sourceSeconds))s "
+                + "(sessionZero=\(String(format: "%.3f", sessionZero))s)",
+                category: .swPlayback
+            )
+        }
         // Stop loop + bump generation to invalidate in-flight packets. Captured right after, so the
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
@@ -1224,7 +1251,7 @@ final class SoftwarePlaybackHost {
         didParkClockAtEnd = false
         didEmitParkedDiag = false
         let packetSource = vodPacketReadAhead
-        let cacheGeneration = packetSource?.beginSeek(to: seconds)
+        let cacheGeneration = packetSource?.beginSeek(to: sourceSeconds)
         // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
         // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
         let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
@@ -1261,14 +1288,14 @@ final class SoftwarePlaybackHost {
         // packet read before the seek used to meet a renderer with no threshold standing and was
         // taken. It then owns the newest handed-over timestamp, and the first real post-seek frame
         // reports the entire seek distance as one inter-frame interval.
-        let targetTime = CMTime(seconds: seconds, preferredTimescale: 90000)
+        let targetTime = CMTime(seconds: sourceSeconds, preferredTimescale: 90000)
         videoDecoder.skipUntilPTS = targetTime
         renderer.setSkipThreshold(targetTime)
 
         var cacheHit = false
         if let packetSource, let cacheGeneration {
             let preparation = await Task.detached(priority: .userInitiated) {
-                try packetSource.prepareSeek(cacheGeneration, to: seconds)
+                try packetSource.prepareSeek(cacheGeneration, to: sourceSeconds)
             }.result
             guard seekGeneration == generation, !stopRequested else { return .superseded }
             switch preparation {
@@ -1277,7 +1304,7 @@ final class SoftwarePlaybackHost {
                 EngineLog.emit(
                     "[SWHost] packet cache seek generation=\(generation) "
                     + "result=\(hit ? "hit" : "miss") "
-                    + "target_s=\(String(format: "%.3f", seconds)) "
+                    + "target_s=\(String(format: "%.3f", sourceSeconds)) "
                     + "resident_bytes=\(packetSource.snapshot.residentBytes)",
                     category: .swPlayback
                 )
@@ -1304,7 +1331,7 @@ final class SoftwarePlaybackHost {
             outcome = .landed
         } else {
             outcome = await dem.seekBounded(
-                to: seconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
+                to: sourceSeconds, timeout: Self.seekBudgetSeconds, on: seekQueue,
                 isSuperseded: { [weak self] in
                     self?.seekGeneration != generation || (self?.stopRequested ?? true)
                 })
@@ -1347,7 +1374,7 @@ final class SoftwarePlaybackHost {
         // The source stands at the target and the clock is anchored on it: everything the loop
         // reads from here belongs to this position. Closing the window releases the loop.
         noteSeekSettled(generation)
-        if let cacheGeneration { packetSource?.endSeek(cacheGeneration, sourceClock: seconds) }
+        if let cacheGeneration { packetSource?.endSeek(cacheGeneration, sourceClock: sourceSeconds) }
         return outcome
     }
 
