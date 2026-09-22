@@ -5519,7 +5519,10 @@ public final class AetherEngine: ObservableObject {
         nativeClockSeconds = clockTarget
         clock.currentTime = target
         // sourceTime + subtitle re-arm need true source PTS; map the display target back (0 off disc). AE#105.
+        // Snappier: a software VOD session whose clock re-anchored mid-stream publishes session time,
+        // so its source PTS is the target plus the host's session zero (0 everywhere else).
         let landedSourcePTS = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin)
+            + (softwareHost?.sourceAxisOffset ?? 0)
         // #123: only settle sourceTime onto the target when the landed frame is actually presented (see
         // applySeekFinalizeSourceTime); while buffering toward it the picture is frozen behind the target,
         // so hold sourceTime on the rendered frame and let the $renderedTime sink settle it when the frame
@@ -6478,7 +6481,11 @@ public final class AetherEngine: ObservableObject {
         // the title's content start; that base differs by backend (native re-times onto a 0-based playlist
         // shifted by playlistShiftSeconds; the software path's raw clock begins at the container start,
         // sourceStartSeconds). Add it so the seek lands on the chapter, not the base seconds early.
-        let base = (playbackBackend == .software) ? sourceStartSeconds : playlistShiftSeconds
+        // Snappier: a software host that re-anchored mid-stream already adds its session zero inside
+        // `seek(to:)`, so only the part of the start the published axis still carries is added here.
+        let base = (playbackBackend == .software)
+            ? max(0, sourceStartSeconds - (softwareHost?.sourceAxisOffset ?? 0))
+            : playlistShiftSeconds
         let target = chapter.startSeconds + base
         EngineLog.emit(
             "[AetherEngine] selectChapter: seeking to chapter \(id) @ title-relative "
