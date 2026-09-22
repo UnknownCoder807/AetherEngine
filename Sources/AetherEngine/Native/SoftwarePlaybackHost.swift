@@ -392,6 +392,13 @@ final class SoftwarePlaybackHost {
         set { feedLock.lock(); _clockSessionZero = newValue; feedLock.unlock() }
     }
 
+    /// Snappier: what the published VOD position is short of the source (raw clock) axis. Callers
+    /// that hold a published-axis target and need its source PTS (subtitle harvest anchors, the
+    /// engine's post-seek `sourceTime`) add this. 0 for live and for zero-based sources.
+    var sourceAxisOffset: Double {
+        isLive ? 0 : max(0, clockSessionZero)
+    }
+
     /// Bumped at every seek; demux loop re-checks around blocking readPacket to discard stale pre-seek packets that would clear the skip threshold (visible fast-forward burst).
     nonisolated(unsafe) private var _seekGeneration: UInt64 = 0
     nonisolated private var seekGeneration: UInt64 {
