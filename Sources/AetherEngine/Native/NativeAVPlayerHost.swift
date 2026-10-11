@@ -680,7 +680,7 @@ final class NativeAVPlayerHost {
                 // started: requesting the still-forming HLS audio track here
                 // can occupy the main actor for several seconds and postpone
                 // both the first visible frame and the ready-state handler.
-                Task.detached(priority: .utility) {
+                BlockingWork.detached(priority: .utility) {
                     Self.dumpAudioRoute(sid: sid, phase: "readyToPlay, route may still be negotiating")
                 }
             }
