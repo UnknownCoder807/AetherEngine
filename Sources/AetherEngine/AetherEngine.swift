@@ -6761,8 +6761,8 @@ public final class AetherEngine: ObservableObject {
         let landedDisplay = nativeOnly ? displaySeconds(forPlaylistSeconds: landedClock) : target
         nativeClockSeconds = landedClock
         clock.currentTime = landedDisplay
-        let landedSourcePTS = PresentationAxis.source(displayTime: landedDisplay, origin: sourcePresentationOrigin)
         // Snappier: software VOD publishes session time; restore its source-axis offset.
+        let landedSourcePTS = PresentationAxis.source(displayTime: landedDisplay, origin: sourcePresentationOrigin)
             + (softwareHost?.sourceAxisOffset ?? 0)
         // #123: only settle sourceTime onto the target when the landed frame is actually presented (see
         // applySeekFinalizeSourceTime); while buffering toward it the picture is frozen behind the target,
