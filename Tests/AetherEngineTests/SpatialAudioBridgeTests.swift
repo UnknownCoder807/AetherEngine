@@ -15,6 +15,7 @@ import AetherLibavutil
 /// behaves like the real one on exactly those points.
 @Suite("TrueHD Atmos spatial bridge", .timeLimit(.minutes(2)))
 struct SpatialAudioBridgeTests {
+    #if TrueHDObjectAudio || DTSXObjectAudio
 
     /// Stand-in object decoder: one pushed byte is one 40-frame access unit (TrueHD's 1/1200 s),
     /// the first `skipAfterReset` access units after a reset are discarded as a real decoder does
@@ -142,6 +143,9 @@ struct SpatialAudioBridgeTests {
         return out
     }
 
+    #endif
+
+    #if TrueHDObjectAudio
     @Test("only TrueHD that FFmpeg marks Atmos, at 48 kHz or not yet known, is rendered")
     func eligibility() {
         let on = ObjectAudioRendering.apac(.l714)
@@ -154,7 +158,28 @@ struct SpatialAudioBridgeTests {
                 "E-AC-3 JOC is already Atmos and stream-copies")
         #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_TRUEHD, profile: 30, sampleRate: 48_000) == nil)
     }
+    #endif
 
+    #if DTSXObjectAudio
+    @Test("every 48 kHz DTS-HD MA track is a DTS:X candidate, whatever FFmpeg's label; lossy DTS is not")
+    func dtsEligibility() {
+        let on = ObjectAudioRendering.apac(.l714)
+        // FFmpeg names only two of DTS:X's markers, so a plain DTS-HD MA label can still be DTS:X;
+        // LibDTSX decides on the track's first frames.
+        for profile in [AV_PROFILE_DTS_HD_MA, AV_PROFILE_DTS_HD_MA_X, AV_PROFILE_DTS_HD_MA_X_IMAX] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
+            #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
+        }
+        for profile in [AV_PROFILE_DTS, AV_PROFILE_DTS_ES, AV_PROFILE_DTS_HD_HRA, AV_PROFILE_DTS_EXPRESS] {
+            #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == nil)
+        }
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 96_000) == nil)
+        #expect(HLSVideoEngine.spatialRenderingLayout(rendering: .off, codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X, sampleRate: 48_000) == nil)
+        #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_TRUEHD, profile: 30) == .trueHDAtmos)
+    }
+    #endif
+
+    #if TrueHDObjectAudio || DTSXObjectAudio
     @Test("the first packet sits at the source position of the first decodable frame, and steps by 1024")
     func anchorsOnSource() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -250,6 +275,89 @@ struct SpatialAudioBridgeTests {
         #expect(emitted > 0, "the decoder found its sync and the bridge encoded")
     }
 
+    /// The encoder runs on its own queue, so a feed returns what earlier chunks encoded. Settled
+    /// before every cut, the split is the one a synchronous encode makes.
+    @Test("settled after every feed, the bridge returns a synchronous encode's packets at each point")
+    func settleRestoresTheSynchronousSplit() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let pipelined = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        let settledEachFeed = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        defer { pipelined.close(); settledEachFeed.close() }
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
+            packets.map { fp in
+                defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+                return (fp.pointee.pts, Data(bytes: fp.pointee.data, count: Int(fp.pointee.size)))
+            }
+        }
+        func feedOne(_ bridge: SpatialAudioBridge, ms: Int64) throws -> [(pts: Int64, data: Data)] {
+            let pkt = av_packet_alloc()!
+            defer { var p: UnsafeMutablePointer<AVPacket>? = pkt; av_packet_free(&p) }
+            _ = av_new_packet(pkt, 24)
+            pkt.pointee.pts = ms
+            pkt.pointee.dts = ms
+            return take(try bridge.feed(packet: pkt))
+        }
+        var a: [(pts: Int64, data: Data)] = [], b: [(pts: Int64, data: Data)] = []
+        for round in 0..<4 {
+            for i in 0..<25 {
+                let ms = Int64(round * 25 + i) * 20
+                a += try feedOne(pipelined, ms: ms)
+                b += try feedOne(settledEachFeed, ms: ms) + take(settledEachFeed.settle())
+            }
+            a += take(pipelined.settle())
+            #expect(a.map(\.pts) == b.map(\.pts), "after a cut both hold the same packets")
+        }
+        a += take(pipelined.flush())
+        b += take(settledEachFeed.flush())
+        #expect(!a.isEmpty)
+        #expect(a.map(\.pts) == b.map(\.pts))
+        #expect(a.map(\.data) == b.map(\.data))
+    }
+
+    /// Like `ClickDecoder`, but returns nothing after a reset until the bridge asks for what it
+    /// holds, as the TrueHD decoder does while it waits for the first object metadata.
+    final class HoldingDecoder: ObjectAudioDecoding {
+        private let inner = ClickDecoder(clickFrame: 30_000)
+        private var holding = true
+        private(set) var releases = 0
+
+        func push(_ bytes: UnsafeRawBufferPointer) throws { try inner.push(bytes) }
+        func nextBlock() throws -> ObjectAudioDecodedBlock? { holding ? nil : try inner.nextBlock() }
+        func reset() { inner.reset(); holding = true }
+        func releaseHeldBlocks() { releases += 1; holding = false }
+    }
+
+    /// A cut settles the bridge, and what the decoder holds plays before that cut, so the hold moves
+    /// no audio into the next segment.
+    @Test("a cut releases what the decoder holds, so it splits as a decoder without a hold does")
+    func settleReleasesHeldBlocks() throws {
+        guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
+        let holding = HoldingDecoder()
+        let held = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: holding)
+        let plain = try SpatialAudioBridge(
+            srcTimeBase: AVRational(num: 1, den: 1000), layout: .l714, decoder: ClickDecoder(clickFrame: 30_000))
+        defer { held.close(); plain.close() }
+        func take(_ packets: [UnsafeMutablePointer<AVPacket>]) -> [(pts: Int64, data: Data)] {
+            packets.map { fp in
+                defer { var p: UnsafeMutablePointer<AVPacket>? = fp; trackedPacketFree(&p) }
+                return (fp.pointee.pts, Data(bytes: fp.pointee.data, count: Int(fp.pointee.size)))
+            }
+        }
+        var a = try feed(held, startMs: 0, count: 25).map(\.pts)
+        var b = try feed(plain, startMs: 0, count: 25).map(\.pts)
+        a += take(held.settle()).map(\.pts)
+        b += take(plain.settle()).map(\.pts)
+        #expect(!b.isEmpty)
+        #expect(a == b, "after the cut both carry the same packets")
+        #expect(holding.releases == 1)
+        a += try feed(held, startMs: 500, count: 25).map(\.pts) + take(held.flush()).map(\.pts)
+        b += try feed(plain, startMs: 500, count: 25).map(\.pts) + take(plain.flush()).map(\.pts)
+        #expect(a == b)
+    }
+
     @Test("a producer restart re-anchors on the new position")
     func restartReanchors() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -342,6 +450,23 @@ struct SpatialAudioBridgeTests {
         return (try #require(initBytes), segment, sessionDir)
     }
 
+    #endif
+    @Test("the Atmos output activator's bundled stream reads as E-AC-3 with the Atmos extension")
+    @MainActor
+    func silentAtmosStreamIsAtmos() async throws {
+        let asset = AVURLAsset(url: AtmosOutputActivator.silentAtmosStream)
+        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        let format = try #require(try await track.load(.formatDescriptions).first)
+        // AVFoundation lists an E-AC-3 track whose dec3 box states the Atmos extension as 'ec+3'
+        // layers (objects first) over its 'ec-3' core.
+        var size = 0
+        let list = try #require(CMAudioFormatDescriptionGetFormatList(format, sizeOut: &size))
+        #expect(size >= MemoryLayout<AudioFormatListItem>.size)
+        #expect(list[0].mASBD.mFormatID == 0x6563_2B33)
+        #expect(CMFormatDescriptionGetMediaSubType(format) == kAudioFormatEnhancedAC3)
+    }
+
+    #if TrueHDObjectAudio || DTSXObjectAudio
     @Test("movenc muxes the stand-in and the init segment carries the real apac entry")
     func muxedInitCarriesAPAC() throws {
         guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return }
@@ -387,7 +512,7 @@ struct SpatialAudioBridgeTests {
         try (muxed.initBytes + Data(contentsOf: muxed.segment)).write(to: file)
 
         let asset = AVURLAsset(url: file)
-        let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
+        nonisolated(unsafe) let track = try #require(try await asset.loadTracks(withMediaType: .audio).first)
         // copyNextSampleBuffer blocks until AVFoundation has decoded the next buffer. Called from the
         // cooperative pool it held one of a three-core CI runner's threads while that decode waited
         // for one, and the whole test process stalled. A thread of its own cannot starve the pool.
@@ -430,8 +555,10 @@ struct SpatialAudioBridgeTests {
         }
         return nil
     }
+    #endif
 }
 
+#if TrueHDObjectAudio || DTSXObjectAudio
 /// The bed level line is the engine's half of a missing-heights report: it says which channels of the
 /// rendered bed carried sound in what AVPlayer was handed, so a silent height here and a silent height
 /// at the receiver are told apart.
@@ -676,3 +803,4 @@ extension SpatialAudioBridgeTests {
         #expect(bridge.servedChannelCount == layout.channelCount)
     }
 }
+#endif

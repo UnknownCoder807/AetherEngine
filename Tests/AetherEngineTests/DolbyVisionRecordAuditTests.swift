@@ -101,6 +101,14 @@ struct DolbyVisionRecordAuditTests {
         #expect(DolbyVisionRecordAudit.rpuProfile(pkt) == nil)
     }
 
+    @Test("an RPU the guard rejects is never handed to libdovi, which would abort the process")
+    func rpuThatWouldAbortLibdoviSaysNothing() {
+        let rpu = DoviRpuGuardTests.craft(linearOnComponent: 1)
+        let pkt = Self.avccPacket([Self.hevcNAL(type: 1, payload: [0xAA]), rpu])
+        defer { Self.free(pkt) }
+        #expect(DolbyVisionRecordAudit.rpuProfile(pkt) == nil)
+    }
+
     // MARK: - When the RPU is worth reading
 
     @Test("a Profile 5 record over a BT.2020 YCbCr PQ VUI is worth auditing")
@@ -252,14 +260,14 @@ struct DolbyVisionRecordAuditTests {
         #expect(r.dvVariant == .profile7)
     }
 
-    @Test("the same correction on a display without Dolby Vision plays the HDR10 base")
+    @Test("the same correction on a display without Dolby Vision is converted and served as 8.1 too")
     func relabelledSevenOnNonDVDisplay() throws {
         let r = try Self.route(Self.relabelledProfile5(), dvDisplay: false, rpuProfile: 7)
         #expect(r.codecTagOverride == "hvc1")
         #expect(r.videoRange == .pq)
-        #expect(r.supplementalCodecs == nil)
-        #expect(r.doviConfig == .strip)
-        #expect(r.convertP7ToProfile81 == false)
+        #expect(r.supplementalCodecs == "dvh1.08.06/db1p")
+        #expect(r.doviConfig == .rewriteToProfile81)
+        #expect(r.convertP7ToProfile81)
     }
 
     @Test("without a verdict the record stands and the route does not move")

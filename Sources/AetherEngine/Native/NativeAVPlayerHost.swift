@@ -5,6 +5,9 @@ import Combine
 #if os(tvOS) || os(iOS)
 import MediaPlayer
 #endif
+#if os(iOS) || os(tvOS) || os(visionOS)
+import UIKit
+#endif
 
 /// NativeAVPlayerHost: AVPlayer + AVPlayerLayer wrapper for the HLS-fMP4 loopback path.
 /// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
@@ -44,6 +47,9 @@ final class NativeAVPlayerHost {
     /// AE#495: what the AE#495 relay knows about the origin's certificate, when the item this host
     /// plays is served by one. Set by the engine at mount, read only while classifying a failure.
     var upstreamTrustRefusal: (@Sendable () -> Int?)?
+    /// AE#682: whether the session's server withheld its I-frame playlist from this item (see
+    /// `MasterFallbackDecision.isMasterRejection(_:mediaErrorCodes:iFramePlaylistWithheld:)`).
+    var iFramePlaylistWithheld: (@Sendable () -> Bool)?
     /// AE#561: what the session can still offer when AVPlayer refuses the media, answered by the
     /// engine because the host owns none of it. Set at mount, read only while classifying a failure.
     var softwarePathAvailability: (@Sendable () -> SoftwarePathEscalation.Availability?)?
@@ -254,6 +260,27 @@ final class NativeAVPlayerHost {
     /// Applied immediately and replayed onto fresh items across internal reloads so Now Playing title/artwork survives audio-switch/background-reopen seams.
     private var pendingExternalMetadata: [AVMetadataItem] = []
     private var timeObserver: Any?
+    private var videoFrameTask: Task<Void, Never>?
+    private var diagnosticVideoOutput: AVPlayerItemVideoOutput?
+    private var videoFrameProgress = VideoFrameProgress()
+    private var videoFrameSampleAt: Double?
+    private var videoFrameSummaryAt: Double?
+    private var videoPresentation = VideoPresentationProgress()
+    private var hasPresentedVideo = false
+    private var loadedVideoRanges: [(Double, Double)] = []
+    private var loadedVideoObservation: NSKeyValueObservation?
+    private var videoHealthSummaryAt: Double?
+    var onVideoPresentationRecovery: ((VideoPresentationProgress.Action, Double) -> Void)?
+    var pictureInPictureActive = false {
+        didSet {
+            // Detach BEFORE AVKit takes the layer, not on the first background polling tick.
+            if pictureInPictureActive, let output = diagnosticVideoOutput {
+                playerItem?.remove(output)
+                diagnosticVideoOutput = nil
+                videoFrameProgress.reset()
+            }
+        }
+    }
     private var statusObservation: NSKeyValueObservation?
     /// One-shot guard; route capability check runs after first .playing, not readyToPlay -- early sampling false-positived the downmix warning on stereo-idle sinks (issue #24).
     private var didSampleSettledRoute = false
@@ -425,6 +452,9 @@ final class NativeAVPlayerHost {
         /// then tunnels it through a 2-channel MAT carrier, so the route's channel count is not a
         /// statement about the audio and the surround-downmix warning below must not read it as one.
         var audioIsAtmosStreamCopy: Bool = false
+        /// Preserve opt-in decoded-output sampling across same-session playlist/item swaps.
+        var nativeVideoFrameDiagnostics: Bool = false
+        var nativeVideoFrameRecovery: Bool = false
         /// Read the item's audio tracks back into `detectedAudioTracks`. Only the remote-HLS bypass needs
         /// them; the loopback's probe already listed its audio, and the reads are XPC round trips.
         var readsBackAudioTracks: Bool = false
@@ -532,6 +562,7 @@ final class NativeAVPlayerHost {
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
                 self.isVideoReadyForDisplay = ready
+                if ready { self.hasPresentedVideo = true }
             }
         }
 
@@ -605,6 +636,18 @@ final class NativeAVPlayerHost {
                 guard let self, self.sessionID == sid else { return }
                 self.seekableEnd = end
                 self.seekableStart = start
+            }
+        }
+
+        // Observe on the item's queue; do not poll a potentially wedged media server on main.
+        loadedVideoObservation = item.observe(\.loadedTimeRanges, options: [.initial, .new]) { [weak self] item, change in
+            let ranges = (change.newValue ?? item.loadedTimeRanges).map { value in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+            Task { @MainActor in
+                guard let self, self.sessionID == sid else { return }
+                self.loadedVideoRanges = ranges
             }
         }
 
@@ -861,10 +904,14 @@ final class NativeAVPlayerHost {
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
                 guard !self.seekInFlight else { return }
                 self.currentTime = value
+                self.observeVideoPresentation(clock: value)
             }
         }
 
         avPlayer.replaceCurrentItem(with: item)
+        if contract.nativeVideoFrameDiagnostics || contract.nativeVideoFrameRecovery {
+            startVideoFrameDiagnostics(item: item, session: sid)
+        }
         // Fold cached counters without a native read. The final reconciliation is requested only
         // after detach, and never holds up the handover.
         if let outgoingDiagnostics {
@@ -1034,7 +1081,11 @@ final class NativeAVPlayerHost {
                 remoteHLSOriginRefused = true
                 return
             }
-            if let code, MasterFallbackDecision.isMasterRejectionCode(code) {
+            if let error = item.error as NSError?, MasterFallbackDecision.isMasterRejection(error,
+                mediaErrorCodes: item.errorLog()?.events.map(\.errorStatusCode) ?? [],
+                iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false) {
+                let code = MasterFallbackDecision.rejectionCode(for: error,
+                    iFramePlaylistWithheld: iFramePlaylistWithheld?() ?? false)
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
@@ -2192,7 +2243,138 @@ final class NativeAVPlayerHost {
         retiredItemDroppedFrames = 0
     }
 
+    private func startVideoFrameDiagnostics(item: AVPlayerItem, session: Int) {
+        videoFrameTask = Task { [weak self, weak item] in
+            while !Task.isCancelled {
+                guard let item, self?.sampleDiagnosticVideo(item: item, session: session) == true else { return }
+                do { try await Task.sleep(for: .milliseconds(50)) }
+                catch { return }
+            }
+        }
+    }
+
+    private func observeVideoPresentation(clock: Double) {
+        // Both halves are opt-in: an unready layer after an in-place swap can be an audio-first
+        // join waiting for its IDR, which no host asked the engine to repair or to log.
+        guard sessionContract.nativeVideoFrameRecovery || sessionContract.nativeVideoFrameDiagnostics else { return }
+        var foreground = true
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        foreground = UIApplication.shared.applicationState == .active
+        #endif
+        var eligible = foreground && !pictureInPictureActive && hasPresentedVideo
+            && playerLayer.superlayer != nil && !playerLayer.isHidden && playerLayer.opacity > 0
+            && !playerLayer.bounds.isEmpty && isReady && failure == nil && playIntent
+            && !seekInFlight && !mountSeekPending && avPlayer.timeControlStatus == .playing
+        #if !os(visionOS)
+        eligible = eligible && !avPlayer.isExternalPlaybackActive
+        #endif
+        let ahead = Self.contiguousBufferedEnd(ranges: loadedVideoRanges, now: clock) - clock
+        eligible = eligible && ahead >= 1
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let duration = detectedVideoFrameRate.flatMap { $0 > 0 ? 1 / $0 : nil }
+        let age = videoFrameProgress.age(at: now)
+        // An output which has never yielded a frame is not evidence of decoder failure.
+        let frozenOutput = videoFrameProgress.samples >= 3
+            && (age ?? 0) >= Swift.max(0.35, 3 * (duration ?? 0))
+        // Diagnostics alone remain observational. Ready means the FIRST frame was ready,
+        // so only the separately opted-in recovery policy can act on stalled decoded output.
+        let stalled = sessionContract.nativeVideoFrameRecovery
+            && videoFrameProgress.isStalled(at: now, lastSampleAt: videoFrameSampleAt, frameDuration: duration)
+        let missing = !isVideoReadyForDisplay || stalled
+        let healthy = !sessionContract.nativeVideoFrameRecovery
+            || (videoFrameProgress.samples >= 3 && (age ?? .infinity) < Swift.max(0.35, 3 * (duration ?? 0)))
+        let previousAttempts = videoPresentation.attempts
+        let action = videoPresentation.observe(clock: clock, now: now, eligible: eligible,
+            missingVideo: missing, frameDuration: duration, hasHealthyVideo: healthy)
+        let recovered = previousAttempts > 0 && videoPresentation.attempts == 0
+        let summarize = hasPresentedVideo && playIntent && (missing || frozenOutput)
+            && now - (videoHealthSummaryAt ?? -.infinity) >= 5
+        if action != nil || recovered || summarize {
+            videoHealthSummaryAt = now
+            let phase = action?.rawValue ?? (recovered ? "resumed" : "sample")
+            let reason = !isVideoReadyForDisplay ? "layer_unready" : (frozenOutput || stalled ? "output_stalled" : "none")
+            EngineLog.emit("[NativeVideoHealth] action=\(phase) sid=\(sessionID) clock=\(String(format: "%.3f", clock)) buffer=\(String(format: "%.3f", ahead)) layerReady=\(isVideoReadyForDisplay) frameAge=\(String(format: "%.3f", age ?? -1)) samples=\(videoFrameProgress.samples) attempt=\(videoPresentation.attempts) pip=\(pictureInPictureActive) foreground=\(foreground) eligible=\(eligible) reason=\(reason) repairEnabled=\(sessionContract.nativeVideoFrameRecovery)", category: .engine)
+        }
+        if let action, sessionContract.nativeVideoFrameRecovery {
+            if stalled { videoFrameProgress.beginRecovery() }
+            onVideoPresentationRecovery?(action, clock)
+        }
+    }
+
+    private func sampleDiagnosticVideo(item: AVPlayerItem, session: Int) -> Bool {
+        guard sessionID == session, playerItem === item, avPlayer.currentItem === item else { return false }
+        var foreground = true
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        foreground = UIApplication.shared.applicationState == .active
+        #endif
+        var eligible = foreground && !pictureInPictureActive && detectedVideoFormat == .sdr && isReady
+            && !seekInFlight && !mountSeekPending
+        #if !os(visionOS)
+        eligible = eligible && !avPlayer.isExternalPlaybackActive
+        #endif
+        let mayContinueRepair = eligible && playIntent
+        eligible = eligible && avPlayer.timeControlStatus == .playing && avPlayer.rate > 0
+        guard eligible else {
+            videoFrameProgress.reset(preservingRecovery: mayContinueRepair)
+            videoFrameSampleAt = nil
+            videoFrameSummaryAt = nil
+            // Do not keep an extra video consumer attached across HDR/external/background modes.
+            if let output = diagnosticVideoOutput { item.remove(output); diagnosticVideoOutput = nil }
+            return true
+        }
+        if diagnosticVideoOutput == nil {
+            guard isVideoReadyForDisplay else { return true }
+            let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+                kCVPixelBufferIOSurfacePropertiesKey as String: [String: String]()
+            ])
+            output.suppressesPlayerRendering = false
+            item.add(output)
+            diagnosticVideoOutput = output
+            EngineLog.emit("[NativeVideoFrames] event=attached sid=\(session) kind=decoded_output", category: .engine)
+        }
+        guard let output = diagnosticVideoOutput else { return true }
+        let itemTime = output.itemTime(forHostTime: CACurrentMediaTime())
+        var displayTime = CMTime.invalid
+        var frame: Double?
+        if itemTime.isNumeric, output.hasNewPixelBuffer(forItemTime: itemTime),
+           output.copyPixelBuffer(forItemTime: itemTime, itemTimeForDisplay: &displayTime) != nil,
+           displayTime.isNumeric { frame = displayTime.seconds }
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        if let previous = videoFrameSampleAt, now - previous > 0.25 {
+            EngineLog.emit("[NativeVideoFrames] event=observer_delay sid=\(session) age=\(String(format: "%.3f", now - previous)) kind=sampling_delay", category: .engine)
+            videoFrameProgress.reset()
+        }
+        videoFrameSampleAt = now
+        let duration = detectedVideoFrameRate.flatMap { $0 > 0 ? 1 / $0 : nil }
+        let event = videoFrameProgress.observe(frame: frame, clock: currentTime, now: now,
+                                                eligible: eligible, frameDuration: duration)
+        if let event {
+            let phase: String, age: Double, advance: Double
+            switch event {
+            case .began(let a, let c): phase = "gap"; age = a; advance = c
+            case .ended(let a): phase = "resumed"; age = a; advance = 0
+            }
+            EngineLog.emit("[NativeVideoFrames] event=\(phase) sid=\(session) clock=\(String(format: "%.3f", currentTime)) frame=\(String(format: "%.3f", videoFrameProgress.frameTime ?? 0)) age=\(String(format: "%.3f", age)) clockAdvance=\(String(format: "%.3f", advance)) samples=\(videoFrameProgress.samples) kind=decoded_output", category: .engine)
+        }
+        if videoFrameSummaryAt == nil { videoFrameSummaryAt = now }
+        if now - (videoFrameSummaryAt ?? now) >= 5 {
+            videoFrameSummaryAt = now
+            if let frame = videoFrameProgress.frameTime, let age = videoFrameProgress.age(at: now) {
+                EngineLog.emit("[NativeVideoFrames] event=sample sid=\(session) clock=\(String(format: "%.3f", currentTime)) frame=\(String(format: "%.3f", frame)) age=\(String(format: "%.3f", age)) clockAdvance=0.000 samples=\(videoFrameProgress.samples) kind=decoded_output", category: .engine)
+            } else {
+                EngineLog.emit("[NativeVideoFrames] event=unavailable sid=\(session) kind=decoded_output", category: .engine)
+            }
+        }
+        return true
+    }
+
     private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        videoFrameTask?.cancel(); videoFrameTask = nil
+        if let output = diagnosticVideoOutput { playerItem?.remove(output) }
+        diagnosticVideoOutput = nil
+        videoFrameProgress.reset(preservingRecovery: inPlaceSwap)
+        videoFrameSampleAt = nil
+        videoFrameSummaryAt = nil
         // Invalidating KVO does not cancel callbacks already queued onto the main actor. Retire
         // their session now so they drop on their `sessionID == sid` guard, including during the
         // handover gap where the old item is still attached and still producing them.
@@ -2214,6 +2396,11 @@ final class NativeAVPlayerHost {
         waitingReasonObservation = nil
         seekableObservation?.invalidate()
         seekableObservation = nil
+        loadedVideoObservation?.invalidate()
+        loadedVideoObservation = nil
+        loadedVideoRanges = []
+        videoHealthSummaryAt = nil
+        if !inPlaceSwap { videoPresentation = VideoPresentationProgress(); hasPresentedVideo = false }
         layerReadyObservation?.invalidate()
         layerReadyObservation = nil
         for obs in notificationObservers {
@@ -2299,7 +2486,7 @@ final class NativeAVPlayerHost {
         for track in tracks {
             let fourcc: String
             var extra = ""
-            if let cm = (try? await track.load(.formatDescriptions))?.first {
+            if let cm = await Self.formatDescriptions(of: track).first {
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
                 if track.mediaType == .audio {
                     extra = " " + audioFormatDescription(cm)
@@ -2326,7 +2513,7 @@ final class NativeAVPlayerHost {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             let fourcc: String
             var extra = ""
-            if let cm = (try? await assetTrack.load(.formatDescriptions))?.first {
+            if let cm = await Self.formatDescriptions(of: assetTrack).first {
                 fourcc = fourccString(CMFormatDescriptionGetMediaSubType(cm))
                 if assetTrack.mediaType == .audio {
                     extra = " " + audioFormatDescription(cm)
@@ -2590,7 +2777,7 @@ final class NativeAVPlayerHost {
         guard sid != 0, playerItem === item else { return }
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .video else { continue }
-            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            guard let cm = await Self.formatDescriptions(of: assetTrack).first else { continue }
             let rate = (try? await assetTrack.load(.nominalFrameRate)).map(Double.init)
             guard sessionID == sid, playerItem === item else { return }
             let subType = CMFormatDescriptionGetMediaSubType(cm)
@@ -2629,7 +2816,7 @@ final class NativeAVPlayerHost {
         var readings: [RemoteHLSStreamDescription.AudioReading] = []
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .audio else { continue }
-            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            guard let cm = await Self.formatDescriptions(of: assetTrack).first else { continue }
             let extendedTag = try? await assetTrack.load(.extendedLanguageTag)
             let languageCode = try? await assetTrack.load(.languageCode)
             let language = [extendedTag ?? nil, languageCode ?? nil, selectedOptionLanguage]
@@ -2653,7 +2840,7 @@ final class NativeAVPlayerHost {
             let mediaType = assetTrack?.mediaType.rawValue ?? "?"
             var fdesc: CMFormatDescription?
             if let assetTrack {
-                fdesc = (try? await assetTrack.load(.formatDescriptions))?.first
+                fdesc = await Self.formatDescriptions(of: assetTrack).first
             }
             let fourCC: String
             if let cm = fdesc {
@@ -2670,6 +2857,24 @@ final class NativeAVPlayerHost {
             }
             EngineLog.emit("[NativeAVPlayerHost] #\(sid)   item.tracks[\(idx)] mediaType=\(mediaType) fourCC=\(fourCC) enabled=\(itrack.isEnabled)", category: .engine)
         }
+    }
+
+    /// AE#735: the first audio format description a process builds loads the audio DSP stack through
+    /// dyld, measured at 3.8 s on an Apple TV 4K. Since the 26 SDKs `load` takes `isolation: = #isolation`
+    /// and runs on the caller's actor, every caller here is the main actor, so the first readyToPlay of a
+    /// launch froze the host's UI while the video kept playing. Off the main actor, on a thread that may block.
+    static func formatDescriptions(of track: AVAssetTrack) async -> [CMFormatDescription] {
+        let track = UncheckedAssetTrack(value: track)
+        return await loadOffMainActor { try await track.value.load(.formatDescriptions) } ?? []
+    }
+
+    /// The async `load` is AVFoundation's any-thread API; the SDK just does not mark the track Sendable.
+    private struct UncheckedAssetTrack: @unchecked Sendable { let value: AVAssetTrack }
+
+    nonisolated static func loadOffMainActor<Value: Sendable>(
+        _ load: @escaping @Sendable () async throws -> Value
+    ) async -> Value? {
+        await BlockingWork.detached(priority: .userInitiated) { try? await load() }.value
     }
 
     nonisolated private static func videoFormatDescription(_ fmt: CMFormatDescription) -> String {
@@ -2692,7 +2897,7 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
-    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded); Sonos Arc reports ch=2 LPCM even with eARC. Not a bridge bug -- a route capability mismatch.
+    /// Warn when the FLAC bridge produced N-channel LPCM but the route carries fewer channels. FLAC bridge decodes to LPCM (unlike stream-copy EAC3/AC3 which tunnels encoded). Not a bridge bug, a route capability mismatch. Silent with tvOS's Continuous Audio Connection on: every HDMI route then reports 32 channels whatever the sink takes (AE#794), so the route cannot show a mismatch.
     private static func warnIfFLACSurroundExceedsRoute(_ item: AVPlayerItem, sid: Int) async {
         #if os(iOS) || os(tvOS)
         var trackChannels: Int = 0
@@ -2700,7 +2905,7 @@ final class NativeAVPlayerHost {
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            guard let cm = await Self.formatDescriptions(of: assetTrack).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             if codec.lowercased() == "flac" {
                 isFLAC = true
@@ -2720,11 +2925,11 @@ final class NativeAVPlayerHost {
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) WARNING: FLAC bridge produced \(trackChannels)-channel "
             + "LPCM but active audio route carries only \(routeChannels) LPCM channels, tvOS "
-            + "will downmix. Common cause: soundbars (Sonos Arc, etc.) accept multichannel only "
-            + "via bitstream codecs (EAC3, Atmos, DD+), not LPCM. Stream-copy paths bypass this; "
-            + "TrueHD / DTS-HD MA sources route through the FLAC bridge and hit the LPCM limit. "
-            + "AVRs with 7.1 LPCM-over-HDMI support play these sources at full source channel "
-            + "count without downmix.",
+            + "will downmix. A 6-channel route is a 5.1 sink (an eARC soundbar such as a Sonos "
+            + "Arc takes 6-channel LPCM), which still gets lossless 5.1; a 2-channel route is a "
+            + "sink behind legacy ARC or one that renegotiated to stereo after idling, where "
+            + "audioBridgeMode .surroundCompat (EAC3 5.1) keeps the surround. An AVR with 7.1 "
+            + "LPCM over HDMI plays the full source channel count.",
             category: .session
         )
         #endif
@@ -2750,7 +2955,7 @@ final class NativeAVPlayerHost {
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack else { continue }
             guard assetTrack.mediaType == .audio else { continue }
-            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            guard let cm = await Self.formatDescriptions(of: assetTrack).first else { continue }
             let codec = fourccString(CMFormatDescriptionGetMediaSubType(cm))
             let lower = codec.lowercased()
             if lower == "ec-3" || lower == "ac-3" {
@@ -2761,13 +2966,16 @@ final class NativeAVPlayerHost {
                 break
             }
         }
-        guard !codecID.isEmpty, trackChannels > 2 else { return }
+        guard !codecID.isEmpty else { return }
         let session = AVAudioSession.sharedInstance()
         let routeChannels = max(
             session.currentRoute.outputs.first?.channels?.count ?? 0,
             session.outputNumberOfChannels
         )
-        guard routeChannels > 0, routeChannels < trackChannels else { return }
+        guard surroundDownmixSuspected(
+            trackChannels: trackChannels, routeChannels: routeChannels,
+            maximumRouteChannels: session.maximumOutputNumberOfChannels
+        ) else { return }
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) WARNING: \(codecID) \(trackChannels)-channel "
             + "track playing into a \(routeChannels)-channel route. tvOS will downmix to "
@@ -2782,6 +2990,16 @@ final class NativeAVPlayerHost {
             category: .session
         )
         #endif
+    }
+
+    /// PR #740 device round: after an APAC session tvOS keeps the HDMI output in the 2-channel MAT carrier it
+    /// negotiated, so a following 5.1 `ec-3` item reads `output=2` while the sink still advertises `max=32`
+    /// and plays the 5.1 intact. Only a sink whose advertised maximum is below the track is a downmix.
+    nonisolated static func surroundDownmixSuspected(
+        trackChannels: Int, routeChannels: Int, maximumRouteChannels: Int
+    ) -> Bool {
+        guard trackChannels > 2, routeChannels > 0, routeChannels < trackChannels else { return false }
+        return maximumRouteChannels < trackChannels
     }
 
     /// Dump audio route channel capability post-load (route renegotiates on asset load; pre-load poll is stale). outputNumberOfChannels is the actual LPCM limit; EAC3/Atmos bypasses it via bitstream tunnel.

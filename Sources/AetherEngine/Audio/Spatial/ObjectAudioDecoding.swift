@@ -1,3 +1,5 @@
+// Only with the TrueHDObjectAudio or DTSXObjectAudio trait (both off by default).
+#if TrueHDObjectAudio || DTSXObjectAudio
 import Foundation
 
 /// One block of decoded object audio, borrowed from the decoder: `planes` stay valid only until the
@@ -21,7 +23,7 @@ struct ObjectAudioDecodedBlock {
     var updates: [ObjectAudioMetadataUpdate]
 }
 
-/// A decoder that turns an object-audio bitstream (TrueHD with Atmos) into signals plus the
+/// A decoder that turns an object-audio bitstream (TrueHD with Atmos, DTS:X) into signals plus the
 /// metadata that positions them. Kept separate from the bridge so the bridge's timeline, renderer
 /// and encoder handling can be exercised with a synthetic decoder.
 protocol ObjectAudioDecoding: AnyObject {
@@ -29,8 +31,12 @@ protocol ObjectAudioDecoding: AnyObject {
     func push(_ bytes: UnsafeRawBufferPointer) throws
     /// The next complete block, or nil when more input is needed.
     func nextBlock() throws -> ObjectAudioDecodedBlock?
-    /// Drop all state; decoding resumes at the next major sync.
+    /// Drop all state; decoding resumes at the next major sync (TrueHD) or frame (DTS:X).
     func reset()
+    /// Blocks the decoder still holds back come out of the next `nextBlock` calls as they are, and it
+    /// holds nothing more until the next reset. The bridge asks at end of input and before a segment
+    /// cut, where that audio belongs.
+    func releaseHeldBlocks()
     /// How often the decoder has reset ITSELF after an internal failure. Its input offsets count from
     /// zero again afterwards, so the caller has to re-anchor its timeline.
     var selfResetCount: Int { get }
@@ -38,4 +44,6 @@ protocol ObjectAudioDecoding: AnyObject {
 
 extension ObjectAudioDecoding {
     var selfResetCount: Int { 0 }
+    func releaseHeldBlocks() {}
 }
+#endif

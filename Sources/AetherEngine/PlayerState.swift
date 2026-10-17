@@ -388,8 +388,14 @@ public enum DecodePath: String, Sendable, Equatable, CaseIterable {
 }
 
 /// Which layer of a Dolby Vision source a session presents. See `LoadOptions.dolbyVisionHandling`.
+/// For Profile 7, FEL (Full Enhancement Layer, `el_type == 'FEL'`) is reconstructed from both layers
+/// on the software host with `DualLayerVideoDecoder` only when `LoadOptions.preferDualLayerDolbyVision`
+/// is true (default false) and the capability gate passes. Otherwise a Profile 7 source goes native:
+/// the single-layer 8.1 conversion where the display takes Dolby Vision, the HDR10 base layer where
+/// it does not. MEL (Minimal Enhancement Layer, `el_type == 'MEL'`) always goes native, because it has
+/// no residual to compose, whatever the preference.
 public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
-    /// Dolby Vision wherever the profile and the display allow it. The default.
+    /// Dolby Vision wherever the profile and the display allow it. A Profile 7 source takes the native route (converted to single-layer 8.1 where the display takes Dolby Vision, the HDR10 base layer where it does not); its FEL is reconstructed (dual-layer Metal) instead only when `LoadOptions.preferDualLayerDolbyVision` is true, which defaults to false. The default.
     case automatic
     /// Present the HDR10 / HLG base layer and leave the Dolby Vision out of the container: `hvc1` /
     /// `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria.
@@ -410,6 +416,22 @@ public struct LoadOptions: Sendable, Equatable {
     /// Extra HTTP headers for HEAD probe, Range chunks, side-demuxer fetches. On the loopback paths they are NOT forwarded to AVPlayer (it hits the local server); on `nativeRemoteHLS` they ride into the AVURLAsset so header-enforcing origins (IPTV Referer / User-Agent / Authorization) work (#119). Forwarded to `selectSidecarSubtitle` by default; pass explicit headers to override (#32). Default empty.
     public var httpHeaders: [String: String]
 
+    /// Opt-in decoded-frame diagnostics for SDR native loopback playback. Default off.
+    /// Samples an additional AVPlayerItemVideoOutput; reports output gaps, not physical display
+    /// freezes. Disabled during seek/pause, external playback and mobile background activity.
+    public var nativeVideoFrameDiagnostics: Bool = false
+
+    /// Opt-in bounded repair of stalled SDR decoded output on native loopback playback.
+    /// Enables frame observation independently of diagnostics. Default off; short gaps,
+    /// unavailable output, PiP, background, external playback, pause and seeks never repair.
+    public var nativeVideoFrameRecovery: Bool = false
+
+    /// The host owns the retry after a verified live replay exhausts in-engine recovery: the engine
+    /// publishes `liveSourceReplayExhausted` and waits for `retryLiveSourceRecovery()`. Default off,
+    /// where that exhaustion publishes `liveSourceReset` like any other source loss, so a host that
+    /// only knows that event still retunes instead of holding the last frame.
+    public var hostRetriesExhaustedLiveReplay: Bool = false
+
     /// Diagnostic lever: force dvh1 codec tags + master playlist regardless of display capability. OFF by default: non-DV displays route DV through the media playlist (no master) so AVPlayer auto-tonemaps the HEVC base layer (only path that avoids AVFoundationErrorDomain -11868 on tvOS 26). AetherEngine#4.
     public var keepDvh1TagWithoutDV: Bool
 
@@ -425,8 +447,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// the profile field means, and a tvOS build that reads the base layer's colorimetry from the profile
     /// rather than the RPU would render IPT out of YCbCr (the green/violet cast of AE#4 and AE#176).
     ///
-    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 only. Reported by
-    /// DrHurt against a Samsung HDR10 panel.
+    /// Ignored when the display does support Dolby Vision, and applies to HEVC Profile 8.1 and to Profile 7,
+    /// which is served as the Profile 8.1 it is converted to. Reported by DrHurt against a Samsung HDR10 panel.
     public var forceDolbyVisionOnNonDVDisplay: Bool
 
     /// A `DolbyVisionHandling`. Default `.automatic`. `.baseLayerOnly` presents the HDR10 / HLG base layer
@@ -448,6 +470,36 @@ public struct LoadOptions: Sendable, Equatable {
     /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
+
+    /// Opt in to full dual-layer Dolby Vision decoding of Profile 7 FEL streams, composed on the GPU, instead of
+    /// the native route (the single-layer Profile 8.1 conversion, or the HDR10 base layer). When true, `dolbyVisionHandling` is `.automatic`, the stream's
+    /// enhancement layer is FEL, VideoToolbox decodes HEVC in hardware and the stream fits the real-time
+    /// budget (`DualLayerRouteDecision.maximumPixelsPerSecond`: UHD at 30 fps plus a 1080p enhancement
+    /// layer), the stream routes through the dual-layer pipeline (SoftwarePlaybackHost +
+    /// DualLayerVideoDecoder). A Profile 7 MEL stream, and anything the device cannot decode twice in real
+    /// time, keeps the native route either way (8.1 where the display takes Dolby Vision, the HDR10 base
+    /// layer where it does not); the load logs one line saying which route it took and why. The source
+    /// must be a seekable VOD: live and non-seekable sources keep the native route. Default false.
+    ///
+    /// Needs the `DualLayerDolbyVision` package trait (off by default): without it this is a no-op and
+    /// every Profile 7 source keeps the native route (`AetherEngine.OptionalComponent.dualLayerDolbyVision`).
+    ///
+    /// The route does not consult the display. With this on and a display that does not take Dolby
+    /// Vision, the route is still taken: the composed full-FEL picture is presented with its attached
+    /// metadata, and how tvOS presents it is up to the platform. The audio trade-off below applies there
+    /// too.
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change on a URL source (which
+    /// re-runs `load()`). On a custom `IOReader` source a Profile 7 session refuses it with
+    /// `SessionReloadRefusal.dualLayerRouteNeedsFreshLoad`, because the in-place rebuild keeps the route
+    /// the session was loaded with; call `load()` again instead.
+    ///
+    /// Known trade-off, audio: the route runs on the software host, whose audio is decoded by FFmpeg and
+    /// played through the sample-buffer audio renderer, and on tvOS only AVPlayer emits Dolby Atmos objects.
+    /// An E-AC-3 (JOC) track therefore plays as its channel-bed core (5.1 or 7.1), without the Atmos objects,
+    /// where the native route would hand it to AVPlayer unchanged. TrueHD behaves as on the native route,
+    /// which also decodes it and loses the objects. Not engineered around.
+    public var preferDualLayerDolbyVision: Bool = false
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
@@ -518,13 +570,16 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Bridge encoder for codecs that cannot stream-copy into fMP4 (TrueHD, DTS, DTS-HD MA, MP3, Opus, EAC3-from-MKV-without-dec3-extradata).
     ///
-    /// - `.surroundCompat` (default): EAC3 128 kbps/ch. Works on soundbars (Sonos Arc, Samsung HW-Q, Bose). Lossy; caps 7.1 to 5.1.
-    /// - `.lossless`: FLAC up to 7.1. Needs a sink that accepts multichannel LPCM (Denon / Marantz / NAD AVRs); stereo-only routes silently downmix.
+    /// - `.surroundCompat` (default): EAC3 128 kbps/ch. Surround on every sink, including a soundbar behind legacy ARC. Lossy; downmixes 7.1 to 5.1.
+    /// - `.lossless`: FLAC up to 7.1. Needs a sink that takes multichannel LPCM (an AVR over HDMI, or an AVR or soundbar on eARC); legacy-ARC routes silently downmix to stereo. The engine cannot tell the two apart from the route (AE#794).
     public var audioBridgeMode: AudioBridgeMode
 
-    /// TrueHD Atmos delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel decode;
-    /// `.apac(layout)` renders the Atmos objects into `layout` and delivers Apple Positional Audio,
-    /// which reaches an Atmos receiver as Dolby MAT with its heights. See `ObjectAudioRendering`.
+    /// TrueHD Atmos and DTS:X delivery (#731). `.off` (default) keeps `audioBridgeMode`'s 7.1 channel
+    /// decode; `.apac(layout)` renders the objects and heights into `layout` and delivers Apple
+    /// Positional Audio, which reaches an Atmos receiver as Dolby MAT with its heights. See
+    /// `ObjectAudioRendering`. Needs the `TrueHDObjectAudio` / `DTSXObjectAudio` package traits (off by
+    /// default): without a codec's trait this is a no-op for that codec, which keeps `audioBridgeMode`
+    /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
 
     /// Treat the source as a live stream. `seek(to:)` becomes a no-op; `isLive` surface reflects this for host UIs. Set explicitly: auto-detection from `probe.durationSeconds == 0` is too noisy (VOD MKVs with broken duration headers). Default `false`.
@@ -677,7 +732,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
-    /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One keyframe per served segment, at the source's full resolution. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
+    /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
 
     /// Confirm E-AC-3 JOC (Dolby Atmos) on this session's audio tracks, so `audioTracks` carries an honest
@@ -756,6 +811,14 @@ public struct LoadOptions: Sendable, Equatable {
     /// Applies to the playback reader. The subtitle and enrichment side readers keep the default
     /// transport: they park deliberately for minutes, which is the one shape a held connection
     /// must not take.
+    ///
+    /// AE#732: it also covers a finite HLS VOD that takes the AE#268 ingest (HEVC in MPEG-TS). Its
+    /// playlist, key and segment requests then run over one persistent HTTP/1.1 connection per
+    /// origin, reused across segment boundaries, one segment at a time instead of four in parallel,
+    /// for origins that refuse h2 or a freshly opened connection but serve consecutive requests on
+    /// one keep-alive connection. The connection is replaced only when the origin closes it, the
+    /// origin changes, or a seek abandons a body mid-transfer; each open and close is logged with
+    /// its protocol and request count. Other HLS routes keep their transport.
     ///
     /// Names the session rather than tuning it: the transport is chosen when the source is opened,
     /// so a reload cannot change it. Default false, which is every reader shipped so far.
@@ -922,6 +985,7 @@ public struct LoadOptions: Sendable, Equatable {
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        preferDualLayerDolbyVision: Bool = false,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -964,7 +1028,10 @@ public struct LoadOptions: Sendable, Equatable {
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
-        sharedOutputRole: SharedOutputRole = .primary
+        sharedOutputRole: SharedOutputRole = .primary,
+        nativeVideoFrameDiagnostics: Bool = false,
+        nativeVideoFrameRecovery: Bool = false,
+        hostRetriesExhaustedLiveReplay: Bool = false
     ) {
         self.omitCriteriaColorExtensions = omitCriteriaColorExtensions
         self.suppressDisplayCriteria = suppressDisplayCriteria
@@ -972,6 +1039,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1015,6 +1083,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole
+        self.nativeVideoFrameRecovery = nativeVideoFrameRecovery
+        self.nativeVideoFrameDiagnostics = nativeVideoFrameDiagnostics
+        self.hostRetriesExhaustedLiveReplay = hostRetriesExhaustedLiveReplay
     }
 }
 
@@ -1029,8 +1100,10 @@ public enum VideoFormat: Sendable, Equatable {
 
 /// A Dolby Vision profile rewrite the engine applies to the served stream (`AetherEngine.dolbyVisionConversion`).
 public enum DolbyVisionConversion: Sendable, Equatable {
-    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1 for a display presenting Dolby
-    /// Vision. The enhancement layer is discarded: a MEL carries next to nothing, a FEL loses its refinement.
+    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1, on every display (a display
+    /// without Dolby Vision gets the RPU-driven tone map a Profile 8.1 gets). The enhancement layer is
+    /// discarded: a MEL carries next to nothing, and a FEL played on this route loses its refinement (a FEL
+    /// on the software dual-layer route keeps it).
     case profile7ToProfile81
 }
 
@@ -1209,6 +1282,12 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// Settable inside the module so `probeDetectingAtmos` can confirm it post-decode without rebuilding the struct field by field.
     public internal(set) var isAtmos: Bool
 
+    /// DTS:X. True from the probe when libavcodec labels the profile DTS:X, and set during playback when
+    /// LibDTSX confirms a track FFmpeg labelled plain DTS-HD MA (FFmpeg reads only two of DTS:X's
+    /// markers). Never cleared once set for a session's source, so a confirmed track keeps its name in a
+    /// track menu after a switch away from it.
+    public internal(set) var isDTSX: Bool
+
     /// ASS / SSA tracks only: `[Script Info]` + `[V4+ Styles]` + `[Events]` format line from codec extradata. Hosts rendering ASS styling themselves (see `LoadOptions.preserveASSMarkup`) need it to resolve style references. nil for all other track kinds.
     public let assHeader: String?
 
@@ -1233,7 +1312,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
     public let profile: String?
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil) {
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false) {
         self.sampleRate = sampleRate
         self.bitsPerSample = bitsPerSample
         self.sampleFormat = sampleFormat
@@ -1250,9 +1329,16 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.isHearingImpaired = isHearingImpaired
         self.isCommentary = isCommentary
         self.isAtmos = isAtmos
+        self.isDTSX = isDTSX || Self.profileNamesDTSX(codec: codec, profile: profile)
         self.assHeader = assHeader
         self.isExternal = isExternal
         self.isNativelyRenderedSubtitle = isNativelyRenderedSubtitle
+    }
+
+    /// libavcodec's DTS:X profiles, "DTS-HD MA + DTS:X" and "DTS-HD MA + DTS:X IMAX". `dca` is the
+    /// decoder's name, `dts` the codec's, which a build without the decoder reports.
+    static func profileNamesDTSX(codec: String, profile: String?) -> Bool {
+        ["dca", "dts"].contains(codec.lowercased()) && (profile?.contains("DTS:X") ?? false)
     }
 }
 

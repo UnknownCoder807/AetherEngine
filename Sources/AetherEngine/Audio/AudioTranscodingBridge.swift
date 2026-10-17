@@ -23,9 +23,16 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
     /// Nil reads the count off `encoderCodecpar`.
     var servedChannelCount: Int? { get }
 
+    /// AE#783: the most bits per second the delivered track can carry, which the master's
+    /// `BANDWIDTH` has to cover.
+    var peakOutputBitRate: Int64 { get }
+
     /// Decode, transcode and return 0+ packets in `encoderTimeBase`. The caller owns them and frees
     /// them with `trackedPacketFree` after muxing.
     func feed(packet: UnsafePointer<AVPacket>) throws -> [UnsafeMutablePointer<AVPacket>]
+    /// Packets for audio already fed that the bridge is still encoding, waited for. The producer
+    /// calls it before cutting a segment, so a cut splits the audio where a synchronous encode would.
+    func settle() -> [UnsafeMutablePointer<AVPacket>]
     /// Drain at source EOF. The bridge is unusable afterwards until `startSegment`.
     func flush() -> [UnsafeMutablePointer<AVPacket>]
     /// A producer restart boundary: drop buffered audio and rebase timestamps off the next packet.
@@ -43,4 +50,20 @@ protocol AudioTranscodingBridge: AnyObject, Sendable {
 extension AudioBridge: AudioTranscodingBridge {
     var soundSampleEntryOverride: Data? { nil }
     var servedChannelCount: Int? { nil }
+    var peakOutputBitRate: Int64 {
+        guard let cp = encoderCodecpar else { return 0 }
+        return Self.peakBitRate(bitRate: cp.pointee.bit_rate,
+                                channels: cp.pointee.ch_layout.nb_channels,
+                                sampleRate: cp.pointee.sample_rate,
+                                bitsPerRawSample: cp.pointee.bits_per_raw_sample)
+    }
+
+    /// A constant-rate encoder (E-AC-3) states its rate. FLAC is variable and never exceeds the PCM
+    /// it encodes by more than its frame headers, so its ceiling is the PCM rate.
+    static func peakBitRate(bitRate: Int64, channels: Int32, sampleRate: Int32, bitsPerRawSample: Int32) -> Int64 {
+        if bitRate > 0 { return bitRate }
+        let bits = bitsPerRawSample > 0 ? Int64(bitsPerRawSample) : 32
+        return Int64(max(0, channels)) * Int64(max(0, sampleRate)) * bits
+    }
+    func settle() -> [UnsafeMutablePointer<AVPacket>] { [] }
 }

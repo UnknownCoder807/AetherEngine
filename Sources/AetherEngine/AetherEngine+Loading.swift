@@ -299,7 +299,12 @@ extension AetherEngine {
             .store(in: &cancellables)
         failure
             .compactMap { $0 }
-            .sink { [weak self] info in self?.publishError(info) }
+            .sink { [weak self] info in
+                guard let self else { return }
+                self.publishError(Self.reclassifiedForCredentialRefusal(
+                    info, refusal: self.sessionRequestHeaders.recentCredentialRefusal(
+                        within: HLSVideoEngine.rateLimitVerdictWindowSeconds)))
+            }
             .store(in: &cancellables)
         didReachEnd
             .filter { $0 }
@@ -323,11 +328,28 @@ extension AetherEngine {
     /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
     func makeNativeHost() -> NativeAVPlayerHost {
         #if os(tvOS) || os(iOS)
-        return NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
+        let host = NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
             hostOptIn: ownsVideoNowPlayingSession, role: loadedOptions.sharedOutputRole))
         #else
-        return NativeAVPlayerHost()
+        let host = NativeAVPlayerHost()
         #endif
+        host.pictureInPictureActive = pictureInPictureActive
+        host.onVideoPresentationRecovery = { [weak self, weak host] action, position in
+            guard let self, let host, self.nativeHost === host,
+                  self.state == .playing, !self.pictureInPictureActive,
+                  self.pendingRecoverySeekClockTarget == nil,
+                  !self.liveItemPlacementPending else { return }
+            switch action {
+            case .nudge:
+                self.reengageStalledConsumer(position: position, trigger: "video presentation")
+            case .reload:
+                // A live native URL with no retained session cannot promise this placement.
+                guard !self.isLive || self.nativeVideoSession != nil else { return }
+                self.reloadStalledConsumerItem(position: position,
+                    preserveLivePosition: self.isLive ? self.currentTime : nil)
+            }
+        }
+        return host
     }
 
     /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
@@ -868,6 +890,9 @@ extension AetherEngine {
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: loadedOptions.forwardBufferSegments
         )
+        // AE#792: the session's live header store, shared with the playback demuxer it was handed, so
+        // `updateRequestHeaders(_:)` reaches that reader and every reopen the producer makes. Set before start().
+        session.requestHeaders = sessionRequestHeaders
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
@@ -1034,6 +1059,39 @@ extension AetherEngine {
                 self.setPresentationAxis(map)
             }
         }
+        session.onLiveSourceReopening = { [weak self, weak session] in
+            self?.hop(for: generation) { [weak self, weak session] in
+                guard let self, let session, self.nativeVideoSession === session else { return }
+                self.endRecordingIfRunning(reason: .sourceReset)
+            }
+        }
+        // Unset, the session reports the exhaustion through `onLiveSourceReset`: a host that never
+        // subscribed to `liveSourceReplayExhausted` would otherwise hold the last frame for good.
+        if loadedOptions.hostRetriesExhaustedLiveReplay {
+            session.onLiveSourceReplayExhausted = { [weak self, weak session] in
+                self?.hop(for: generation) { [weak self, weak session] in
+                    guard let self, let session, self.nativeVideoSession === session else { return }
+                    self.noteLiveSourceGivenUp()
+                    self.endRecordingIfRunning(reason: .sourceReset)
+                    self.liveSourceReplayExhausted.send()
+                }
+            }
+        }
+        session.onLivePlaylistRenewal = { [weak self, weak session] in
+            self?.hop(for: generation) { [weak self, weak session] in
+                guard let self, let session, self.nativeVideoSession === session,
+                      let oldURL = (self.currentAVPlayer?.currentItem?.asset as? AVURLAsset)?.url,
+                      let url = session.renewedLivePlaylistURL(replacing: oldURL), url != oldURL else { return }
+                self.stallReengageTask?.cancel()
+                self.stallReengageTask = nil
+                self.liveOutageResumeWatcher?.cancel()
+                self.liveOutageResumeWatcher = nil
+                session.clearLiveOutageEndlist()
+                self.reloadStalledConsumerItem(position: self.renderedPositionMirror.get(),
+                    allowPausedConsumer: true, liveRejoinOverride: self.currentTime,
+                    replacementURL: url)
+            }
+        }
         session.onLiveSourceReset = { [weak self, weak session] in
             Task { @MainActor in
                 // Stale session (superseded by a zap) must not retune the current channel.
@@ -1107,6 +1165,13 @@ extension AetherEngine {
         // #126: zero-progress VOD pump death (readError before any packet/segment), and #169:
         // mid-session readError after the revive cap. Without this the host sees
         // isPlayable=true / a stalled item and waits until its own timeout.
+        session.onVODVideoConfigurationChanged = { [weak self, weak session] epoch, summary in
+            Task { @MainActor in
+                guard let self, let session else { return }
+                await self.handleVODVideoConfigurationChange(session: session, epoch: epoch,
+                    summary: summary, generation: generation)
+            }
+        }
         session.onVODSourceFailed = { [weak self, weak session] code, reason, kind in
             Task { @MainActor in
                 guard let self, let session, self.nativeVideoSession === session else {
@@ -1273,6 +1338,13 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        if let event = session.pendingVODVideoConfigurationMismatch {
+            await handleVODVideoConfigurationChange(session: session, epoch: event.epoch,
+                summary: event.summary, generation: generation, reportRefusal: false)
+            try checkLoadCurrent(generation)
+            // If no takeover occurred, the explicitly selected route cannot serve this source.
+            throw HLSVideoEngine.HLSVideoEngineError.openFailed(reason: event.summary)
+        }
         isSourceSeekable = session.openedSourceIsSeekable
         // AE#270: anchor the display axis on the container's own start time, which is what `duration` is
         // measured from. Taking it from the session rather than latching the first published shift keeps a
@@ -1342,6 +1414,7 @@ extension AetherEngine {
         // keyed to the item that loaded it. Installed on the one funnel every attach passes through, so
         // the session's FIRST item is covered as well as every swap: both used to reconstruct the axis
         // from the cache instead, and a reconstruction is only as good as the older of its two samples.
+        host.iFramePlaylistWithheld = { [weak session] in session?.iFrameRenditionWithheld ?? false }
         host.onWillAttachItem = { [weak self] in
             // The host owns this closure, so it reaches back for the host rather than capturing it.
             guard let self, let attaching = self.nativeHost else { return }
@@ -1814,7 +1887,9 @@ extension AetherEngine {
                       // AE#520: the session knows whether the bitstream it stream-copied carries JOC;
                       // the HDMI route cannot, because Atmos passthrough and a stereo LPCM route
                       // report the same two channels.
-                      audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true))
+                      audioIsAtmosStreamCopy: nativeVideoSession?.audioIsAtmosStreamCopy == true,
+                      nativeVideoFrameDiagnostics: loadedOptions.nativeVideoFrameDiagnostics,
+                      nativeVideoFrameRecovery: loadedOptions.nativeVideoFrameRecovery))
         forceNativeLegibleDeselectedUntilHostSelects()
         // Sodalite#175: from the session's own pick, since a track-switch reload has no active index yet.
         let sessionAudioPick = nativeVideoSession.map(\.activeAudioSourceStreamIndex).flatMap { $0 >= 0 ? Int($0) : nil }
@@ -1883,7 +1958,8 @@ extension AetherEngine {
         isLive: Bool = false,
         dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer?,
-        generation: UInt64
+        generation: UInt64,
+        elType: String? = nil
     ) async throws {
         let deinterlaceMode = loadedOptions.deinterlaceMode
         let waitStarted = DispatchTime.now()
@@ -1915,6 +1991,10 @@ extension AetherEngine {
         // on every build. Without it a software host came up aspect-fit whatever the app had set,
         // and only a second write mid-session took effect.
         let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
+        host.configuredDVProfile = sourceDVProfile
+        host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
+        host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
+        host.elType = elType ?? sourceElType
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
@@ -1941,6 +2021,13 @@ extension AetherEngine {
         // #353: the settled picture size, wired next to the frame times because a host laying out an
         // overlay needs the rectangle as well as the clock, and both come off this renderer.
         mirrorSoftwareDisplaySize(from: host.$videoDisplaySize, storeIn: &softwareCancellables)
+        host.$residentRanges
+            .sink { [weak self, weak host] ranges in
+                guard let self, let host, self.softwareHost === host,
+                      self.loadGeneration == generation, !self.isLive else { return }
+                self.residentRanges = ranges
+            }
+            .store(in: &softwareCancellables)
         // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
         // the session; the host attaches it to the view and, on PiP start, to the system window).
         softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)
@@ -2038,13 +2125,13 @@ extension AetherEngine {
         let forwardBufferSegments = loadedOptions.forwardBufferSegments
         let dvrRetention = loadedOptions.softwareDVRRetention
         try await BlockingWork.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, requestHeaders = sessionRequestHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withRequestHeaders(requestHeaders), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2117,13 +2204,13 @@ extension AetherEngine {
         }
         if loadGeneration == generation { recordStartupCheckpoint(.sessionConstructed) }   // #361
         try await BlockingWork.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, requestHeaders = sessionRequestHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration).withHeldSourceConnection(heldSourceConnection).withSourceOpenPolicy(sourceOpenPolicy).withRequestHeaders(requestHeaders))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -2214,7 +2301,7 @@ extension AetherEngine {
         let sideTracks = session.companionAudioTracks
         if !sideTracks.isEmpty {
             audioTracks = sideTracks
-            applyConfirmedAtmos()   // #214 follow-up: a whole-list swap must not drop confirmed JOC
+            applyConfirmedTrackFlags()   // #214 follow-up: a whole-list swap must not drop confirmed JOC
         }
         let active = session.activeAudioSourceStreamIndex
         let resolved: Int? = active >= 0 ? Int(active) : nil
@@ -2226,6 +2313,9 @@ extension AetherEngine {
                 category: .engine
             )
             activeAudioTrackIndex = resolved
+        }
+        if session.audioIsConfirmedDTSX, active >= 0 {
+            recordConfirmedDTSX(streamIndex: active)
         }
     }
 
@@ -2504,13 +2594,15 @@ extension AetherEngine {
                     isLive: loadedOptions.isLive,
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened,
-                    generation: gen
+                    generation: gen,
+                    elType: sourceElType
                 )
                 EngineLog.emit("[AetherEngine] reload: loadSoftware done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .software
                 activeAudioTrackIndex = audioStreamIndex.map { Int($0) }
                 activeVideoDecoder = Self.videoDecoderLabel(
-                    codecID: preservedVideoCodec, isSoftware: true
+                    codecID: preservedVideoCodec,
+                    isSoftware: !(softwareHost?.usesHardwareVideoDecoder ?? false)
                 )
                 // AE#462: the rebuilt host's own resolved index (see the load site).
                 activeAudioDecoder = Self.softwareAudioDecoderLabel(
@@ -2655,7 +2747,7 @@ extension AetherEngine {
             // not reconcile tracks post-load, needs the probe-derived lists re-applied here.
             if targetSoftwarePath {
                 audioTracks = reopenedAudioTracks
-                applyConfirmedAtmos()   // #214 follow-up: a title switch re-applies probe lists
+                applyConfirmedTrackFlags()   // #214 follow-up: a title switch re-applies probe lists
                 subtitleTracks = reopenedSubtitleTracks
             }
         } else {

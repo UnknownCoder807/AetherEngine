@@ -41,7 +41,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     // MARK: - State
 
     let sourceURL: URL
-    let sourceHTTPHeaders: [String: String]
+    /// AE#792: the session's live header set. Seeded from `sourceHTTPHeaders` at init; `AetherEngine`
+    /// installs its session store here before `start()`, so the opens below and the playback demuxer it
+    /// hands over read the same value, and `updateRequestHeaders(_:)` reaches both.
+    var requestHeaders: RequestHeaderStore
+    var sourceHTTPHeaders: [String: String] { requestHeaders.current }
     private let dvModeAvailable: Bool
 
     /// From `LoadOptions.keepDvh1TagWithoutDV`; default OFF, set only for misreporting DV panels.
@@ -250,6 +254,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// that took it, at once when the rendition stays absent, or in `stop()`.
     var customIFrameReader: (reader: IOReader, formatHint: String?)?
     private(set) var iFrameRenditionVerdict: IFrameRenditionEligibility.Verdict = .absent(.notRequested)
+    /// False for a Dolby Vision Profile 5 / 10.0 source in a build without the
+    /// `DolbyVisionStillReshaping` trait: none of its frames can become a correct still.
+    private(set) var yieldsStills = true
+    /// AE#682: the server withheld the JPEG I-frame playlist because AVPlayer never asked for a media
+    /// segment, which is how a refused HDR variant looks next to an SDR I-frame rendition.
+    var iFrameRenditionWithheld: Bool { server?.iFrameRenditionWithheld ?? false }
     private var iFrameRendition: IFrameRendition?
 
     /// Native subtitle rendition marked DEFAULT=YES in the master (Sodalite#32). Set before `start()`; the
@@ -272,6 +282,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     public var initialStartSeconds: Double?
     /// Resolved in start() from `initialStartSeconds` once the segment plan exists.
     private(set) var initialProducerBaseIndex: Int = 0
+    /// Set once the main demuxer sits at the initial producer's start (step 8's seek ran early).
+    var demuxerAtInitialProducerStart = false
 
     /// One cue store per declared text track (#55, all-tracks), ordinal-aligned with
     /// `nativeSubtitleLanguagesForSession`. Re-threaded onto every producer restart so
@@ -550,6 +562,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// off the HDMI route has to know that, or it reads the carrier as a downmix.
     public internal(set) var audioIsAtmosStreamCopy = false
 
+    /// The audio is TrueHD Atmos or DTS:X rendered to APAC (`objectAudioRendering`), which on tvOS needs
+    /// `AtmosOutputActivator` beside the player to reach the receiver as Atmos.
+    var audioIsAPAC = false
+
+    /// LibDTSX confirmed the playing track as DTS:X (#744), whatever FFmpeg's profile label said. The
+    /// engine folds it into the published track's `isDTSX`.
+    var audioIsConfirmedDTSX = false
+
     /// Producer's `videoShiftPts` in seconds, updated on every gate open. AVPlayer clock =
     /// `source_pts - playlistShiftSeconds`. Lock-guarded: written on pump thread, read on others.
     public var playlistShiftSeconds: Double {
@@ -625,6 +645,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Source bitrate in bps for HLS BANDWIDTH/AVERAGE-BANDWIDTH. 0 when libavformat can't
     /// compute it; callers fall back to an over-declared estimate to avoid CoreMediaErrorDomain -12318.
     private var sourceBitrate: Int64 = 0
+    /// AE#783: the highest per-segment source bitrate the keyframe index measures, nil when it cannot.
+    private var sourcePeakBitrate: Int64?
 
     /// Fires on each gate open (initial + restart) so AetherEngine keeps its shift in step
     /// for subtitle cue lookup.
@@ -715,8 +737,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Fires on live program-boundary rebase: `(newShiftSeconds, seamOutputSeconds)`. AetherEngine
     /// defers applying the shift until playback crosses `seamOutputSeconds` so the clock doesn't jump.
     var onPlaylistShiftRebased: (@Sendable (Double, Double) -> Void)?
-    /// Fires on `PumpExitReason.sourceReplay`; host must re-negotiate a fresh session.
+    /// Fires when a longer finalized segment requires a new live playlist URL.
+    var onLivePlaylistRenewal: (@Sendable () -> Void)?
+    func renewedLivePlaylistURL(replacing url: URL) -> URL? {
+        server?.renewedLivePlaylistURL(replacing: url)
+    }
+    /// Fires when no in-engine source reopen can continue the session.
     var onLiveSourceReset: (@Sendable () -> Void)?
+    var onLiveSourceReplayExhausted: (@Sendable () -> Void)?
+    /// A fresh source may change format; the owner ends the old recording before that seam.
+    var onLiveSourceReopening: (@Sendable () -> Void)?
     /// AE#627: the first join read video for the whole keyframe wait and found no point the native
     /// route can open a segment on. Reopening joins the same bitstream, so the engine decides between
     /// the software path and telling the host (`escalateLiveReopenExhaustion`) instead. Unset, the
@@ -736,6 +766,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// source that is gone, and the reader's `-1` cannot say which, so the kind is decided here
     /// and published rather than inferred from the code downstream.
     var onVODSourceFailed: (@Sendable (Int32, String, PlaybackErrorKind) -> Void)?
+    var onVODVideoConfigurationChanged: (@Sendable (UInt64, String) -> Void)?
+    private var vodVideoConfigurationMismatch: (epoch: UInt64, summary: String)?
+
+    /// Retained because the first pump can finish before loadNative installs this session.
+    var pendingVODVideoConfigurationMismatch: (epoch: UInt64, summary: String)? {
+        restartLock.lock(); defer { restartLock.unlock() }
+        guard let event = vodVideoConfigurationMismatch, producer?.epoch == event.epoch else { return nil }
+        return event
+    }
+
+    func recordVODVideoConfigurationMismatch(_ prod: HLSSegmentProducer, summary: String) {
+        restartLock.lock()
+        guard !isLiveSession, producer === prod else { restartLock.unlock(); return }
+        vodVideoConfigurationMismatch = (prod.epoch, summary)
+        restartLock.unlock()
+        onVODVideoConfigurationChanged?(prod.epoch, summary)
+    }
 
     /// The one way a VOD session surfaces a terminal source failure (#370 follow-up).
     ///
@@ -833,6 +880,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// See `RefusingSourceReviveBudget` for why: the old figure was the emergent product of two
     /// constants that did not know about each other, and it was never reset.
     var rateLimitReviveGate = RefusingSourceReviveBudget()
+    /// AE#792 part 2: revives spent on a credential refusal the host has since renewed. Each one
+    /// answers a renewal, so the bound only stops a host whose fresh credentials keep being refused.
+    var credentialReviveGate = MuxerFailureReviveGate(maxAttempts: 3)
 
     /// AE#169 round 2 (under `restartLock`): the demuxer's last read threw, so the next
     /// performRestart replaces it via the #79 fresh-demuxer path instead of seeking a connection
@@ -1001,7 +1051,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         forwardBufferSegments: Int? = nil
     ) {
         self.sourceURL = url
-        self.sourceHTTPHeaders = sourceHTTPHeaders
+        self.requestHeaders = RequestHeaderStore(sourceHTTPHeaders)
         self.sequentialOrigin = sequentialOrigin
         self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
@@ -1137,7 +1187,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// EAC3 from MKV without dec3 extradata).
     let audioBridgeMode: AudioBridgeMode
 
-    /// TrueHD Atmos delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
+    /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
 
     /// Pre-opened demuxer reused by `start()` to skip `avformat_find_stream_info` (~1-3 s on slow CDN).
@@ -1161,6 +1211,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .withSourceOpenPolicy(openProfile.sourceOpenPolicy)
             .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
             .withHeldSourceConnection(heldSourceConnection)
+            .withRequestHeaders(requestHeaders)
     }
 
     /// `LoadOptions.sequentialOrigin` for this session. Gates the VOD readError revive
@@ -1222,7 +1273,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         } else {
             dem = Demuxer()
             do {
-                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
+                try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                             profile: openProfile.withRequestHeaders(requestHeaders), isLive: isLiveSession)
             } catch {
                 throw Self.openFailure(from: error)
             }
@@ -1279,6 +1331,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         sourceStartSeconds = formatStart == Int64.min ? 0 : max(0, Double(formatStart) / Double(AV_TIME_BASE))
         let durationSeconds = dem.duration
         var plan: [Segment]
+        var keyframeBytePositions: [Int64: Int64] = [:]
         if isLiveSession {
             sourceBitrate = dem.bitRate
             self.firstKeyframePts = 0
@@ -1336,7 +1389,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // 3. Build the segment plan. Uses the same cut algorithm as libavformat's hls muxer
             //    (first IDR at-or-after `(segIdx+1) * hls_time`); falls back to uniform stride
             //    if the index has < 2 entries (restart machinery handles any plan/muxer drift).
-            let keyframes = dem.indexedKeyframes(streamIndex: videoIndex)
+            let keyframeEntries = dem.indexedKeyframeEntries(streamIndex: videoIndex)
+            let keyframes = keyframeEntries.map(\.pts)
             let indexTrustworthy = Self.keyframeIndexIsTrustworthy(
                 keyframes: keyframes,
                 videoTimeBase: videoTimeBase,
@@ -1375,6 +1429,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     sourceDurationSeconds: durationSeconds
                 )
                 planBoundariesClaimRandomAccess = true
+                keyframeBytePositions = Dictionary(keyframeEntries.map { ($0.pts, $0.pos) },
+                                                   uniquingKeysWith: { first, _ in first })
                 // AE#561: these boundaries ARE this container's index entries, so they carry its
                 // stamping. Read from the demuxer that produced them, never from the URL or the
                 // host's metadata: on a remux session the delivered container is the one indexed.
@@ -1548,6 +1604,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             if dem.isSourceSeekable { dem.seek(to: 0) }
             dem.endIndexPass()      // AE#585: the next read that lands outside a span is playback's
         }
+        demuxerAtInitialProducerStart = false
 
         // volumeAvailableCapacityForImportantUsage is unavailable on tvOS; the plain capacity key
         // exists on every platform and is close enough for the quarter-of-free-space clamp.
@@ -1670,6 +1727,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // share these boundaries, so the merge fixes both at once).
         plan = Self.collapseShortSegments(plan, minDurationSeconds: Self.minSegmentDurationSeconds)
         self.segmentPlan = plan
+        if !keyframeBytePositions.isEmpty {
+            sourcePeakBitrate = Self.peakSegmentBitrate(plan: plan, keyframeBytePositions: keyframeBytePositions)
+            EngineLog.emit(
+                "[HLSVideoEngine] peak segment bitrate: "
+                + (sourcePeakBitrate.map { "\($0) bps (source average \(sourceBitrate) bps)" }
+                   ?? "not measurable from the index byte positions"),
+                category: .session
+            )
+        }
 
         // #93 residual: anchor the FIRST producer at the session's start position instead of seg0.
         // A resume start otherwise produces seg0 (torn down and discarded seconds later when
@@ -1851,7 +1917,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     frameSize: acpForHE.frame_size,
                     hasASC: hasASC
                 )
-            if compat.requiresBridge || isHEAAC {
+            // AE#764: CoreMedia refuses a FLAC min_blocksize under 192 and hangs on frames smaller than the
+            // field claims, so a stream with small blocks cannot be copied, only decoded.
+            let flacBlocksTooSmall = compat == .flac
+                && FLACStreamInfo.coreMediaRejectsStreamCopy(UnsafePointer(audioStream.pointee.codecpar))
+            if flacBlocksTooSmall {
+                bridgePreferred = true
+                let sizes = FLACStreamInfo.blockSizes(UnsafePointer(audioStream.pointee.codecpar))
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: FLAC STREAMINFO min_blocksize=\(sizes?.min ?? 0) "
+                    + "max_blocksize=\(sizes?.max ?? 0) is below CoreMedia's floor of "
+                    + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
+                    category: .session
+                )
+            } else if compat.requiresBridge || isHEAAC {
                 bridgePreferred = true
                 EngineLog.emit(
                     isHEAAC
@@ -1860,7 +1939,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
                           + (Self.spatialRenderingLayout(
                                 rendering: objectAudioRendering, codecID: acpForHE.codec_id,
                                 profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
-                             .map { "Atmos object render into \($0.rawValue), APAC" }
+                             .map { layout in
+                                 Self.objectAudioSource(codecID: acpForHE.codec_id, profile: acpForHE.profile) == .trueHDAtmos
+                                     ? "Atmos object render into \(layout.rawValue), APAC"
+                                     : "DTS:X render into \(layout.rawValue) if LibDTSX confirms DTS:X, APAC"
+                             }
                              ?? Self.encoderLabel(AudioBridge.bridgeEncoder(
                                 for: audioBridgeMode,
                                 sourceChannels: acpForHE.ch_layout.nb_channels)).uppercased())
@@ -1898,6 +1981,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let sampleRate = Int64(acp.sample_rate)
                 let frameSamples: Int64 = {
                     if acp.frame_size > 0 { return Int64(acp.frame_size) }
+                    if let declared = FLACStreamInfo.fixedBlockSize(UnsafePointer(audioStream.pointee.codecpar)) {
+                        return declared
+                    }
                     switch acp.codec_id {
                     case AV_CODEC_ID_AC3, AV_CODEC_ID_EAC3: return 1536
                     case AV_CODEC_ID_AAC: return 1024
@@ -1985,6 +2071,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             streamCopyAudio: streamCopyAudio,
             sourceAudioStreamIndex: audioStreamIndex,
             sourceAudioStream: audioStreamIndex >= 0 ? audioDem.stream(at: audioStreamIndex) : nil,
+            audioDemuxer: audioDem,
             sourceCarriesAudio: audioDem.firstAudioStreamIndexByType >= 0,
             audioHLSCodecs: &audioHLSCodecs,
             audioLanguage: audioLanguage
@@ -2034,6 +2121,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             frameRate: frameRate,
             hdcpLevel: hdcpLevel,
             sourceBitrate: sourceBitrate,
+            sourcePeakBitrate: sourcePeakBitrate,
+            bridgedAudioPeakBitrate: savedAudioConfig?.bridge?.peakOutputBitRate ?? 0,
             audioLanguage: servedAudioLanguage,
             audioChannelCount: servedAudioChannels,
             audioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy,
@@ -2115,13 +2204,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // 8. Kick the pump. Seek on the video stream's exact plan timestamp and forbid an earlier
         // landing. A global time seek can choose the previous sync point in a multi-stream MP4,
         // leaving the producer to scan a whole GOP over the origin before writing anything (#191).
-        if initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count {
-            let targetPts = plan[initialProducerBaseIndex].startPts
-            // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
-            if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
-                let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-                dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
-            }
+        // The DTS:X verdict may already have put the cursor there and peeked from it (#744); a
+        // second seek would drop those packets and read the same bytes again.
+        if !demuxerAtInitialProducerStart {
+            seekToInitialProducerStart(dem)
         }
         // #416: the pump harvests every subtitle packet it demuxes, so where it OPENS is where its
         // coverage of the source begins. The subtitle drain reads "nothing between this set and the
@@ -2150,6 +2236,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // the standard sourceIsHDR && panelReadyForHDR check routes them correctly.
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
+        let stillsAvailable = FrameDecodeContext.yieldsStill(
+            dolbyVisionNoBaseLayer: FrameDecodeContext.isDVNoBaseLayer(codecpar: codecpar))
+        yieldsStills = stillsAvailable
+        if !stillsAvailable {
+            EngineLog.emit("[HLSVideoEngine] Dolby Vision Profile 5 / 10.0 stills are not built in "
+                           + "(DolbyVisionStillReshaping trait off): no scrub thumbnails, I-frame stills "
+                           + "or held pictures for this source", category: .session)
+        }
         // AE#682: decided before the routing below, because an I-frame rendition is one of the
         // reasons to serve a master at all.
         let iFrameCandidate = IFrameRenditionEligibility.candidate(.init(
@@ -2161,7 +2255,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             originIsSerial: sourceReopenableByURL
                 && OriginRequestBudget.shared.requiresSerialRequests(sourceURL),
             isDiscSource: dem.isDiscSource,
-            secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil))
+            secondReaderAvailable: sourceReopenableByURL || customIFrameReader != nil,
+            stillsUnavailable: !stillsAvailable))
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
         // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
@@ -2191,11 +2286,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.servingMasterPlaylist = useMasterPlaylist
         iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
-        if iFrameRenditionVerdict == .served, let rendition = makeIFrameRendition(plan: plan, cache: segmentCache) {
+        if iFrameRenditionVerdict == .served,
+           let rendition = makeIFrameRendition(plan: plan, cache: segmentCache,
+                                               sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
             iFrameRendition = rendition
             prov.setIFrameSource(rendition)
-            EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count)",
-                           category: .session)
+            EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
+                           + "format=\(rendition.format.logName)", category: .session)
         } else if iFramePlaylistRequested {
             closeUnusedCustomIFrameReader()
             if iFrameRenditionVerdict == .served { iFrameRenditionVerdict = .absent(.noSecondReader) }
@@ -2651,6 +2748,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         retentionClaim = nil
         let p = producer
         producer = nil
+        liveRecoveryProducer = nil
         let s = server
         server = nil
         let c = cache
@@ -2723,7 +2821,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - I-frame rendition (AE#682)
 
-    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache) -> IFrameRendition? {
+    /// `sourceIsHDR` picks the format: AVKit shows no scrub thumbnail from a PQ or Dolby Vision
+    /// keyframe, so those sessions serve tone-mapped JPEG stills instead of the keyframes themselves.
+    private func makeIFrameRendition(plan: [Segment], cache segmentCache: SegmentCache,
+                                     sourceIsHDR: Bool) -> IFrameRendition? {
         guard let cfg = savedVideoConfig, !plan.isEmpty else { return nil }
         let directory = segmentCache.sessionDir.appendingPathComponent("iframes", isDirectory: true)
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
@@ -2734,7 +2835,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                            category: .session)
             return nil
         }
-        let builder = IFrameFragmentBuilder(
+        let keyframeBuilder = IFrameFragmentBuilder(
             video: MP4SegmentMuxer.VideoConfig(
                 codecpar: cfg.codecpar, timeBase: cfg.timeBase,
                 codecTagOverride: cfg.codecTagOverride, doviConfig: cfg.doviConfig,
@@ -2742,11 +2843,32 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 convertsAnnexBSamples: cfg.convertsAnnexBSamples,
                 nalFramingLatch: cfg.nalFramingLatch),
             stagingDir: staging)
+        let format: IFrameRenditionFormat
+        let buildFragment: (Data, Int, IFrameRendition.Entry) -> IFrameFragmentBuilder.Output?
+        let par = cfg.codecpar.pointee
+        if sourceIsHDR, let size = IFrameJPEGBuilder.size(
+            codedWidth: Int(par.width), codedHeight: Int(par.height),
+            sarNum: par.sample_aspect_ratio.num, sarDen: par.sample_aspect_ratio.den) {
+            let jpeg = IFrameJPEGBuilder(keyframe: keyframeBuilder, width: size.width, height: size.height)
+            let shortest = plan.map(\.durationSeconds).filter { $0 > 0 }.min() ?? 1
+            format = .jpeg(width: size.width, height: size.height,
+                           bandwidth: IFrameJPEGBuilder.bandwidth(shortestSegmentSeconds: shortest))
+            buildFragment = { payload, index, entry in
+                jpeg.build(payload: payload, index: index,
+                           startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
+            }
+        } else {
+            format = .keyframes
+            buildFragment = { payload, index, entry in
+                keyframeBuilder.build(payload: payload, index: index,
+                                      startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
+            }
+        }
         let framing = cfg.nalFramingOverride ?? A53SEIParser.nalFraming(
             codec: cfg.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC ? .hevc : .h264,
             extradata: cfg.codecpar.pointee.extradata.map { UnsafePointer($0) },
             size: Int(cfg.codecpar.pointee.extradata_size))
-        let url = sourceURL, headers = sourceHTTPHeaders, custom = customIFrameReader
+        let url = sourceURL, headers = sourceHTTPHeaders, headerStore = requestHeaders, custom = customIFrameReader
         // The side reader owns the clone from here; `stop()` must not close it a second time.
         customIFrameReader = nil
         let reader = IFrameSideReader(
@@ -2755,7 +2877,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     try dem.open(reader: custom.reader, formatHint: custom.formatHint,
                                  profile: .iFrameSideDemuxer)
                 } else {
-                    try dem.open(url: url, extraHeaders: headers, profile: .iFrameSideDemuxer, isLive: false)
+                    try dem.open(url: url, extraHeaders: headers,
+                                 profile: DemuxerOpenProfile.iFrameSideDemuxer.withRequestHeaders(headerStore),
+                                 isLive: false)
                 }
             },
             cleanup: { custom?.reader.close() },
@@ -2768,11 +2892,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return IFrameRendition(
             entries: entries,
             cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            format: format,
             readPayload: { reader.payload(startPts: $0.startPts) },
-            buildFragment: { payload, index, entry in
-                builder.build(payload: payload, index: index,
-                              startSeconds: entry.startSeconds, durationSeconds: entry.durationSeconds)
-            },
+            buildFragment: buildFragment,
             waitForLink: { [weak self] shouldStop in
                 // A seek or a producer restart owns the link for a moment; a thumbnail can wait that
                 // out, but not ordinary fetching, or it would stall whenever the pump is busy.
@@ -2973,6 +3095,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// cuts segments the playlist never lists (audit HLS-101).
     func wireProviderCallbacks(_ prod: HLSSegmentProducer, to prov: VideoSegmentProvider) {
         if isLiveSession {
+            prov.onLivePlaylistRenewal = { [weak self] in self?.onLivePlaylistRenewal?() }
             prod.onLiveSegmentFinalized = { [weak prov] index, durationSeconds, startPtsSeconds, discontinuous in
                 prov?.appendLiveSegment(index: index,
                                         startSeconds: startPtsSeconds,
@@ -3002,6 +3125,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Barren-cycle backstop: an open-then-starve source would cycle forever without this.
     /// After `maxBarrenReopenCycles` consecutive cycles producing no new segment, stop reviving.
     var barrenReopenCycles = 0
+    var liveRecoveryHasVerifiedReplay = false
+    var liveSourceRequiresNegotiation = false
+    var liveRecoveryProducer: HLSSegmentProducer?
     var lastReopenSegmentCount = -1
     static let maxBarrenReopenCycles = 3
     /// Live muxerFailed in-place rebuilds, bounded by progress like the reopen cycles above: new segments
@@ -4357,6 +4483,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
             activeDem.seek(to: absoluteTargetSeconds)
         }
+        // AE#782: after the seek, so a container whose seek reads (a TS bisection) spends none of it.
+        activeDem.notePlaybackRepositioned()
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
         seekMs = msSince(seekStart)
@@ -4420,4 +4548,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
     }
 
+}
+
+extension HLSVideoEngine {
+    /// Puts the demuxer where the first producer starts: no-op at segment 0. Seeks on the video
+    /// stream's exact plan timestamp and forbids an earlier landing. A global time seek can choose
+    /// the previous sync point in a multi-stream MP4, leaving the producer to scan a whole GOP over
+    /// the origin before writing anything (#191).
+    func seekToInitialProducerStart(_ dem: Demuxer) {
+        let plan = segmentPlan
+        guard initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count else { return }
+        let targetPts = plan[initialProducerBaseIndex].startPts
+        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
+        if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
+            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+            dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
+        }
+    }
 }
