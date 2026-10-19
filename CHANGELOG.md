@@ -12,6 +12,61 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.42.0] - 2026-10-19
+
+### Added
+
+- **`LoadOptions.displayCriteriaOwner` (`.engine` / `.avKit` / `.host`), AE#842.** `suppressDisplayCriteria`
+  means "AVKit writes the criteria", and every branch behind it waits for that write: a host that keeps
+  the panel in its system format (or writes rate-only criteria itself) had no correct setting and paid up
+  to a second of play-gate wait per HDR or Dolby Vision title for a write that never came, with the
+  engine's panel readout switched off. `.host` writes nothing, takes the brief budget, reads the panel
+  and still waits out a switch it observes. `suppressDisplayCriteria = true` keeps meaning `.avKit`.
+
+### Fixed
+
+- **`confirmAtmos` no longer starves the video pump on an origin limited to one request.** Each
+  E-AC-3 track's pass is a second handle on the source, and at `maxConcurrentSourceRequests = 1`
+  every read it made took the pump's only slot: an integrator measured stalls every ten seconds on a
+  4K remux with 17 E-AC-3 tracks behind an Xtream origin that answers a second connection with 509,
+  and the pass never finished. The pass is now declined there, and for `sequentialOrigin` and
+  `heldSourceConnection`, the same set the I-frame rendition declines; the budget is re-checked
+  before every track, so a limit learned from refusals mid-session stops it too. The
+  `[AtmosConfirmation]` line now also appears for a stopped pass, with how many tracks it reached.
+
+## [7.41.0] - 2026-10-19
+
+### Added
+
+- **Dolby Vision Profile 5 / 10.0 scrub previews in colour, drawn by the system compositor.**
+  `scrubPreviewDrawsInView`, `showScrubPreview(atSeconds:in:)` and `AetherScrubPreviewView`: the
+  keyframe that opens a resident segment becomes a one-sample fMP4, and a muted `AVPlayer` inside
+  the view shows it, so the colour comes from the same place as the playing picture rather than from
+  a reshaping of our own. Needs no `DolbyVisionStillReshaping` trait. Positions outside the resident
+  window read the segment's keyframe off the source with a side demuxer, as the I-frame rendition
+  does, and get the same gates (no read on a sequential, serial or held-connection origin, waits out a
+  seek, skips superseded requests); before, the preview only covered the cached span around the
+  playhead. 26 to 45 ms per new position on an M1, 18 to 25 ms for one read off a local source,
+  byte-identical to the source's keyframe; verified next to 4K Profile 5 playback on an Apple TV.
+- **The held picture of an audio switch covers Dolby Vision Profile 5 / 10.0 without the reshaping
+  trait.** The resident segment's video becomes a standalone file, and a player on the bound surface
+  seeks it frame-exactly to the outgoing position, so the compositor colours the held frame. It was
+  skipped before. On three Profile 5 clips the held frame is pixel-identical to the paused outgoing
+  picture, up in 165 to 220 ms on an M1. The offset adds the segment's B-frame delay; without it the
+  frame lands two frames early.
+
+## [7.40.1] - 2026-10-18
+
+### Fixed
+
+- **TrueHD Atmos that starts after the probe window is rendered again.** A track whose first packet
+  lies beyond `find_stream_info`'s budget (John Wick: Chapter 2 carries TrueHD from 22 s, 45.8 MB
+  into the file) kept an unknown profile, so `objectAudioRendering` played it through the channel
+  bridge. With rendering requested and the profile unknown, the engine now reads the track's major
+  sync where the first producer starts, the same test mlpdec applies (four substreams, top bit of
+  `substream_info`), and renders it when it is Atmos. Costs 679 ms and 44.7 MB of held packets from
+  the start of that file at the tvOS probe budget, 30 ms on a resume; nothing for any other track.
+
 ## [7.40.0] - 2026-10-18
 
 ### Changed

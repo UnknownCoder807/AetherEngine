@@ -387,7 +387,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.40.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -626,7 +626,7 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 - **[docs/api.md](docs/api.md)**: every public surface a host consumes, and the contracts that require it to act (how a load ends, `.ended`, the live retune, the audio tap, what must be set before `load`, and which FFmpeg your link hands the engine). A test fails the build when a host-facing public symbol is named nowhere in the docs.
 - **[docs/architecture.md](docs/architecture.md)**: the three playback pipelines, the source-file map, dependencies, the SwiftUI `Menu` pattern.
 - **[docs/formats.md](docs/formats.md)**: codec / container coverage, HDR routing, audio bridging, subtitles, frame extraction, disc playback, live ingest, and known limitations.
-- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-one subcommands).
+- **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-four subcommands).
 - **[CHANGELOG.md](CHANGELOG.md)**: per-release index.
 
 ## Stability and versioning
@@ -634,10 +634,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.40.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.40.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.42.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -672,7 +672,7 @@ These components may be subject to third-party patent licensing. Integrators who
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.40.0",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.42.0",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 
