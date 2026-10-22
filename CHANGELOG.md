@@ -10,7 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Changed
+
+- **10-bit AV1 gets its film grain and P010 conversion on the GPU on the software host.**
+  dav1d applied the film grain on the CPU and `sws_scale` then converted every frame to P010: two per-pixel
+  passes on top of the decode, which on a fanless Apple TV is heat. dav1d now exports the grain parameters, and
+  `GPUFrameConverter` applies the grain and writes P010 in one Metal pass, dav1d's picture sample for sample
+  (pinned in CI against dav1d's own `dav1d_apply_grain`). On an M5 Pro, CPU time per frame drops from 36.5 to
+  31.6 ms and real-time playback from 93-95 % to 82-83 % CPU, at the same peak decode speed. An Apple TV 4K
+  (3rd generation) plays 20 minutes of a 4K AV1 Dolby Vision 10.1 film on this route at 151 % CPU on average.
+  8-bit AV1 and anything the pass refuses keep `sws_scale`. See `docs/formats.md`.
 
 ## [7.50.0] - 2026-10-28
 

@@ -59,6 +59,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var attachesAV1DolbyVisionRPU = false
     private let rpuTable = AV1DolbyVisionRPUTable(logPrefix: "[SWDecoder]")
 
+    /// 10-bit AV1: frames reach P010 on the GPU with their film grain applied there, and dav1d is told at
+    /// open to export the grain instead of applying it (see `GPUFrameConverter`). Nil for everything else,
+    /// which keeps `sws_scale`. Written in `open`, used under `lock` like the sws context.
+    private var gpuConverter: GPUFrameConverter?
+
+    /// Frames the GPU converted, grained and had to copy first; nil when this decoder does not use it.
+    var gpuConversionCounts: (converted: Int, grained: Int, copied: Int)? {
+        lock.lock(); defer { lock.unlock() }
+        return gpuConverter.map { ($0.framesConverted, $0.framesGrained, $0.framesCopied) }
+    }
+
     private var pixelBufferPool: CVPixelBufferPool?
     private var poolWidth = 0
     private var poolHeight = 0
@@ -239,6 +250,16 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
         }
 
+        // 10-bit AV1 converts on the GPU, and its grain is applied there: dav1d only exports the
+        // parameters. Decided before the open, since that is when dav1d reads whether to apply it.
+        gpuConverter = nil
+        if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+           codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
+           let converter = GPUFrameConverter() {
+            gpuConverter = converter
+            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+        }
+
         // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
         var opts: OpaquePointer?
         av_dict_set(&opts, "hwaccel", "none", 0)
@@ -257,7 +278,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         // Release-visible log (no #if DEBUG): needed for TestFlight users and DrHurt #4 black-screen reports.
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")"
-                       + (attachesAV1DolbyVisionRPU ? ", Dolby Vision 10.1 (RPU attached per frame)" : ""), category: .swPlayback)
+                       + (attachesAV1DolbyVisionRPU ? ", Dolby Vision 10.1 (RPU attached per frame)" : "")
+                       + (gpuConverter != nil ? ", P010 and film grain on the GPU" : ""), category: .swPlayback)
     }
 
     /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
@@ -566,6 +588,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             sws_freeContext(swsContext)
             swsContext = nil
         }
+        gpuConverter = nil
         pixelBufferPool = nil
         poolWidth = 0
         poolHeight = 0
@@ -669,6 +692,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             )
         }
 
+        var pixelBuffer: CVPixelBuffer?
+        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
+        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
+        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
+
+        attachColorSpace(from: frame, to: pb)
+        attachPixelAspectRatio(from: frame, to: pb)
+
+        if let gpuConverter, outputFormat.tenBit, GPUFrameConverter.accepts(frame),
+           gpuConverter.convert(frame, into: pb) {
+            return pb
+        }
+
         swsContext = sws_getCachedContext(
             swsContext,
             Int32(width), Int32(height), srcFmt,
@@ -678,14 +714,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             Int32(SWS_BILINEAR.rawValue), nil, nil, nil
         )
         guard swsContext != nil else { return nil }
-
-        var pixelBuffer: CVPixelBuffer?
-        guard let pool = ensurePixelBufferPool(width: width, height: height, format: outputFormat) else { return nil }
-        let status = CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &pixelBuffer)
-        guard status == kCVReturnSuccess, let pb = pixelBuffer else { return nil }
-
-        attachColorSpace(from: frame, to: pb)
-        attachPixelAspectRatio(from: frame, to: pb)
 
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
