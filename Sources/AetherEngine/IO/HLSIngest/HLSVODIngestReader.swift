@@ -25,6 +25,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     /// narrows once the first segment's real size is known (AE#255: bound by bytes, not by count).
     private static let maximumInFlightBytes = 24 * 1024 * 1024
 
+    private let diagnosticContext: SourceNetworkDiagnostics.Context?
     private let playlistURL: URL
     private let httpHeaders: [String: String]
     private let session: URLSession
@@ -65,8 +66,10 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         playlistURL: URL,
         httpHeaders: [String: String],
         session: URLSession? = nil,
-        persistentHTTP1: Bool = false
+        persistentHTTP1: Bool = false,
+        diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context
     ) {
+        self.diagnosticContext = diagnosticContext
         self.playlistURL = playlistURL
         self.httpHeaders = httpHeaders
         transport = persistentHTTP1 ? PersistentHTTP1Transport(label: "vod") : nil
@@ -95,13 +98,15 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         playlistURL: URL,
         httpHeaders: [String: String],
         session: URLSession? = nil,
-        persistentHTTP1: Bool = false
+        persistentHTTP1: Bool = false,
+        diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context
     ) async throws -> HLSVODIngestReader? {
         let reader = HLSVODIngestReader(
             playlistURL: playlistURL,
             httpHeaders: httpHeaders,
             session: session,
-            persistentHTTP1: persistentHTTP1
+            persistentHTTP1: persistentHTTP1,
+            diagnosticContext: diagnosticContext
         )
         var accepted = false
         defer {
@@ -475,6 +480,9 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         defer { primed?.body.abandon() }
         for (offset, (segment, url)) in segments.enumerated() {
             try Task.checkCancellation()
+            // Runs on the producer's BlockingWork executor. The last offered chunk can fill the
+            // FIFO with no pending remainder, so admission must not depend on append() parking.
+            guard waitForSegmentAdmission(generation: generation) else { return }
             if let crypt = segment.crypt {
                 let bytes = try await decrypt(
                     try await fetch(url, limit: BoundedFetch.segmentLimit(forDuration: segment.duration)),
@@ -542,9 +550,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
             throw HLSIngestError.playlistInvalid(reason: "segment body over its limit")
         }
         guard total > 0 else { throw HLSIngestError.playlistUnreachable(status: body.response.statusCode) }
-        // Between segments the ceiling holds even when the last chunk was taken just under it: the
-        // next request waits for the reader either way, not only when bytes are left over.
-        return pending.isEmpty ? waitForRoom(generation: generation) : append(pending, generation: generation)
+        // The ceiling between segments is enforced before the next request (`waitForSegmentAdmission`).
+        return pending.isEmpty || append(pending, generation: generation)
     }
 
     private enum Offer { case taken, full, superseded }
@@ -566,7 +573,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         guard let transport else { throw CancellationError() }
         let body: PersistentHTTP1Transport.Body
         do {
-            body = try await transport.open(url, headers: scopedHeaders(url), limit: limit)
+            body = try await transport.open(url, headers: scopedHeaders(url), limit: limit,
+                                             diagnosticContext: diagnosticContext, role: .hlsSegment)
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
         }
@@ -576,16 +584,16 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         return body
     }
 
-    /// Parks until the FIFO is below its ceiling. False when the generation was superseded.
-    private func waitForRoom(generation: UInt64) -> Bool {
+    /// Wait between requests, after the previous body has completed. Seek/close wake the producer
+    /// and invalidate its generation; a superseded producer must never open the next segment.
+    private func waitForSegmentAdmission(generation: UInt64) -> Bool {
         condition.lock()
         defer { condition.unlock() }
-        while self.generation == generation,
-              !closed,
+        while self.generation == generation, !closed, !failed,
               bufferedBytes >= Self.maximumBufferedBytes {
             condition.wait()
         }
-        return self.generation == generation && !closed
+        return self.generation == generation && !closed && !failed
     }
 
     private func append(_ data: Data, generation: UInt64) -> Bool {
@@ -680,7 +688,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         for (field, value) in scopedHeaders(url) {
             request.setValue(value, forHTTPHeaderField: field)
         }
-        return request
+        return SourceNetworkDiagnostics.request(request, context: diagnosticContext)
     }
 
     private func scopedHeaders(_ url: URL) -> [String: String] {
@@ -692,7 +700,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         let response: URLResponse
         if let transport {
             do {
-                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: Self.maximumPlaylistBytes)
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: Self.maximumPlaylistBytes,
+                                                     diagnosticContext: diagnosticContext, role: .hlsPlaylist)
                 (data, response) = (answer.body, answer.response)
             } catch let error as BoundedFetch.Exceeded {
                 throw HLSIngestError.playlistInvalid(reason: "playlist exceeds \(error.limit) bytes")
@@ -712,15 +721,16 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 
     /// A segment or a key body, cut off at `limit` while it arrives (audit NET-112).
-    private func fetch(_ url: URL, limit: Int) async throws -> Data {
+    private func fetch(_ url: URL, limit: Int, role: SourceNetworkDiagnostics.Role = .hlsSegment) async throws -> Data {
         let data: Data
         let response: URLResponse
         do {
             if let transport {
-                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: limit)
+                let answer = try await transport.get(url, headers: scopedHeaders(url), limit: limit,
+                                                     diagnosticContext: diagnosticContext, role: role)
                 (data, response) = (answer.body, answer.response)
             } else {
-                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit)
+                (data, response) = try await BoundedFetch.data(for: makeRequest(url), session: session, limit: limit, role: role)
             }
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
@@ -768,7 +778,8 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         return try await HLSCarriageProbe.classifySegmentHead(
             url: url,
             httpHeaders: RedirectHeaderPolicy.scoped(httpHeaders, grantedFor: playlistURL, sentTo: url),
-            session: session
+            session: session,
+            diagnosticContext: diagnosticContext
         )
     }
 
@@ -784,7 +795,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
         if let cached = keyCacheLock.withLock({ keyCache[keyURL.absoluteString] }) {
             key = cached
         } else {
-            let fetched = try await fetch(keyURL, limit: BoundedFetch.keyLimit)
+            let fetched = try await fetch(keyURL, limit: BoundedFetch.keyLimit, role: .hlsKey)
             guard fetched.count == kCCKeySizeAES128 else {
                 throw HLSIngestError.segmentDecryptFailed(reason: "key length is not 16 bytes")
             }

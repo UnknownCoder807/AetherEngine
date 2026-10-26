@@ -192,9 +192,26 @@ extension AetherEngine {
                     ownedReader = reader
                     let counted = ProbeIOReader(reader: reader, control: control)
                     try control.check()
-                    if let http = reader as? ProbeHTTPReader { try http.open() }
+                    var isDASHManifest = false
+                    if let http = reader as? ProbeHTTPReader {
+                        do {
+                            try http.open()
+                        } catch AVIOReaderError.dashManifest {
+                            isDASHManifest = true
+                        }
+                    }
                     try control.check()
-                    try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                    if isDASHManifest {
+                        // AE#859: an MPD is opened by the demuxer's own DASH path, which reads several
+                        // files. Deadline and cancellation are honoured inside libavformat's reads
+                        // through the demuxer's interrupt, but the manifest and head requests run to
+                        // their own timeouts, and the byte budget, which counts one source, does not apply.
+                        reader.close()
+                        ownedReader = nil
+                        try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+                    } else {
+                        try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                    }
                 } else {
                     try demuxer.open(url: u, extraHeaders: options.httpHeaders)
                 }
@@ -556,6 +573,22 @@ extension AetherEngine {
         (!engineWritesCriteria || audioOnlyPath) ? .clearStale : .applyFresh
     }
 
+    /// AE#348: whether the pre-flight gate after an HDR/DV write runs beside the load rather than in front
+    /// of it.
+    ///
+    /// The gate guards the routing read (master or media, from the settled panel) and the AVPlayerItem,
+    /// not the segment production in front of them: `HLSVideoEngine.prepare()` reads nothing about the
+    /// panel. Serialising the two put a ~96 Mbit/s title's first two segments (2.0 s to cut) behind a
+    /// switch that ended 1.5 s before playback started (Apple TV 4K, DV, badrabbit 2026-10-16). The gate
+    /// still starts at the write and the routing read still waits for it, so the read is never taken
+    /// earlier than before.
+    ///
+    /// Live keeps the serial order: its join and rejoin are timed against the edge, and the overlap has not
+    /// been measured there.
+    nonisolated static func preflightGateRunsBesideLoad(isLive: Bool) -> Bool {
+        !isLive
+    }
+
     /// #274: how long the post-load play-gate blind-polls for a panel switch to start.
     ///
     /// The gate exists for one case: a sole-writer host (`suppressDisplayCriteria`) whose criteria write
@@ -669,9 +702,15 @@ extension AetherEngine {
         // another dub, not another format of this one.
         guard prefersObjectAudio,
               let fallback = tracks.first(where: { $0.id == Int(defaultIndex) }),
-              !isRenderableObjectAudio(fallback),
-              let language = fallback.language
+              !isRenderableObjectAudio(fallback)
         else { return nil }
+        // With no track tagged at all (`und`, empty, none) there is nothing to tell dubs apart by, and
+        // demo discs like Dolby's Unfold tag nothing and list the E-AC-3 JOC as the probe's best stream.
+        // One tagged track is enough to show the file names its dubs, so the default then stays.
+        guard let language = fallback.language, LanguageTag(language) != nil else {
+            guard tracks.allSatisfy({ LanguageTag($0.language) == nil }) else { return nil }
+            return tracks.first(where: isRenderableObjectAudio).map { Int32($0.id) }
+        }
         let candidates = tracks.compactMap { track -> (track: TrackInfo, rank: Int)? in
             guard isRenderableObjectAudio(track),
                   let rank = languageMatchRank(track.language, language, kind: .audio),
@@ -831,19 +870,27 @@ extension AetherEngine {
         return "VideoToolbox \(name) (HW)"
     }
 
-    /// User-facing label for the active audio decoder on the SW path (libavcodec -> CoreAudio). nil when
-    /// no audio track. AE#462: `activeIndex` is the HOST's resolved index, never the engine's pick. The
-    /// pick says which track was asked for; a session whose decoder refused to open serves none, and
-    /// this label used to name one for it.
+    /// User-facing label for the active audio pipeline on the SW path. nil when no audio track. AE#462:
+    /// `activeIndex` is the HOST's resolved index, never the engine's pick. The pick says which track was
+    /// asked for; a session whose decoder refused to open serves none, and this label used to name one
+    /// for it. `route` is the host's `audioRoute`: the PCM decode is libavcodec into CoreAudio, the Atmos
+    /// routes are named the way the loopback route names its own APAC ("TRUEHD Atmos → APAC 7.1.4").
     nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
-        activeIndex: Int32
+        activeIndex: Int32,
+        route: SoftwareAtmosRoute = .pcm
     ) -> String? {
         guard activeIndex >= 0,
               let track = audioTracks.first(where: { $0.id == Int(activeIndex) }) else {
             return nil
         }
-        return "libavcodec \(track.codec.uppercased()) → CoreAudio"
+        let codec = track.codec.uppercased()
+        switch route {
+        case .pcm: return "libavcodec \(codec) → CoreAudio"
+        case .compressedEAC3JOC: return "\(codec) Atmos → renderer (compressed)"
+        case .apac(let layout):
+            return codec.hasPrefix("DTS") ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
+        }
     }
 
     // MARK: - Format / frame-rate probing
@@ -1041,14 +1088,13 @@ extension AetherEngine {
         hostAsserts: Bool,
         criteriaReadoutAtLoad: Bool?,
         attemptWhenUnproven: Bool,
-        isLive: Bool,
         displayEligibleForHDR: Bool,
         panelRefusedHDRMaster: Bool
     ) -> Bool {
         sessionRoutesAsHDRPanel(
             panelPresentsHDR: sessionPanelPresentsHDR(
                 hostAsserts: hostAsserts, criteriaReadout: criteriaReadoutAtLoad),
-            attemptWhenUnproven: attemptWhenUnproven && !isLive,
+            attemptWhenUnproven: attemptWhenUnproven,
             displayEligibleForHDR: displayEligibleForHDR,
             panelRefusedHDRMaster: panelRefusedHDRMaster)
     }

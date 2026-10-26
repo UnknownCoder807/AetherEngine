@@ -1,13 +1,13 @@
 {
-  "originHash" : "7816b11b113ce741ab17b588aa7b4d9eb9f27d3c190e97a227916509bcc7ba8d",
+  "originHash" : "d92f37d07502845c43317db6f95111e8a97ee005f8cd3a59e2521da707eb622c",
   "pins" : [
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/superuser404notfound/FFmpegBuild",
       "state" : {
-        "revision" : "013c48bd4d3073428f31cade039ec4ed958d0ceb",
-        "version" : "3.7.1"
+        "revision" : "2c7977df9c3e337e4d6a46cc506d7914d7d2b61e",
+        "version" : "3.10.1"
       }
     },
     {
@@ -17,24 +17,6 @@
       "state" : {
         "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
         "version" : "2.1.0"
-      }
-    },
-    {
-      "identity" : "libdtsx",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibDTSX",
-      "state" : {
-        "revision" : "7d68c8bbda348a10e169b9bb9619c8b2b7a0c642",
-        "version" : "3.0.0"
-      }
-    },
-    {
-      "identity" : "libtruehd",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibTrueHD",
-      "state" : {
-        "revision" : "aebd5ffe1046dadbea833ce87a75d00fd8b1edd1",
-        "version" : "3.0.0"
       }
     },
     {

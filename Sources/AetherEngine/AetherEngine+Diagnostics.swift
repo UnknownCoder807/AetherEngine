@@ -219,6 +219,8 @@ extension AetherEngine {
         HTTPDiscIOReader.resetLifetimeFetchedBytes()
         // #134: currentTime()/loadedTimeRanges are sync XPC reads; hop them off the main actor.
         let probeReadQueue = DispatchQueue(label: "engine.memprobe.avfread", qos: .utility)
+        let cpuSampler = ThreadCPUSampler()
+        _ = cpuSampler.sample()
         memoryProbeTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
@@ -367,6 +369,9 @@ extension AetherEngine {
                     + "seams=\(self.presentationAxis.seams.count)"
 
                 EngineLog.emit(line, category: .engine)
+                if let cpu = cpuSampler.sample() {
+                    EngineLog.emit("[AetherEngine] cpuprobe t=\(elapsed)s " + cpu.logFragment(), category: .engine)
+                }
 
                 // #250: the steady-state cadence for the subtitle-resolution statement. It rides
                 // the memprobe rather than the 2 Hz drain tick because it states a span, and a
@@ -487,6 +492,25 @@ extension AetherEngine {
     }
 
     // MARK: - Live telemetry bridge
+
+    /// Lifecycle callbacks can arrive after stop or a new load. Only cleanup may publish after
+    /// the owning session has detached; the token still prevents it crossing into its successor.
+    func acceptSessionCacheStatus(_ status: SessionCacheStatus, token: UInt64) {
+        guard token == sessionCacheStatusToken else { return }
+        guard status.cleanupResult != .notRun || nativeVideoSession != nil else { return }
+        diagnostics.sessionCacheStatus = status
+    }
+
+    /// Read the cache ledger off-main. An old tick must never overwrite a new session or cleanup.
+    func refreshSessionCacheStatus() async {
+        guard let session = nativeVideoSession else { return }
+        let token = sessionCacheStatusToken
+        let generation = loadGeneration
+        let status = await BlockingWork.detached(priority: .utility) { session.sessionCacheStatus() }.value
+        guard !Task.isCancelled, sessionCacheStatusToken == token, loadGeneration == generation,
+              nativeVideoSession === session else { return }
+        diagnostics.sessionCacheStatus = status
+    }
 
     /// Single write-through point: sampler never reaches into `EngineDiagnostics` directly.
     func applyLiveTelemetry(_ snapshot: LiveTelemetry) {

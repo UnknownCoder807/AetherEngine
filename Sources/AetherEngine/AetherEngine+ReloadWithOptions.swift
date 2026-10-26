@@ -294,9 +294,9 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
 /// deciding which half it belongs in.
 enum SessionOptionCorrection {
 
-    /// The fields that NAME the session rather than tune it. Each opens the source on a different
-    /// pipeline, and the engine writes the last two itself, so a host write races its determination.
+    /// The fields that NAME the session rather than tune it: source pipeline and diagnostic identity.
     static let loadIdentityFields: [String] = [
+        "sourceDiagnosticsContext",
         "isLive",
         "audioOnly",
         "nativeRemoteHLS",
@@ -333,6 +333,10 @@ enum SessionOptionCorrection {
     /// torn down, so it does not ride on reflection.
     static func refusedFields(from current: LoadOptions, to proposed: LoadOptions) -> [String] {
         var refused: [String] = []
+        // Internal reopens retain the load's request identity; a new identity needs a new load.
+        if proposed.sourceDiagnosticsContext != current.sourceDiagnosticsContext {
+            refused.append("sourceDiagnosticsContext")
+        }
         if proposed.isLive != current.isLive { refused.append("isLive") }
         if proposed.audioOnly != current.audioOnly { refused.append("audioOnly") }
         if proposed.nativeRemoteHLS != current.nativeRemoteHLS { refused.append("nativeRemoteHLS") }
@@ -443,18 +447,19 @@ enum SessionOptionCorrection {
     /// right for a tuning lever and wrong for an identity one, so the choice has to be made
     /// deliberately. Update this list and, if the field names the session, `loadIdentityFields`.
     static let knownFields: [String] = [
+        "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
         "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "objectAudioRendering", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
         "softwareDVRRetention",
-        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveJoinStartsImmediately",
+        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "progressiveSegmentDelivery", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
         "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
     ]

@@ -18,6 +18,13 @@ import AetherLibavcodec
 /// Adding a number to the docs? Pin it here in the same commit.
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
+    func testDemuxNSErrorCaseCodesMatchDocumentation() throws {
+        XCTAssertEqual((DemuxerError.openFailed(code: -1) as NSError).code, 0)
+        XCTAssertEqual((DemuxerError.streamInfoFailed(code: -1) as NSError).code, 1)
+        XCTAssertEqual((DemuxerError.readFailed(code: -1) as NSError).code, 2)
+        assertDocumented("0 (open), 1 (stream information), and 2 (read)", try documentation())
+    }
+
     func testLiveReplayQuarantineBoundsMatchDocumentation() throws {
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingBytes, 96 * 1_024 * 1_024)
         XCTAssertEqual(LivePacketReplayGuard.maximumPendingPackets, 10_000)
@@ -116,6 +123,16 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(SoftwareLiveJoinPolicy.maximumSettleSeconds, 1.5)
         XCTAssertEqual(SoftwareLiveJoinPolicy.calmWindowSeconds, 0.25)
         assertDocumented("`SoftwareLiveJoinPolicy.leadSeconds` (4 s) behind the newest media", try documentation())
+    }
+
+    /// docs/formats.md quotes the segmented holdback of a live HLS ingest on the software path (AE#813).
+    func testSoftwareLiveHoldbackMatchesDocumentation() throws {
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 2).joinLeadSeconds, 4)
+        XCTAssertEqual(SoftwareLiveHoldback(deliveryUnitSeconds: 10).joinLeadSeconds, 16)
+        XCTAssertEqual(SoftwareLiveHoldback.maximumLeadSeconds, 45)
+        XCTAssertEqual(SoftwareLiveHoldback.resumeSlackSeconds, 2)
+        assertDocumented("`1.5 x segment + 1 s` behind the newest media (4 s on 2 s segments, 16 s on 10 s segments, at most 45 s)",
+                         try documentation())
     }
 
     // MARK: - Documentation corpus
