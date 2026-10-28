@@ -10,7 +10,18 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Privacy manifests for the required-reason APIs (#920).** The engine calls three categories on Apple's
+  required-reason list and now declares them in a `PrivacyInfo.xcprivacy` in its resource bundle: system boot time
+  (35F9.1, `systemUptime` for elapsed time), disk space (E174.1, checked before packets spool to disk) and file
+  timestamp (C617.1 for its own temp and cache files, 3B52.1 for local media the host opens). No tracking, no
+  collected data. FFmpegBuild 3.10.2 adds the matching manifest to the three FFmpeg frameworks that `stat` files
+  (FFmpegBuild#10), so an app embedding the engine no longer declares any of these calls itself (ITMS-91053).
+
+### Changed
+
+- **FFmpegBuild 3.10.2.** Only the privacy manifests above; the FFmpeg code is byte-identical to 3.10.1.
 
 ## [7.51.0] - 2026-10-28
 
