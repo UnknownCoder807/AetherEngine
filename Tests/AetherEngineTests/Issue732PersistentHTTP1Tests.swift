@@ -863,7 +863,9 @@ struct PersistentHLSSegmentAdmissionTests {
         }
         if exit == .consume || exit == .seek {
             #expect(server.requests.filter { $0.path == "/seg2.ts" }.count == 1)
-            #expect(server.connectionCount == 1)
+            // The seek abandons seg1's body, and a drain that misses `drainDeadline` closes the socket
+            // by design. A starved runner gets there (CI read 2 here), so only consumption pins reuse.
+            #expect(server.connectionCount <= (exit == .seek ? 2 : 1))
             #expect(server.maxInFlight == 1)
         }
     }
