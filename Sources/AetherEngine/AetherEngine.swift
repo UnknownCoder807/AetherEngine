@@ -200,6 +200,20 @@ public final class AetherEngine: ObservableObject {
         sourceAuthorizationRefusedSubject.eraseToAnyPublisher()
     }
 
+    /// Forwards a refusal from the current session's header store to `sourceAuthorizationRefused`. The store holds
+    /// this closure, so it holds the store weakly: a strong capture kept every session's store (and its headers)
+    /// alive after the session ended.
+    func relayCredentialRefusals(of store: RequestHeaderStore) {
+        store.onCredentialRefusal = { [weak self, weak store] status in
+            Task { @MainActor [weak self, weak store] in
+                guard let self, let store, self.sessionRequestHeaders === store else { return }
+                EngineLog.emit("[AetherEngine] AE#792: source refused the request headers (HTTP \(status))",
+                               category: .engine)
+                self.sourceAuthorizationRefusedSubject.send(status)
+            }
+        }
+    }
+
     let sourceAuthorizationRefusedSubject = PassthroughSubject<Int, Never>()
 
     /// Monotonic id source for `SeekEvent`. Deliberately NOT `seekGeneration`: that counter is the
@@ -4426,15 +4440,7 @@ public final class AetherEngine: ObservableObject {
         // AE#792: a fresh store per load, so a header rotated on the previous session can never reach
         // this one through a reader that outlived it.
         sessionRequestHeaders = RequestHeaderStore(options.httpHeaders)
-        let refusalStore = sessionRequestHeaders
-        refusalStore.onCredentialRefusal = { [weak self] status in
-            Task { @MainActor [weak self] in
-                guard let self, self.sessionRequestHeaders === refusalStore else { return }
-                EngineLog.emit("[AetherEngine] AE#792: source refused the request headers (HTTP \(status))",
-                               category: .engine)
-                self.sourceAuthorizationRefusedSubject.send(status)
-            }
-        }
+        relayCredentialRefusals(of: sessionRequestHeaders)
         audioSessionRequestsOwnedByAVFoundation = false
         // #377: register the host's concurrency ceiling for this origin before anything fetches
         // from it. Keyed on the origin rather than the load, so the subtitle side reader and any

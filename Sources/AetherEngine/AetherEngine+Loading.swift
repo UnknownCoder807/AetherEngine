@@ -947,76 +947,7 @@ extension AetherEngine {
         session.onFirstHDR10PlusDetected = { [weak self] in
             self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
         }
-        session.onPlaylistShiftChanged = { [weak self] seconds, seamItemSeconds in
-            self?.hop(for: generation) { [weak self] in
-                guard let self = self else { return }
-                let prevShift = self.playlistShiftSeconds
-                let delta = seconds - prevShift
-                // AE#105 / AE#270: `duration` is 0-based for every source, so the published playhead has to
-                // be too. The origin is the source PTS of the item's first frame: a disc re-reads it from
-                // every publish (constant STC base), any other VOD source latches the first one (its later
-                // shifts carry producer drift), live keeps 0. See `PresentationOriginPolicy`.
-                self.sourcePresentationOrigin = PresentationOriginPolicy.origin(
-                    latched: self.latchedPresentationOrigin,
-                    publishedShift: seconds,
-                    isLive: self.isLive,
-                    isDisc: !self.discTitles.isEmpty
-                )
-                self.latchedPresentationOrigin = self.sourcePresentationOrigin
-                // #260: a live retune/reopen replaces the whole timeline (nothing older comes back on screen), so
-                // the history re-anchors. A VOD producer only writes from `seamItemSeconds` forward; whatever sits
-                // below that on the item axis was muxed by the previous producer, can still be in AVPlayer's
-                // buffer, and has to keep folding with the previous shift. Collapsing the history here (as this
-                // did before) hands every consumer the new shift for old-epoch bytes.
-                if self.isLive {
-                    if self.liveDisplayShiftSeconds == nil {
-                        self.liveDisplayShiftSeconds = seconds
-                    }
-                    self.setPresentationAxis(.anchored(shiftSeconds: seconds))
-                } else {
-                    var map = self.presentationAxis
-                    map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamItemSeconds)
-                    self.setPresentationAxis(map)
-                }
-                // Fold with the shift in effect AT the raw clock, not with the newest one: while old-epoch buffer
-                // is still on screen those differ, and the picture is what the clock has to describe.
-                let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
-                if activeShift != self.playlistShiftSeconds { self.playlistShiftSeconds = activeShift }
-                // The cache did not move, but the fold onto the display axis did. Re-publish the band
-                // from the raw spans so it does not carry the retired epoch's offset until the next
-                // segment lands (AE#468 follow-up).
-                self.republishResidentRanges()
-                // AE#422: read off-main before building the line (see `avPlayerBufferAheadSeconds`).
-                let avBufAhead = await self.avPlayerBufferAheadSeconds()
-                // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
-                self.clock.currentTime = self.isLive && self.videoRoute == .loopback
-                    ? self.nativeClockSeconds + self.liveSessionShiftSeconds
-                        + self.liveItemAxisOffsetSeconds
-                    : PresentationAxis.display(
-                        sourcePTS: self.nativeClockSeconds + activeShift,
-                        origin: self.displayOrigin(forShift: activeShift))
-                // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
-                EngineLog.emit(
-                    "[AetherEngine] VOD shift published: \(String(format: "%.3f", seconds))s "
-                    + "(prev \(String(format: "%.3f", prevShift))s, delta \(String(format: "%.3f", delta))s, "
-                    + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) "
-                    + "seamAt=\(String(format: "%.3f", seamItemSeconds))s "
-                    + "seams=\(self.presentationAxis.seams.count) "
-                    + "foldShift=\(String(format: "%.3f", activeShift))s "
-                    + "presentationOrigin=\(String(format: "%.3f", self.sourcePresentationOrigin))s "
-                    + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
-                    + "avBufAhead=\(String(format: "%.2f", avBufAhead))s",
-                    category: .session
-                )
-                // AE#418 round 3: a fetch is not a placement. The composition assumed AVPlayer's
-                // timeline was carrying the last axis this side published; the item's own loaded
-                // ranges say whether it was. Live rebases the whole timeline at a program boundary
-                // and nothing older comes back on screen, so it composes nothing and checks nothing.
-                if !self.isLive {
-                    self.verifyPlacementAgainstLoadedRanges(session: session)
-                }
-            }
-        }
+        installPlaylistShiftRelay(on: session, generation: generation)
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
             self?.hop(for: generation) { [weak self] in
                 guard let self = self else { return }
@@ -3093,5 +3024,83 @@ extension AetherEngine {
     func refreshNativeBufferedPosition() {
         guard nativeVideoSession != nil, let host = nativeHost else { return }
         refreshNativeBufferedPosition(playlistSeconds: host.renderedTime)
+    }
+}
+
+extension AetherEngine {
+    /// Republishes a session's playlist shift on the engine. The session holds this closure, so it holds the
+    /// session weakly: a strong capture made a cycle that kept every played HLS session alive after `stop`, with
+    /// its ingest reader, URL session and caches.
+    func installPlaylistShiftRelay(on session: HLSVideoEngine, generation: UInt64) {
+        session.onPlaylistShiftChanged = { [weak self, weak session] seconds, seamItemSeconds in
+            self?.hop(for: generation) { [weak self, weak session] in
+                guard let self = self else { return }
+                let prevShift = self.playlistShiftSeconds
+                let delta = seconds - prevShift
+                // AE#105 / AE#270: `duration` is 0-based for every source, so the published playhead has to
+                // be too. The origin is the source PTS of the item's first frame: a disc re-reads it from
+                // every publish (constant STC base), any other VOD source latches the first one (its later
+                // shifts carry producer drift), live keeps 0. See `PresentationOriginPolicy`.
+                self.sourcePresentationOrigin = PresentationOriginPolicy.origin(
+                    latched: self.latchedPresentationOrigin,
+                    publishedShift: seconds,
+                    isLive: self.isLive,
+                    isDisc: !self.discTitles.isEmpty
+                )
+                self.latchedPresentationOrigin = self.sourcePresentationOrigin
+                // #260: a live retune/reopen replaces the whole timeline (nothing older comes back on screen), so
+                // the history re-anchors. A VOD producer only writes from `seamItemSeconds` forward; whatever sits
+                // below that on the item axis was muxed by the previous producer, can still be in AVPlayer's
+                // buffer, and has to keep folding with the previous shift. Collapsing the history here (as this
+                // did before) hands every consumer the new shift for old-epoch bytes.
+                if self.isLive {
+                    if self.liveDisplayShiftSeconds == nil {
+                        self.liveDisplayShiftSeconds = seconds
+                    }
+                    self.setPresentationAxis(.anchored(shiftSeconds: seconds))
+                } else {
+                    var map = self.presentationAxis
+                    map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamItemSeconds)
+                    self.setPresentationAxis(map)
+                }
+                // Fold with the shift in effect AT the raw clock, not with the newest one: while old-epoch buffer
+                // is still on screen those differ, and the picture is what the clock has to describe.
+                let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
+                if activeShift != self.playlistShiftSeconds { self.playlistShiftSeconds = activeShift }
+                // The cache did not move, but the fold onto the display axis did. Re-publish the band
+                // from the raw spans so it does not carry the retired epoch's offset until the next
+                // segment lands (AE#468 follow-up).
+                self.republishResidentRanges()
+                // AE#422: read off-main before building the line (see `avPlayerBufferAheadSeconds`).
+                let avBufAhead = await self.avPlayerBufferAheadSeconds()
+                // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
+                self.clock.currentTime = self.isLive && self.videoRoute == .loopback
+                    ? self.nativeClockSeconds + self.liveSessionShiftSeconds
+                        + self.liveItemAxisOffsetSeconds
+                    : PresentationAxis.display(
+                        sourcePTS: self.nativeClockSeconds + activeShift,
+                        origin: self.displayOrigin(forShift: activeShift))
+                // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
+                EngineLog.emit(
+                    "[AetherEngine] VOD shift published: \(String(format: "%.3f", seconds))s "
+                    + "(prev \(String(format: "%.3f", prevShift))s, delta \(String(format: "%.3f", delta))s, "
+                    + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) "
+                    + "seamAt=\(String(format: "%.3f", seamItemSeconds))s "
+                    + "seams=\(self.presentationAxis.seams.count) "
+                    + "foldShift=\(String(format: "%.3f", activeShift))s "
+                    + "presentationOrigin=\(String(format: "%.3f", self.sourcePresentationOrigin))s "
+                    + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
+                    + "avBufAhead=\(String(format: "%.2f", avBufAhead))s",
+                    category: .session
+                )
+                // AE#418 round 3: a fetch is not a placement. The composition assumed AVPlayer's
+                // timeline was carrying the last axis this side published; the item's own loaded
+                // ranges say whether it was. Live rebases the whole timeline at a program boundary
+                // and nothing older comes back on screen, so it composes nothing and checks nothing.
+                if !self.isLive, let session {
+                    self.verifyPlacementAgainstLoadedRanges(session: session)
+                }
+            }
+        }
     }
 }

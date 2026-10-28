@@ -10,7 +10,15 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Fixed
+
+- **A stopped HLS session and its request header store are released.**
+  The playlist shift callback the engine installs on each native session captured the session strongly for
+  its VOD placement check, and the credential refusal callback captured the store it is installed on. Both
+  objects hold their callback, so every played session stayed in memory after `stop` with its ingest reader,
+  URL session and caches (about 14 KB per live session, found with `leaks` on a host), and so did each
+  session's header store. Both callbacks now hold their owner weakly; a refusal still reaches
+  `sourceAuthorizationRefused` for the current session only.
 
 ## [7.50.0] - 2026-10-28
 
