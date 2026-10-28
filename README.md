@@ -671,6 +671,8 @@ establish that the rest of the package builds there or lower the supported toolc
 A separately installed newer Swift toolchain paired with an older SDK is not covered by this
 proxy. The existing macOS registration path is unchanged.
 
+**Privacy manifest.** The engine ships a `PrivacyInfo.xcprivacy` in its resource bundle for the required-reason APIs it calls (#920): system boot time (35F9.1, `systemUptime` for elapsed time), disk space (E174.1, checked before packets spool to disk) and file timestamp (C617.1 for its own temp and cache files, 3B52.1 for local media the host opens). The FFmpeg frameworks carry their own from FFmpegBuild 3.10.2 on. Neither tracks or collects anything, so an app embedding the engine has nothing of the engine's to add to its own manifest.
+
 The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that still supports those pins the 6.x line with `.upToNextMajor(from: "6.89.1")`.
 
 ### Optional components
