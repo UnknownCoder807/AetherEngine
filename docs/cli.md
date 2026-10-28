@@ -533,6 +533,12 @@ Loads a Dolby Vision Profile 5 / 10.0 source on the native path, plays it for `-
 swift run aetherctl scrubpreview --throttle-kbps 20000 --at 2,30,50,65 --keep /tmp/previews <p5-source>
 ```
 
+`--stills` asks `scrubPreviewFrame` instead, for any source, and prints for each position whether it was resident, the `actualSeconds` of the still and the span it names. A position outside the resident window is answered by the keyframe still ladder, so warm long enough for it (15 s grace, then one rung every 2 s while the origin is idle). `--max-concurrent-requests N` and `--forward-buffer-segments N` pass through to `LoadOptions`; `1` is the one-connection plan the ladder exists for. Put a Range-logging origin in front and read it alongside: every rung must arrive with nothing else in flight.
+
+```bash
+swift run aetherctl scrubpreview --stills --max-concurrent-requests 1 --warm 75 --at 20,300,610,1150 http://127.0.0.1:8931/movie.mkv
+```
+
 ## extract
 
 Opens a `FrameExtractor` against the source and pulls a still frame. Thumbnail mode (default) snaps to the nearest keyframe and downscales to `--width` (default 320); `--preview` decodes frame-accurately at `--width`, while `--snapshot` uses full resolution. The two flags are mutually exclusive. `--at <sec>` sets the seek position (default 60.0). The first frame is written to `aetherctl-extract-<mode>.png` in aetherctl's private per-user temporary directory (the path is printed). `--loops N` repeats the extraction across eight cycling positions, which pairs with `leaks --atExit` to validate the decode-context teardown is clean:

@@ -527,17 +527,25 @@ if first == "scrubpreview" {
     let at = takeStringFlag("--at", from: &rest) ?? "2,5,30,50,65"
     let warm = takeDoubleFlag("--warm", from: &rest) ?? 4
     let keep = takeStringFlag("--keep", from: &rest)
+    let stills = takeFlag("--stills", from: &rest)
+    let maxRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
+    let forward = takeIntFlag("--forward-buffer-segments", from: &rest)
     if let kbps = takeIntFlag("--throttle-kbps", from: &rest) {
         AetherEngine.setSourceThrottleKbpsForTesting(kbps)
         print("[aetherctl] source throttle: \(kbps) kbit/s")
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
-        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] <url>")
+        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] "
+              + "[--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "scrubpreview")
     let positions = at.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    if stills {
+        exit(runScrubStills(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm,
+                            maxConcurrentRequests: maxRequests, forwardBufferSegments: forward))
+    }
     exit(runScrubPreview(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm, keepDir: keep))
 }
 
