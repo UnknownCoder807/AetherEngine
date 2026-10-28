@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.51.0] - 2026-10-28
+
 ### Added
 
 - **Scrub stills beyond the buffer on a one-connection origin (keyframe still ladder).** `scrubPreviewFrame` used to
@@ -50,6 +54,14 @@ the public-API contract.
   clock is now matched against the same decoder's repaired frame times and used for coverage, residency and seek
   anchors; the packets themselves are unchanged. Packed bitstreams and anything else that is not one picture per
   packet stay uncovered rather than guessed. Contributed by orut34iop.
+- **A 12 s stall after a CDN cut a pinned connection mid-range.** The keep-pin grace for rate-limited refusals
+  (`509` / `429`) rides out the slot of a connection the reader itself just ended. When the origin or the network cut
+  the last delivering connection instead, the edge has revoked the pinned session, and three refusals against the
+  pin cost 9 s before a fresh redirect answered `206` at once. The first refusal after such a cut now drops the pin
+  and skips the backoff, once per cut. Reported by StreamX on 7.50.0.
+- **A pause issued right after the audio clock started could leave it running.** `setPlaybackEnabled(false)` stopped
+  the synchronizer only when its rate read nonzero, and that readback lags `setRate(1)`. It now stops it
+  unconditionally.
 
 ## [7.50.0] - 2026-10-28
 
