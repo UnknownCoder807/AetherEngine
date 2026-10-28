@@ -43,21 +43,39 @@ final class GPUFrameConverter: @unchecked Sendable {
 
     private static let pageSize = Int(getpagesize())
 
+    /// Device, queue and pipelines, compiled once per process: every 10-bit AV1 open (each load, each still
+    /// extractor) builds a converter, and a compile from source would sit on its time to first frame. A
+    /// failure is kept too, so a shader that does not compile costs one attempt.
+    private struct Shared: @unchecked Sendable {
+        let device: MTLDevice
+        let queue: MTLCommandQueue
+        let luma: MTLComputePipelineState
+        let chroma: MTLComputePipelineState
+
+        static let instance: Shared? = {
+            guard let dev = MTLCreateSystemDefaultDevice(), let queue = dev.makeCommandQueue() else { return nil }
+            do {
+                let library = try dev.makeLibrary(source: AV1FilmGrainShaderSource.source, options: nil)
+                guard let lumaFn = library.makeFunction(name: "fg_luma"),
+                      let chromaFn = library.makeFunction(name: "fg_chroma") else { return nil }
+                return Shared(device: dev, queue: queue,
+                              luma: try dev.makeComputePipelineState(function: lumaFn),
+                              chroma: try dev.makeComputePipelineState(function: chromaFn))
+            } catch {
+                EngineLog.emit("[GPUFrameConverter] Metal shader compilation failed: \(error)", category: .swPlayback)
+                return nil
+            }
+        }()
+    }
+
     init?() {
-        guard let dev = MTLCreateSystemDefaultDevice(), let queue = dev.makeCommandQueue() else { return nil }
+        guard let shared = Shared.instance else { return nil }
+        let dev = shared.device
         device = dev
-        self.queue = queue
+        queue = shared.queue
+        luma = shared.luma
+        chroma = shared.chroma
         supportsNonUniformThreadgroups = dev.supportsFamily(.apple4) || dev.supportsFamily(.mac2)
-        do {
-            let library = try dev.makeLibrary(source: AV1FilmGrainShaderSource.source, options: nil)
-            guard let lumaFn = library.makeFunction(name: "fg_luma"),
-                  let chromaFn = library.makeFunction(name: "fg_chroma") else { return nil }
-            luma = try dev.makeComputePipelineState(function: lumaFn)
-            chroma = try dev.makeComputePipelineState(function: chromaFn)
-        } catch {
-            EngineLog.emit("[GPUFrameConverter] Metal shader compilation failed: \(error)", category: .swPlayback)
-            return nil
-        }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, dev, nil, &cache) == kCVReturnSuccess else { return nil }
         textureCache = cache
