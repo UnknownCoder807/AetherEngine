@@ -1925,6 +1925,7 @@ public final class Demuxer: @unchecked Sendable {
         let isForced = (disposition & AV_DISPOSITION_FORCED) != 0
         let isHearingImpaired = (disposition & AV_DISPOSITION_HEARING_IMPAIRED) != 0
         let isCommentary = (disposition & AV_DISPOSITION_COMMENT) != 0
+        let isVisualImpaired = (disposition & AV_DISPOSITION_VISUAL_IMPAIRED) != 0
         let channels = Int(codecpar.pointee.ch_layout.nb_channels)
         let bitrate = declaredBitrate(stream: stream)
 
@@ -1958,6 +1959,7 @@ public final class Demuxer: @unchecked Sendable {
             isForced: isForced,
             isHearingImpaired: isHearingImpaired,
             isCommentary: isCommentary,
+            isVisualImpaired: isVisualImpaired,
             isAtmos: isAtmos,
             assHeader: assHeader,
             sampleRate: isAudio ? Int(codecpar.pointee.sample_rate) : 0,
