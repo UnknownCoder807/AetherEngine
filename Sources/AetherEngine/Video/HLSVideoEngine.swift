@@ -2521,6 +2521,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 secondReaderAvailable: sourceReopenableByURL)) == .served
         stillLadderLock.lock()
         stillLadderStartedAt = .now()
+        stillLadderLastRungAt = nil
+        stillLadderCached.removeAll()
+        stillLadderFailures.removeAll()
+        stillLadderComplete = false
         stillLadderLock.unlock()
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
         // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
