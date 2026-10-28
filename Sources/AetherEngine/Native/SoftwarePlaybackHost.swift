@@ -4392,6 +4392,7 @@ final class SoftwarePlaybackHost {
                     // landing stays paused (rate 0 already).
                     if isPlaying(), clockArmed(), let aOut = audioOutput {
                         rebuffering = true
+                        noteRebuffering(true)
                         aOut.pause()
                         EngineLog.emit(
                             "[SWHost] post-seek hold: clock parked at "
