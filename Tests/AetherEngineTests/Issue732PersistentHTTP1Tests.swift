@@ -346,10 +346,11 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
     func testSteadySlowBodyIsNeverCutOff() async throws {
         let server = try XCTUnwrap(KeepAliveOrigin())
         defer { server.stop() }
-        // 40 packets 50 ms apart: two seconds in all, against a read timeout of 0.3 s.
-        let body = Self.transportStream(marker: 7, packets: 40)
+        // 80 packets 50 ms apart: four seconds in all, against a read timeout of 1 s. The margin is
+        // per gap, and a starved CI runner stretched one 50 ms gap past the 0.3 s this used to allow.
+        let body = Self.transportStream(marker: 7, packets: 80)
         server.route = { _ in .init(body: body, trickleUs: 50_000) }
-        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 0.3)
+        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 1)
         defer { transport.close() }
 
         let answer = try await transport.get(server.url("/slow"), headers: [:], limit: 1 << 20)
@@ -811,8 +812,13 @@ struct PersistentHLSSegmentAdmissionTests {
             return .init(body: encryptedFrom.map { index >= $0 } == true
                 ? Issue732PersistentHTTP1Tests.aes128CBC(clear, key: key) : clear)
         }
+        // The factory turns a probe error into nil and only logs it. CI declined once under load
+        // (main d6c46ee6) and nothing said why, so a failure carries the logged reason.
+        let log = EngineLogCapture()
+        defer { log.end() }
         let reader = try #require(try await HLSVODIngestReader.makeIfHEVCMPEGTS(
-            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true))
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true),
+            "declined: \(log.matching("[HLSVODIngest]").suffix(6))")
         defer { reader.close() }
         let firstRead = ProbeTestJob { () -> Int32 in
             var bytes = [UInt8](repeating: 0, count: 188)
@@ -863,7 +869,9 @@ struct PersistentHLSSegmentAdmissionTests {
         }
         if exit == .consume || exit == .seek {
             #expect(server.requests.filter { $0.path == "/seg2.ts" }.count == 1)
-            #expect(server.connectionCount == 1)
+            // The seek abandons seg1's body, and a drain that misses `drainDeadline` closes the socket
+            // by design. A starved runner gets there (CI read 2 here), so only consumption pins reuse.
+            #expect(server.connectionCount <= (exit == .seek ? 2 : 1))
             #expect(server.maxInFlight == 1)
         }
     }

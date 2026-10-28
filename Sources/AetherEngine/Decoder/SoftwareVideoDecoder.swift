@@ -190,6 +190,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// from one that is not.
     private var loggedSendFailure = false
 
+    /// Configured before open, only for the AVI MPEG-4 software-cache route. Observation metadata
+    /// never supplies frame timestamps; the established reorder/repair algorithm is unchanged.
+    var onCacheTiming: (@Sendable (UInt64, Int64, Int64) -> Void)?
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -264,6 +268,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var opts: OpaquePointer?
         av_dict_set(&opts, "hwaccel", "none", 0)
 
+        if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
         guard avcodec_open2(ctx, codec, &opts) >= 0 else {
             av_dict_free(&opts)
             throw VideoDecoderError.sessionCreationFailed(status: -2)
@@ -396,6 +401,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                         category: .swPlayback
                     )
                 }
+            }
+
+            if let onCacheTiming, let (sourceEpoch, position) = SoftwarePacketCacheIdentity.identity(f) {
+                onCacheTiming(sourceEpoch, position, f.pointee.pts)
             }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
@@ -599,6 +608,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
         onFrame = nil
+        onCacheTiming = nil
         lock.unlock()
     }
 

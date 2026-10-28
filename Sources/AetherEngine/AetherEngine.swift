@@ -6442,6 +6442,7 @@ public final class AetherEngine: ObservableObject {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
             // never lands and the recovery chain must aim here, not at the frozen clock.
             setPendingRecoverySeekTarget(clockTarget)
+            refreshNativeBufferedPosition()
             pendingSeekProgressAccum = 0
             let renderedAtSeekStart = nativeHost?.renderedTime ?? 0
             pendingSeekInitialRenderedPosition = renderedAtSeekStart

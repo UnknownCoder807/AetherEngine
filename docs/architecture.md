@@ -627,6 +627,7 @@ Sources/AetherEngine/
 │   └── WebVTTSegmentParser.swift            One parsed WebVTT segment of a live SUBTITLES rendition: cue times are in the segment's own local clock (a counter providers run for days), and placement comes from the playlist geometry rather than the `X-TIMESTAMP-MAP` the spec offers (#359)
 ├── Video/
 │   ├── HLSVideoEngine.swift                 Native path: session orchestrator (start/stop, producer construction + restart, shift handling)
+│   ├── KeyframeStillLadder.swift            Native VOD: which keyframe the sparse scrub-still ladder reads next (one a minute, then every 30 s, nearest the playhead first) and whether the origin is idle enough to read it (nothing in flight or queued, no recent refusal, 30 s buffered), so `scrubPreviewFrame` can answer beyond the resident window on a one-connection plan
 │   ├── HLSVideoEngine+AudioRoute.swift      Native path: stream-copy -> FLAC-bridge -> video-only audio cascade
 │   ├── HLSVideoEngine+SegmentPlanning.swift Native path: keyframe / uniform segment plans, extradata + AAC fixups
 │   ├── HLSVideoEngine+LiveReopen.swift      Native path: live source-loss recovery (capped-backoff reopen on the same timeline); VOD backpressure-wedge re-anchor + consumer re-engage nudge, which re-reads the rendered position at nudge time so the zero-tolerance seek never lands behind the on-screen frame (#115)

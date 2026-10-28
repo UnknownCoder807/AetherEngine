@@ -10,6 +10,16 @@ the public-API contract.
 
 ## [Unreleased]
 
+### Added
+
+- **Scrub stills beyond the buffer on a one-connection origin (keyframe still ladder).** `scrubPreviewFrame` used to
+  return nil for every position no resident segment covers, and a host on a plan that allows one connection had no
+  way to fill it. While the origin has nothing in flight, a native VOD session now reads one keyframe every 2 s off
+  the source, one a minute across the title first, then every 30 s, nearest the playhead first, through the same
+  request budget the pump uses, so it never opens a second concurrent request. A miss is answered with the nearest
+  rung within 60 s, labelled by its own `actualSeconds` and `validRange`. Reported by StreamX on 7.48.0. aetherctl
+  `scrubpreview --stills` measures it.
+
 ### Changed
 
 - **10-bit AV1 gets its film grain and P010 conversion on the GPU on the software host.**
@@ -19,7 +29,20 @@ the public-API contract.
   (pinned in CI against dav1d's own `dav1d_apply_grain`). On an M5 Pro, CPU time per frame drops from 36.5 to
   31.6 ms and real-time playback from 93-95 % to 82-83 % CPU, at the same peak decode speed. An Apple TV 4K
   (3rd generation) plays 20 minutes of a 4K AV1 Dolby Vision 10.1 film on this route at 151 % CPU on average.
-  8-bit AV1 and anything the pass refuses keep `sws_scale`. See `docs/formats.md`.
+  8-bit AV1 keeps dav1d's grain and `sws_scale`; a 10-bit frame the pass refuses falls back to `sws_scale` without grain. See `docs/formats.md`.
+
+### Fixed
+
+- **`bufferedPosition` during a pending native seek.** `currentTime` jumps to the seek target at once, but the buffer
+  was still measured from the frame AVPlayer showed, so after a backward scrub it read thousands of seconds ahead and
+  after a forward one it fell below the playhead. It is now measured from the target and never reads below
+  `currentTime`. Reported by StreamX on 7.48.0.
+- **`residentRanges` on AVI MPEG-4 with B-frames (#916).** The decode-order repair clears the packet PTS on these
+  files, and the software packet cache indexes video by packet PTS, so it held bytes but published no video range and
+  no seek anchor: the buffer bar stayed empty and every seek went back to the source. The MPEG-4 parser's display
+  clock is now matched against the same decoder's repaired frame times and used for coverage, residency and seek
+  anchors; the packets themselves are unchanged. Packed bitstreams and anything else that is not one picture per
+  packet stay uncovered rather than guessed. Contributed by orut34iop.
 
 ## [7.50.0] - 2026-10-28
 

@@ -89,6 +89,11 @@ struct Sodalite104PausedFirstFrameTests {
 
         #expect(correctionEntered)
         #expect(!host.isPlaying)
+        // The synchronizer reports its rate asynchronously, so a stop can still read 1 for a while
+        // on a starved runner. Block the main actor while it settles: the queued correction must
+        // not run yet, or it would mask a restart. A real restart keeps reading 1.
+        let settleDeadline = Date().addingTimeInterval(2)
+        while output.rate != 0, Date() < settleDeadline { usleep(5_000) }
         #expect(output.rate == 0, "the feeder must not restart a clock pause() just stopped")
         try await drainClockArmCallbacks()
         #expect(output.rate == 0, "the queued correction sees the completed pause")
