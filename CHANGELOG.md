@@ -26,6 +26,12 @@ the public-API contract.
   was still measured from the frame AVPlayer showed, so after a backward scrub it read thousands of seconds ahead and
   after a forward one it fell below the playhead. It is now measured from the target and never reads below
   `currentTime`. Reported by StreamX on 7.48.0.
+- **`residentRanges` on AVI MPEG-4 with B-frames (#916).** The decode-order repair clears the packet PTS on these
+  files, and the software packet cache indexes video by packet PTS, so it held bytes but published no video range and
+  no seek anchor: the buffer bar stayed empty and every seek went back to the source. The MPEG-4 parser's display
+  clock is now matched against the same decoder's repaired frame times and used for coverage, residency and seek
+  anchors; the packets themselves are unchanged. Packed bitstreams and anything else that is not one picture per
+  packet stay uncovered rather than guessed. Contributed by orut34iop.
 
 ## [7.50.0] - 2026-10-28
 
@@ -40,15 +46,6 @@ the public-API contract.
   force one. Measured on an Apple TV 4K into a Sonos, on an iPhone with AirPods and on a MacBook Air (speakers and
   AirPods), 7.1.4 and 9.1.6, every channel on its own speaker. `.apac` is unchanged. aetherctl takes
   `--bed-format apac|lpcm`. See `docs/formats.md`.
-
-### Fixed
-
-- **AVI MPEG-4 software VOD can publish retained cache ranges when decode-order repair
-  suppresses packet PTS.** Qualify the existing parser's display clock against the
-  same decoder's repaired frame timestamps, then share that axis with coverage,
-  residency and seek anchors without changing decoder input. Temporary pairing
-  retirement preserves confirmed retained history; actual store eviction still
-  removes it. Includes generated reproduction material and disk / memory cache tests.
 
 ## [7.49.0] - 2026-10-27
 
