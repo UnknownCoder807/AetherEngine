@@ -812,8 +812,13 @@ struct PersistentHLSSegmentAdmissionTests {
             return .init(body: encryptedFrom.map { index >= $0 } == true
                 ? Issue732PersistentHTTP1Tests.aes128CBC(clear, key: key) : clear)
         }
+        // The factory turns a probe error into nil and only logs it. CI declined once under load
+        // (main d6c46ee6) and nothing said why, so a failure carries the logged reason.
+        let log = EngineLogCapture()
+        defer { log.end() }
         let reader = try #require(try await HLSVODIngestReader.makeIfHEVCMPEGTS(
-            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true))
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true),
+            "declined: \(log.matching("[HLSVODIngest]").suffix(6))")
         defer { reader.close() }
         let firstRead = ProbeTestJob { () -> Int32 in
             var bytes = [UInt8](repeating: 0, count: 188)
