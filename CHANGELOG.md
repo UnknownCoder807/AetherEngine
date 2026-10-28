@@ -10,7 +10,22 @@ the public-API contract.
 
 ## [Unreleased]
 
-_Nothing yet._
+### Added
+
+- **Scrub stills beyond the buffer on a one-connection origin (keyframe still ladder).** `scrubPreviewFrame` used to
+  return nil for every position no resident segment covers, and a host on a plan that allows one connection had no
+  way to fill it. While the origin has nothing in flight, a native VOD session now reads one keyframe every 2 s off
+  the source, one a minute across the title first, then every 30 s, nearest the playhead first, through the same
+  request budget the pump uses, so it never opens a second concurrent request. A miss is answered with the nearest
+  rung within 60 s, labelled by its own `actualSeconds` and `validRange`. Reported by StreamX on 7.48.0. aetherctl
+  `scrubpreview --stills` measures it.
+
+### Fixed
+
+- **`bufferedPosition` during a pending native seek.** `currentTime` jumps to the seek target at once, but the buffer
+  was still measured from the frame AVPlayer showed, so after a backward scrub it read thousands of seconds ahead and
+  after a forward one it fell below the playhead. It is now measured from the target and never reads below
+  `currentTime`. Reported by StreamX on 7.48.0.
 
 ## [7.50.0] - 2026-10-28
 
