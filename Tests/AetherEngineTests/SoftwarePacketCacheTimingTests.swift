@@ -30,7 +30,7 @@ struct SoftwarePacketCacheTimingTests {
         var observations: [Int64: Int64] = [:]
         func receive() {
             while avcodec_receive_frame(c, f) >= 0 {
-                if let (e, position) = SoftwarePacketCacheTiming.identity(f) {
+                if let (e, position) = SoftwarePacketCacheIdentity.identity(f) {
                     let pts = f.pointee.pts == Int64.min ? f.pointee.best_effort_timestamp : f.pointee.pts
                     timing.observe(epoch: e, position: position, pts: pts)
                     observations[position] = pts

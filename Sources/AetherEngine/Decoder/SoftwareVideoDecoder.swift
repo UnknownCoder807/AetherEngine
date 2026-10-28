@@ -381,7 +381,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 }
             }
 
-            if let onCacheTiming, let (sourceEpoch, position) = SoftwarePacketCacheTiming.identity(f) {
+            if let onCacheTiming, let (sourceEpoch, position) = SoftwarePacketCacheIdentity.identity(f) {
                 onCacheTiming(sourceEpoch, position, f.pointee.pts)
             }
 

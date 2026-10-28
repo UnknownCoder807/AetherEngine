@@ -243,22 +243,4 @@ final class SoftwarePacketCacheTiming: SoftwarePacketCacheTimingSource, @uncheck
         order.removeFirst(count)
         published = max(0, published - count)
     }
-
-    // Ref-counted private observation metadata, never serialized and never used to schedule frames.
-    static func attach(epoch: UInt64, position: Int64, to packet: UnsafeMutablePointer<AVPacket>) {
-        guard packet.pointee.opaque_ref == nil, let buffer = av_buffer_alloc(24),
-              let data = buffer.pointee.data else { return }
-        var values = [UInt64(0x434143484554494d), epoch, UInt64(bitPattern: position)]
-        values.withUnsafeMutableBytes { data.update(from: $0.baseAddress!.assumingMemoryBound(to: UInt8.self), count: 24) }
-        packet.pointee.opaque_ref = buffer
-    }
-
-    static func identity(_ frame: UnsafeMutablePointer<AVFrame>) -> (UInt64, Int64)? {
-        guard let buffer = frame.pointee.opaque_ref, buffer.pointee.size == 24,
-              let data = buffer.pointee.data else { return nil }
-        let raw = UnsafeRawPointer(data)
-        guard raw.loadUnaligned(as: UInt64.self) == 0x434143484554494d else { return nil }
-        return (raw.loadUnaligned(fromByteOffset: 8, as: UInt64.self),
-                Int64(bitPattern: raw.loadUnaligned(fromByteOffset: 16, as: UInt64.self)))
-    }
 }
