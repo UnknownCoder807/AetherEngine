@@ -2924,8 +2924,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             invalidateResolvedURL(reason: "rate-limited after \(Int(idle))s idle through pinned URL")
             return true
         }
+        // One re-resolve per cut: taking the flag means a re-pinned target that refuses before
+        // its first byte is back on the grace instead of re-resolving on every refusal.
         winCond.lock()
         let cut = lastDeliveringConnCut
+        lastDeliveringConnCut = false
         winCond.unlock()
         if cut, cachedResolvedURL() != nil {
             invalidateResolvedURL(reason: "rate-limited after the pinned connection was cut mid-range")
