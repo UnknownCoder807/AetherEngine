@@ -45,6 +45,9 @@ extension SoftwareStoredPacket {
                 }
                 side.bytes.copyBytes(to: target, count: side.bytes.count)
             }
+            if let cacheTimingEpoch {
+                SoftwarePacketCacheTiming.attach(epoch: cacheTimingEpoch, position: position, to: packet)
+            }
             return packet
         } catch {
             av_packet_unref(packet)

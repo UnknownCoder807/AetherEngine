@@ -746,6 +746,13 @@ end. Ranges are clipped against retained keyframes and discarded packet timestam
 invalid coverage stays empty. Metadata limits can conservatively omit old spans rather than claim
 packets that no longer exist.
 
+AVI MPEG-4 sessions that suppress generated packet PTS can qualify a separate cache
+presentation axis from the existing MPEG-4 parser and the same decoder's repaired
+frame timestamps. The packet delivered to the decoder is unchanged. Unqualified
+or ambiguous packet ownership remains uncovered; retiring temporary timing pairs
+does not itself evict confirmed ranges or retained seek anchors. See the
+[synthetic reproduction and scope](avi-mpeg4-cache-repro.md).
+
 The software sampler computes an immutable snapshot in the background and publishes on the main
 actor, including while paused. Cached seeks preserve retained spans; a cache miss clears them when
 the old store is discarded. Seek, replacement and teardown guards reject a late snapshot. Display

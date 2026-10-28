@@ -41,6 +41,15 @@ the public-API contract.
   AirPods), 7.1.4 and 9.1.6, every channel on its own speaker. `.apac` is unchanged. aetherctl takes
   `--bed-format apac|lpcm`. See `docs/formats.md`.
 
+### Fixed
+
+- **AVI MPEG-4 software VOD can publish retained cache ranges when decode-order repair
+  suppresses packet PTS.** Qualify the existing parser's display clock against the
+  same decoder's repaired frame timestamps, then share that axis with coverage,
+  residency and seek anchors without changing decoder input. Temporary pairing
+  retirement preserves confirmed retained history; actual store eviction still
+  removes it. Includes generated reproduction material and disk / memory cache tests.
+
 ## [7.49.0] - 2026-10-27
 
 ### Added
