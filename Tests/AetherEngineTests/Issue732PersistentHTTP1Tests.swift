@@ -346,10 +346,11 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
     func testSteadySlowBodyIsNeverCutOff() async throws {
         let server = try XCTUnwrap(KeepAliveOrigin())
         defer { server.stop() }
-        // 40 packets 50 ms apart: two seconds in all, against a read timeout of 0.3 s.
-        let body = Self.transportStream(marker: 7, packets: 40)
+        // 80 packets 50 ms apart: four seconds in all, against a read timeout of 1 s. The margin is
+        // per gap, and a starved CI runner stretched one 50 ms gap past the 0.3 s this used to allow.
+        let body = Self.transportStream(marker: 7, packets: 80)
         server.route = { _ in .init(body: body, trickleUs: 50_000) }
-        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 0.3)
+        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 1)
         defer { transport.close() }
 
         let answer = try await transport.get(server.url("/slow"), headers: [:], limit: 1 << 20)
