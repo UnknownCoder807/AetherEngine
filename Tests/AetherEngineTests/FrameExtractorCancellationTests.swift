@@ -39,7 +39,6 @@ struct FrameExtractorCancellationTests {
         let reader = StillGateReader(data: try LongGOPTransportStreamFixture.data())
         let extractor = FrameExtractor(reader: reader, formatHint: "mpegts",
                                        yieldWhile: { starved.withLock { $0 } })
-        await extractor.setIdleIntervalForTesting(.milliseconds(200))
         reader.arm()
         let older = Task { await extractor.preview(at: 2, maxWidth: 16) }
         defer { reader.release(); older.cancel() }
