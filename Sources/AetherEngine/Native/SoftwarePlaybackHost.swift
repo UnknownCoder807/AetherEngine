@@ -1320,6 +1320,25 @@ final class SoftwarePlaybackHost {
             )
         }
 
+        // The parser is lazy and producer-owned; this copies only stream configuration. The
+        // observer must be installed before open so libavcodec propagates opaque identities.
+        let cacheTiming: SoftwarePacketCacheTiming?
+        if !isLive, !dem.readsSourceDirectly, dem.isSourceSeekable,
+           dem.usesAVIMPEG4CacheTiming(at: videoStreamIndex),
+           let software = videoDecoder as? SoftwareVideoDecoder {
+            let p = vStream.pointee.codecpar?.pointee
+            let extra = p.flatMap { par -> Data? in
+                guard par.extradata_size > 0, let bytes = par.extradata else { return nil }
+                return Data(bytes: bytes, count: Int(par.extradata_size))
+            } ?? Data()
+            let timing = SoftwarePacketCacheTiming(numerator: vtb.num, denominator: vtb.den, extradata: extra)
+            software.onCacheTiming = { epoch, position, pts in timing.observe(epoch: epoch, position: position, pts: pts) }
+            cacheTiming = timing
+        } else {
+            (videoDecoder as? SoftwareVideoDecoder)?.onCacheTiming = nil
+            cacheTiming = nil
+        }
+
         // Audit PERF-104: only the VideoToolbox decoders emit out of presentation order. That includes the
         // DualLayerVideoDecoder: OrderedDelivery keeps its frames in the order the base layer came out of
         // VideoToolbox, which is decode order (measured on the real fixtures, `DoviFelRealFileTests`). It gets
@@ -1591,7 +1610,7 @@ final class SoftwarePlaybackHost {
                     video: video, audio: audio, byteBudget: bytes,
                     forwardSeconds: Double(segments) * 4,
                     initialSourceClock: initialSourceClock, fifo: fifo,
-                    videoReorderDepth: videoReorderDepth
+                    videoReorderDepth: videoReorderDepth, cacheTiming: cacheTiming
                 ) { isCurrent in
                     guard let packet = try dem.readPacket(isCurrent: isCurrent) else { return nil }
                     defer { av_packet_unref(packet); av_packet_free_safe(packet) }

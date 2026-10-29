@@ -3006,16 +3006,21 @@ extension AetherEngine {
 // Shared by picture ticks and the independent cache sampler. A paused picture
 // keeps its source-axis position while the real contiguous cache can advance.
 extension AetherEngine {
-    func refreshNativeBufferedPosition(playlistSeconds value: Double) {
+    func refreshNativeBufferedPosition(playlistSeconds rendered: Double) {
+        // A native seek publishes its target as `currentTime` up front and holds it there until the
+        // picture lands, while AVPlayer still renders the frame it left. Measuring from that frame put
+        // the buffer on another axis than the playhead: thousands of seconds "ahead" after a backward
+        // scrub, below the playhead after a forward one (StreamX, 7.48.0). Measure from the target.
+        let value = pendingRecoverySeekClockTarget ?? rendered
         let shift = presentationAxis.shiftSeconds(atItemSeconds: value)
             ?? playlistShiftSeconds
-        let renderedDisplay = isLive && videoRoute == .loopback
+        let anchorDisplay = isLive && videoRoute == .loopback
             ? value + liveSessionShiftSeconds + liveItemAxisOffsetSeconds
             : PresentationAxis.display(
                 sourcePTS: value + shift, origin: displayOrigin(forShift: shift))
         let readAhead = nativeVideoSession?
             .contiguousForwardReadAheadSeconds(playlistSeconds: value) ?? 0
-        clock.bufferedPosition = renderedDisplay + max(0, readAhead)
+        clock.bufferedPosition = max(clock.currentTime, anchorDisplay + max(0, readAhead))
     }
 }
 

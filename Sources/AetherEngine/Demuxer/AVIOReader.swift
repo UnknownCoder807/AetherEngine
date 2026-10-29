@@ -1027,6 +1027,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
+    /// The last connection that carried bytes was ended by the peer or the network mid-range, not by
+    /// us (cancel, range end, high water). Set where that connection ends, cleared by the next
+    /// generation's first byte, so the refused attempts that follow a cut keep it. winCond-guarded.
+    private var lastDeliveringConnCut = false
     /// The generation `awaitFirstPersistentData` is waiting on, while it waits. Its first byte is
     /// governed by the open policy's budget, not by the delivery-gap watchdog.
     private var openAwaitedGeneration: Int?
@@ -2896,6 +2900,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// delays finding out: three paced attempts against an address that will refuse all of them,
     /// 12.5 s in the 6.30.0 retest of #380. There the first refusal is taken at face value.
     ///
+    /// The lingering slot also needs a connection WE ended (range end, high water, a seek). When
+    /// the origin or the network cut the last delivering connection mid-range instead, the refusals
+    /// that follow are the edge revoking the pinned session, not our socket still counted: StreamX
+    /// on 7.50.0, a CDN cut at 16 of 32 MB, three 509s against the pin across 9 s, then a fresh
+    /// redirect through the source got its 206 on the first try, and the 12 s stall was the grace.
+    /// There too the first refusal is taken at face value.
+    ///
     /// Demux-thread-only: it reads the ladder streaks.
     @discardableResult
     private func dropPinIfTheRefusalCallsForIt(isRateLimited: Bool) -> Bool {
@@ -2911,6 +2922,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // its backoff would just retry a refusing target faster.
         if idle >= pinIdleSeconds, cachedResolvedURL() != nil {
             invalidateResolvedURL(reason: "rate-limited after \(Int(idle))s idle through pinned URL")
+            return true
+        }
+        // One re-resolve per cut: taking the flag means a re-pinned target that refuses before
+        // its first byte is back on the grace instead of re-resolving on every refusal.
+        winCond.lock()
+        let cut = lastDeliveringConnCut
+        lastDeliveringConnCut = false
+        winCond.unlock()
+        if cut, cachedResolvedURL() != nil {
+            invalidateResolvedURL(reason: "rate-limited after the pinned connection was cut mid-range")
             return true
         }
         if rateLimitStreak >= Self.rateLimitRepinStreak {
@@ -3812,6 +3833,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
+            lastDeliveringConnCut = false
             clearRecordedTransportFailure()
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
             // #281 retest: the price of one round trip against this origin, which is what bounds
@@ -4098,6 +4120,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // already logged where it was decided; reporting it as an error too would make every
         // drain cycle against a fast origin read like a transport fault.
         let deliberateEnd = isCurrentGen && (connEndedByBackpressure || connEndedAtRangeEnd)
+        if isCurrentGen, connFirstDataSeen, !deliberateEnd, let error,
+           (error as? URLError)?.code != .cancelled {
+            lastDeliveringConnCut = true
+        }
         let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
         winCond.broadcast()
         winCond.unlock()

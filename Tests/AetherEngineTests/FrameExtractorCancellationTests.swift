@@ -12,6 +12,7 @@ struct FrameExtractorCancellationTests {
         let extractor = resident
             ? FrameExtractor(residentReader: reader, formatHint: "mpegts", identity: "resident-idle")
             : FrameExtractor(reader: reader, formatHint: "mpegts")
+        await extractor.setIdleIntervalForTesting(.milliseconds(200))
         reader.arm()
         let pending = Task { () -> Bool in
             if resident {
@@ -26,8 +27,8 @@ struct FrameExtractorCancellationTests {
         reader.release()
         #expect(await pending.value == false)
         let cancellations = reader.cancellationCount
-        // Demuxer.close cancels its custom reader. Keep the extractor alive while its real
-        // ten-second idle task releases the context; dropping the extractor would hide the leak.
+        // Demuxer.close cancels its custom reader. Keep the extractor alive while its idle task
+        // releases the context; dropping the extractor would hide the leak.
         try await waitFor { reader.cancellationCount > cancellations }
         await extractor.shutdown()
     }
