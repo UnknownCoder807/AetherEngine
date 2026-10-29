@@ -619,7 +619,12 @@ is also confirmed.
 `maxInputBytes` counts cumulative bytes the underlying reader delivers to the probe, including bytes
 read again after a seek. Reads are clipped to the remaining allowance **before** calling the reader.
 It is **not a network/wire cap**: HTTP headers, transport buffers, requests used to resolve length, and
-reader-internal prefetch can consume more. `maxPackets` counts all packets returned for inspection across
+reader-internal prefetch can consume more. An HTTP probe reads in byte ranges that start at 64 KiB and
+double while each one continues the last in full, up to 4 MiB; a seek starts over at 64 KiB, and no
+range is longer than the input allowance still left (AE#927). A grown range gets a request budget in
+proportion to its size, so it needs the same throughput a 64 KiB range needs in 2 s; the 2 s idle timeout
+still ends a stalled one. The 50 MiB playback analysis depth therefore costs a few dozen round
+trips rather than ~800, so the deadline is spent on the origin's bandwidth instead of its latency. `maxPackets` counts all packets returned for inspection across
 both passes, including foreign streams; FFmpeg-internal packets during open/seek are bounded by input
 and time, not that counter. `maxPacketBytes` rejects an oversized packet payload before parsing/decode,
 after FFmpeg has allocated it. None of these is a hard native-memory ceiling. The separate per-pass byte
