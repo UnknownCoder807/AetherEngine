@@ -14,9 +14,11 @@ the public-API contract.
 
 - **Audio shaping: a channel cap, a dialogue lift and night mode (#923).** A host can now ask the engine to shape the
   audio before it reaches the output, through `LoadOptions.audioShaping` and, mid-session, `setAudioShaping(_:)`:
-  fold to at most N channels, raise the dialogue (the centre channel, or the mid signal of a stereo source) by up to
-  12 dB, and compress the dynamic range (`AudioShaping.Compressor.night`). A -1 dBFS limiter keeps all of it from
-  clipping. The common complaint it answers is a 5.1 film folded to TV speakers burying its dialogue under the score.
+  fold to at most N channels, raise the dialogue (the centre channel, or on a stereo source the dialogue that
+  libavfilter's `dialoguenhance` extracts) by up to 12 dB, and compress the dynamic range (`acompressor`,
+  `AudioShaping.Compressor.night`). A -1 dBFS lookahead limiter (`alimiter`) keeps all of it from clipping, and the
+  enhancer's 32 ms latency is taken back out so the audio stays on the source's timeline to the sample. Needs
+  FFmpegBuild 3.11.0. The common complaint it answers is a 5.1 film folded to TV speakers burying its dialogue under the score.
   Until now a host could only get this by having its server re-encode the audio, which threw away passthrough for
   every film and restarted the stream on every toggle. Shaping needs PCM, so while it is on a stream-copied track is
   bridged (Atmos arrives as its bed), and `$audioShapingState` says whether the session carries it.

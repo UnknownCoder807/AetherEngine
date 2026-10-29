@@ -470,9 +470,8 @@ Sources/AetherEngine/
 │   ├── AtmosDecoderPrimer.swift             Registers the system's Atmos decoders in the process once (creates an AVPlayer), which the renderer needs before it decodes compressed E-AC-3 as Atmos
 │   ├── Shaping/
 │   │   ├── AudioShaping.swift               `AudioShaping` (channel cap, dialogue lift, compressor) and `AudioShapingState`, the host's request and the published answer (AE#923)
-│   │   ├── AudioShapingMatrix.swift         The cap and the dialogue lift as one libswresample remix matrix (centre column, or a mid lift on stereo)
-│   │   ├── AudioDynamicsProcessor.swift     The compressor and the -1 dBFS peak limiter, linked across channels, on interleaved Float32
-│   │   └── AudioShapingSampleWriter.swift   Shaped Float32 into the bridge encoder's sample format
+│   │   ├── AudioShapingMatrix.swift         The cap and the centre lift as one libswresample remix matrix
+│   │   └── AudioShapingGraph.swift          The libavfilter graph after the remix: dialoguenhance + pan on stereo, acompressor, alimiter, aformat; runs on its own sample counter so its latency never reaches the timeline
 │   ├── Spatial/
 │   │   ├── SpatialBedOutput.swift           `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, and `PCMBedPacker`, the 24-bit PCM sink beside `APACEncodePipeline`
 │   │   └── SoftwareAPACProducer.swift       SW path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` as APAC or PCM, the packets handed to the audio renderer as sample buffers
