@@ -109,17 +109,21 @@ struct HLSByteRangeSegmentTests {
 
     // MARK: - Answers
 
-    @Test("a 206 is the sub-range, and one that starts elsewhere fails")
+    @Test("a 206 is the sub-range, and one that starts elsewhere or ends short fails")
     func partialContentAnswer() throws {
         let range = HLSByteRange(offset: 100, length: 4)
         #expect(range.requestHeaderValue == "bytes=100-103")
         let body = Data([1, 2, 3, 4])
         #expect(try range.segmentBytes(from: body, status: 206, contentRange: "bytes 100-103/400") == body)
         #expect(try range.segmentBytes(from: body + Data([9, 9]), status: 206, contentRange: nil) == body)
-        let error = #expect(throws: HLSIngestError.self) {
+        let elsewhere = #expect(throws: HLSIngestError.self) {
             try range.segmentBytes(from: body, status: 206, contentRange: "bytes 0-3/400")
         }
-        #expect(error?.diagnosticReason == .invalidByteRange)
+        #expect(elsewhere?.diagnosticReason == .invalidByteRange)
+        let short = #expect(throws: HLSIngestError.self) {
+            try range.segmentBytes(from: body.prefix(3), status: 206, contentRange: "bytes 100-102/400")
+        }
+        #expect(short?.diagnosticReason == .invalidByteRange)
     }
 
     @Test("a 200 carrying the whole resource is cut to the sub-range, and one too short for it fails")
@@ -260,8 +264,11 @@ struct HLSByteRangeSegmentTests {
         let got = try await drain(reader, expectedBytes: file.count + 1)
 
         #expect(got == file)
-        // The carriage probe reads the head of the resource on a request of its own.
-        let ranged = Set(origin.requests(to: "/vod/stream.ts").compactMap(\.range))
+        // The carriage probe reads on a request of its own, ranged as well: unranged, the persistent path
+        // opens the whole file, which for a real single-file VOD overruns the segment limit.
+        let requests = origin.requests(to: "/vod/stream.ts")
+        #expect(requests.allSatisfy { $0.range != nil })
+        let ranged = Set(requests.compactMap(\.range))
         #expect(ranged.isSuperset(of: [
             "bytes=0-\(length - 1)", "bytes=\(length)-\(2 * length - 1)", "bytes=\(2 * length)-\(3 * length - 1)",
         ]))

@@ -53,15 +53,19 @@ struct HLSByteRange: Equatable {
     var requestHeaderValue: String { "bytes=\(offset)-\(offset + length - 1)" }
 
     /// The segment's bytes out of a 2xx answer to a request that carried `requestHeaderValue`. A 206 is
-    /// the sub-range itself and must start where it was asked to. An origin that ignores `Range`
-    /// answers 200 with the whole resource, and the sub-range is cut from it here; one that cannot
-    /// hold the sub-range fails, since playing the wrong bytes is worse than failing the segment.
+    /// the sub-range itself and must start where it was asked to and hold all of it. An origin that
+    /// ignores `Range` answers 200 with the whole resource, and the sub-range is cut from it here. An
+    /// answer that cannot hold the sub-range fails, since playing the wrong bytes is worse than failing
+    /// the segment.
     func segmentBytes(from body: Data, status: Int, contentRange: String?) throws -> Data {
         if status == 206 {
             if let contentRange, Self.contentRangeStart(contentRange) != offset {
                 throw HLSIngestError.playlistInvalid(reason: "byte range answered elsewhere")
             }
-            return body.count > length ? body.prefix(length) : body
+            guard body.count >= length else {
+                throw HLSIngestError.playlistInvalid(reason: "byte range answered short")
+            }
+            return body.prefix(length)
         }
         guard body.count >= offset + length else {
             throw HLSIngestError.playlistInvalid(reason: "byte range beyond the resource")

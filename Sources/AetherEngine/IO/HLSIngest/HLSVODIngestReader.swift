@@ -123,7 +123,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                 return nil
             }
             guard try await reader.probeCarriage(segmentURL, duration: first.duration,
-                                                 retainBody: first.byteRange == nil) == .hevcInMPEGTS else {
+                                                 byteRange: first.byteRange) == .hevcInMPEGTS else {
                 return nil
             }
             reader.condition.withLock {
@@ -576,11 +576,13 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 
     /// A segment's response with its status checked; the body is still to be read.
-    private func openSegment(_ url: URL, limit: Int) async throws -> PersistentHTTP1Transport.Body {
+    private func openSegment(
+        _ url: URL, limit: Int, byteRange: HLSByteRange? = nil
+    ) async throws -> PersistentHTTP1Transport.Body {
         guard let transport else { throw CancellationError() }
         let body: PersistentHTTP1Transport.Body
         do {
-            body = try await transport.open(url, headers: scopedHeaders(url), limit: limit,
+            body = try await transport.open(url, headers: scopedHeaders(url, byteRange: byteRange), limit: limit,
                                              diagnosticContext: diagnosticContext, role: .hlsSegment)
         } catch is BoundedFetch.Exceeded {
             throw HLSIngestError.playlistInvalid(reason: "body exceeds \(limit) bytes")
@@ -761,16 +763,17 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
     }
 
     /// Reads the head of the first segment and classifies its carriage (AE#293 shares this read with the
-    /// live probe, so both paths judge a source the same way). `retainBody` false lets the response go
-    /// after the verdict: a sub-range segment is fetched on its own, so the head of its whole resource
-    /// is no segment to continue.
+    /// live probe, so both paths judge a source the same way). A sub-range segment is probed on its own
+    /// range: its resource is the whole file, which overruns the segment limit on the persistent path.
+    /// That response goes after the verdict, since the segment is fetched again on its own request.
     private func probeCarriage(
-        _ url: URL, duration: Double, retainBody: Bool = true
+        _ url: URL, duration: Double, byteRange: HLSByteRange? = nil
     ) async throws -> MPEGTransportStreamCodecProbe.Verdict {
         if transport != nil {
             // The probe reads the head and leaves the response open: stopping the body here would
             // cost the connection, and reading it whole delays the start by the whole segment.
-            let body = try await openSegment(url, limit: BoundedFetch.segmentLimit(forDuration: duration))
+            let body = try await openSegment(url, limit: BoundedFetch.segmentLimit(forDuration: duration),
+                                             byteRange: byteRange)
             var head = Data()
             var verdict = MPEGTransportStreamCodecProbe.Verdict.inconclusive
             do {
@@ -784,7 +787,7 @@ final class HLSVODIngestReader: TimeSeekableIOReader, @unchecked Sendable {
                 throw error
             }
             guard !head.isEmpty else { throw HLSIngestError.unsupportedSegmentFormat }
-            if verdict == .hevcInMPEGTS, retainBody {
+            if verdict == .hevcInMPEGTS, byteRange == nil {
                 let displaced = condition.withLock { () -> PrimedSegment? in
                     defer { primedSegment = PrimedSegment(url: url, head: head, body: body) }
                     return primedSegment

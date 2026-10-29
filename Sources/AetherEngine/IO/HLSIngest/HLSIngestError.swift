@@ -119,7 +119,8 @@ public enum HLSIngestError: Error, Equatable, CustomStringConvertible, Localized
             case "TARGETDURATION out of range": return .invalidTargetDuration
             case "EXTINF out of range", "segment duration must be positive": return .invalidSegmentDuration
             case "malformed BYTERANGE", "BYTERANGE out of range", "BYTERANGE offset undefined",
-                 "byte range answered elsewhere", "byte range beyond the resource":
+                 "byte range answered elsewhere", "byte range answered short",
+                 "byte range beyond the resource":
                 return .invalidByteRange
             case "non-UTF8 playlist", "playlist is not bounded UTF-8", "rendition payload is not UTF-8": return .invalidPlaylistEncoding
             default:

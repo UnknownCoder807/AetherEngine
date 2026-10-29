@@ -19,9 +19,10 @@ the public-API contract.
   `#EXT-X-BYTERANGE:<length>[@<offset>]` (an omitted offset continues the previous sub-range of the same URI,
   and a playlist where that is undefined is refused, as RFC 8216 requires), and the segment is fetched with a
   `Range` request, on the persistent HTTP/1.1 path as well. An origin that ignores `Range` and answers 200 with
-  the whole resource has the sub-range cut from it; one whose 206 starts elsewhere, or whose resource is too
-  short for the range, fails the segment rather than playing the wrong bytes. Those failures and a malformed tag
-  report the new `HLSIngestDiagnosticReason.invalidByteRange` (`invalid_byte_range`).
+  the whole resource has the sub-range cut from it; one whose 206 starts elsewhere or ends short, or whose resource
+  is too short for the range, fails the segment rather than playing the wrong bytes. The VOD carriage probe reads
+  the first segment's own range too, so a single-file VOD is not refused for the size of its whole file. Those
+  failures and a malformed tag report the new `HLSIngestDiagnosticReason.invalidByteRange` (`invalid_byte_range`).
 
 ## [7.52.0] - 2026-10-29
 
