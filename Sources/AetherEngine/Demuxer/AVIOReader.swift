@@ -400,6 +400,41 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return status == 429 || status == 503 || status == 509
     }
 
+    /// AE#925: an Xtream panel at its connection cap answers a live request with HTTP 200 and a
+    /// short `text/plain` notice ("CONNECTION LIMIT REACHED ..."). Taken as media, the notice went
+    /// into the window, the connection ended, and the reconnect counted the bytes as progress and
+    /// asked again at once: 436 requests in 10 s against an origin holding the slot for 10 s.
+    /// The header only makes a body a suspect, because a playlist or an MPD can be served the same
+    /// way (one Xtream path answers TS or HLS by its query, and the AE#140/AE#363 reroute reads the
+    /// body to tell). A text type without a length is not one either: a mislabelled TS feed never
+    /// ends. 64 KiB is far above the panels' few hundred bytes and far below anything that plays.
+    static let liveTextNoticeMaxBytes: Int64 = 64 * 1024
+
+    static func isLiveTextNoticeCandidate(_ http: HTTPURLResponse) -> Bool {
+        guard http.statusCode == 200 || http.statusCode == 206 else { return false }
+        let type = (http.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        guard type.hasPrefix("text/") else { return false }
+        let length = http.expectedContentLength
+        return length > 0 && length <= liveTextNoticeMaxBytes
+    }
+
+    /// The suspect's whole body decides: a playlist or a manifest goes on to the reroute that reads
+    /// it, a body opening on the TS sync byte is media whatever its label says, anything else is
+    /// the origin saying no.
+    static func isConnectionRefusalNotice(_ body: [UInt8]) -> Bool {
+        guard let first = body.first, first != 0x47 else { return false }
+        return !bodyBeginsWithHLSPlaylistTag(body) && !DASHManifest.bodyBeginsWithManifest(body)
+    }
+
+    /// The notice as one log line: printable ASCII, line breaks folded, capped.
+    static func noticeExcerpt(_ body: [UInt8], limit: Int = 120) -> String {
+        let printable = String(decoding: body.filter { (0x20...0x7E).contains($0) || $0 == 0x0A }, as: UTF8.self)
+        let text = printable.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }.joined(separator: " / ")
+        guard text.count > limit else { return text }
+        return text.prefix(limit).trimmingCharacters(in: CharacterSet(charactersIn: " /")) + "..."
+    }
+
     /// AE#792 part 2: the origin refused the request's credentials. An identical request carrying
     /// the identical credential cannot succeed, so these get a short ladder of their own instead of
     /// the twelve unproductive reconnects a dropped connection is given, and the refusal is stamped
@@ -1027,6 +1062,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
+    /// AE#925 (winCond-guarded): the body of a live text suspect, held outside the window until it
+    /// is complete or its connection ends. Tagged with its generation, because a connection can be
+    /// abandoned by a generation bump that starts no new one, and a held body must never swallow
+    /// the next connection's bytes.
+    private var connTextNotice: (generation: Int, body: Data)?
+    private var connTextNoticeLength: Int64 = 0
+    private var connTextNoticeRetryAfter: TimeInterval = 0
+    private var connEndedByTextNotice = false
+
+    /// Takes the held suspect body of `generation`, if there is one. Caller holds winCond.
+    private func takeTextNoticeLocked(generation: Int) -> Data? {
+        guard let held = connTextNotice, held.generation == generation else { return nil }
+        connTextNotice = nil
+        return held.body
+    }
     /// The last connection that carried bytes was ended by the peer or the network mid-range, not by
     /// us (cancel, range end, high water). Set where that connection ends, cleared by the next
     /// generation's first byte, so the refused attempts that follow a cut keep it. winCond-guarded.
@@ -3559,6 +3609,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connStatus = 0
         connURLFailureCode = nil
         connRetryAfter = 0
+        connTextNotice = nil
+        connEndedByTextNotice = false
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
         lastDeliveryAt = connStartedAt       // #309: the gap is measured from here until data lands
@@ -3815,6 +3867,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             winCond.unlock()
             return
         }
+        // AE#925: a live text suspect is held back until its body is complete, and decided whole.
+        if var held = takeTextNoticeLocked(generation: generation) {
+            held.append(delivered)
+            if Int64(held.count) < connTextNoticeLength {
+                connTextNotice = (generation, held)
+                winCond.unlock()
+                return
+            }
+            winCond.unlock()
+            settleTextNotice(held, generation: generation)
+            return
+        }
         // Audit DMX-1: the range is the bound only if bytes past its end are refused. A 200 that
         // ignored Range at offset 0, or a 206 wider than asked, otherwise kept appending under
         // `connEnded`, which also disarms the high-water end below, so the rest of the file
@@ -3978,6 +4042,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // origin accepted the socket but withheld the response while it served another connection
             // of the same file at full rate), the prime suspect for the ~15s cold reads.
             headerMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
+            if isLive, Self.isLiveTextNoticeCandidate(http) {
+                connTextNotice = (generation, Data())
+                connTextNoticeLength = http.expectedContentLength
+                connTextNoticeRetryAfter = Self.parseRetryAfter(http)
+            }
         }
         // VOD: 200 at offset > 0 means server ignored Range and sent the full body
         // from byte 0 (silent corruption). Reject it. Live is exempt: transcode
@@ -4105,7 +4174,47 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return false
     }
 
+    /// AE#925: decides a held live text body. Media (a playlist, a manifest, TS) goes into the window
+    /// as if it had never been held, where the open's reroute reads it; a notice ends the connection
+    /// as the 509 it means, so the live refusal ladder paces the next request and the body never
+    /// reaches the demuxer.
+    private func settleTextNotice(_ body: Data, generation: Int) {
+        let bytes = [UInt8](body)
+        guard Self.isConnectionRefusalNotice(bytes) else {
+            if !body.isEmpty { appendPersistentData(body, generation: generation) }
+            return
+        }
+        winCond.lock()
+        guard generation == connGeneration, !isFullyClosed else {
+            winCond.unlock()
+            return
+        }
+        let retryAfter = connTextNoticeRetryAfter
+        connStatus = 509
+        connRetryAfter = retryAfter
+        connEndedByTextNotice = true
+        connEnded = true
+        let transfer = activeTransfer
+        activeTransfer = nil
+        winCond.broadcast()
+        winCond.unlock()
+        EngineLog.emit(
+            "[AVIOReader] \(label) gen=\(generation) live origin answered 2xx with a \(bytes.count) B text "
+            + "notice (\"\(Self.noticeExcerpt(bytes))\"); taking it as a connection-cap refusal, status=509 (AE#925)",
+            category: .demux)
+        noteOriginRefusal(status: 509, retryAfter: retryAfter > 0 ? retryAfter : nil)
+        transfer?.cancelTransfer()
+        transfer?.releaseOriginTicket()
+    }
+
     fileprivate func persistentConnectionEnded(error: Error?, generation: Int) {
+        // AE#925: a suspect whose body came up short of its length is decided on what arrived.
+        winCond.lock()
+        let heldNotice = takeTextNoticeLocked(generation: generation)
+        winCond.unlock()
+        if let heldNotice, !heldNotice.isEmpty {
+            settleTextNotice(heldNotice, generation: generation)
+        }
         winCond.lock()
         let isCurrentGen = (generation == connGeneration)
         if isCurrentGen {
@@ -4119,7 +4228,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #310: our own high-water cancel completes here as NSURLErrorCancelled. That end was
         // already logged where it was decided; reporting it as an error too would make every
         // drain cycle against a fast origin read like a transport fault.
-        let deliberateEnd = isCurrentGen && (connEndedByBackpressure || connEndedAtRangeEnd)
+        let deliberateEnd = isCurrentGen && (connEndedByBackpressure || connEndedAtRangeEnd || connEndedByTextNotice)
         if isCurrentGen, connFirstDataSeen, !deliberateEnd, let error,
            (error as? URLError)?.code != .cancelled {
             lastDeliveringConnCut = true
