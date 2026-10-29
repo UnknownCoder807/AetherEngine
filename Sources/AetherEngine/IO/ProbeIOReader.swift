@@ -38,7 +38,10 @@ final class ProbeIOReader: IOReader, @unchecked Sendable {
 
 /// Reuses the engine HTTP transport with speculation disabled; no playback transport policy changes.
 /// Its AVIO allocation stays owned here, separate from the bridge FFmpeg uses for the counted input.
+/// A metadata probe's sequential ranges grow from 64 KiB to `rangeCeiling` (AE#927); a preview's
+/// bounded window keeps them at 64 KiB, since its reads are a seek and one keyframe.
 final class ProbeHTTPReader: IOReader, @unchecked Sendable {
+    static let rangeCeiling = 4 * 1024 * 1024
     private let reader: AVIOReader
     private let isDiscImageURL: Bool
     /// AE#860: an extensionless URL counts once its response declared a disc image type; the
@@ -55,7 +58,8 @@ final class ProbeHTTPReader: IOReader, @unchecked Sendable {
             chunkSize: 64 * 1024, prefetchEnabled: false,
             chunkRequestTimeout: 2, chunkMaxRetries: 1,
             boundedInitialFetch: boundedWindowBytes.map { Int64($0) },
-            windowHighWater: boundedWindowBytes, probeControl: control)
+            windowHighWater: boundedWindowBytes, probeControl: control,
+            probeRangeCeiling: boundedWindowBytes == nil ? Self.rangeCeiling : nil)
     }
 
     func open() throws { try reader.open() }
