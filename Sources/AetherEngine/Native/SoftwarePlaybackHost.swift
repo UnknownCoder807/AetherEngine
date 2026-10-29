@@ -293,6 +293,13 @@ final class SoftwarePlaybackHost {
     /// The host's object-audio setting, set before `load`. Anything but `.off` lets Atmos tracks reach
     /// the renderer as Atmos instead of as the PCM decode of their core.
     var objectAudioRendering: ObjectAudioRendering = .off
+
+    /// AE#923: the host's audio shaping. Active shaping keeps the track on the PCM decode, past both
+    /// Atmos routes, and the decoder carries it. Set before the decoder opens.
+    var audioShaping = AudioShaping()
+
+    /// AE#923: whether the producer this host built carries `audioShaping`.
+    private(set) var audioShapingApplied = false
     private var audioOutput: AudioOutput?
     private var demuxer: Demuxer?
     private var vodPacketReadAhead: SoftwarePacketReadAhead?
@@ -1464,6 +1471,7 @@ final class SoftwarePlaybackHost {
                 // A stop() can land on the suspension above, as on the ones below.
                 guard !stopRequested else { made.producer.close(); return }
                 self.audioDecoder = made.producer
+                self.audioShapingApplied = audioShaping.isActive && made.route == .pcm
                 self.audioRoute = made.route
                 self.audioRouteCarriesDolbyAtmos = made.route.carriesDolbyAtmos(sourceCodec: acp.pointee.codec_id)
                 self.audioStreamIndex = resolvedAudioIdx

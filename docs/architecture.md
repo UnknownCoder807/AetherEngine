@@ -446,6 +446,7 @@ Sources/AetherEngine/
 ├── FFmpegErrorConstants.swift               AVERROR sentinels Swift can't import from the C macros
 ├── AetherEngine+LiveSubtitleRenditions.swift Live path: the upstream master's `EXT-X-MEDIA:TYPE=SUBTITLES` renditions surfaced as tracks (synthetic ids from 300000) and, once one is selected, fetched as WebVTT segments onto the host-overlay surface; cues are placed by the playlist geometry the renditions share (`EXT-X-PROGRAM-DATE-TIME`), anchored at the playhead rather than at the head of a two-hour DVR playlist, and re-anchored when a producer seam moves the source axis (#359)
 ├── AetherEngine+SubtitleOCR.swift           Arming, per-ordinal cursors and the MainActor tick of the bitmap-subtitle OCR worker that fills a text rendition for PiP / AirPlay / external display while a PGS / DVB / DVD track's rendition is selected natively (PiP / AirPlay / external display)
+├── AetherEngine+AudioShaping.swift          `setAudioShaping(_:)`: audio shaping as a live setting, every change a session-preserving rebuild with presses folded into the one in flight (AE#923)
 ├── AetherEngine+TeletextPage.swift          The teletext caption page as a live setting: `setTeletextPage(_:)` rebuilds the drain decoder of every channel currently showing a teletext track and leaves the others alone, so a page libzvbi does not flag as a subtitle page is correctable without leaving the channel (#364)
 ├── AetherEngine+ScrubThumbnail.swift        Cache-backed scrub still for the active native session: decodes from already-produced SegmentCache bytes, so single-connection sources (debrid / torrent links) that refuse the FrameExtractor's second demuxer still get previews (#106)
 ├── AetherEngine+SoftwareNowPlaying.swift    Builds the software host's Now-Playing publisher when the app set `ownsSoftwareNowPlaying` (primary role only) and publishes `softwareNowPlayingActive`
@@ -467,6 +468,11 @@ Sources/AetherEngine/
 │   ├── SoftwareAudioProducing.swift         SW path: what the host asks of whatever turns an audio packet into renderer input; implemented by `AudioDecoder`, `SoftwareEAC3Passthrough` and `SoftwareAPACProducer`
 │   ├── SoftwareEAC3Passthrough.swift        SW path: E-AC-3 JOC packets enqueued compressed to the audio renderer, with the `dec3` format description built from the stream, so the system's Atmos decoder gets the objects
 │   ├── AtmosDecoderPrimer.swift             Registers the system's Atmos decoders in the process once (creates an AVPlayer), which the renderer needs before it decodes compressed E-AC-3 as Atmos
+│   ├── Shaping/
+│   │   ├── AudioShaping.swift               `AudioShaping` (channel cap, dialogue lift, compressor) and `AudioShapingState`, the host's request and the published answer (AE#923)
+│   │   ├── AudioShapingMatrix.swift         The cap and the dialogue lift as one libswresample remix matrix (centre column, or a mid lift on stereo)
+│   │   ├── AudioDynamicsProcessor.swift     The compressor and the -1 dBFS peak limiter, linked across channels, on interleaved Float32
+│   │   └── AudioShapingSampleWriter.swift   Shaped Float32 into the bridge encoder's sample format
 │   ├── Spatial/
 │   │   ├── SpatialBedOutput.swift           `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, and `PCMBedPacker`, the 24-bit PCM sink beside `APACEncodePipeline`
 │   │   └── SoftwareAPACProducer.swift       SW path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` as APAC or PCM, the packets handed to the audio renderer as sample buffers

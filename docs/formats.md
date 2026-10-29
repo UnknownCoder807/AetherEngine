@@ -359,6 +359,43 @@ Two bridge lifecycle invariants (issue #99): the encoder PTS counter re-bases on
 
 **Audio that ends before the picture (AE#847).** AVPlayer ends a muxed HLS item the moment its audio runs out, however much video is left, and a re-seek in place does not get past it (measured on a 60 s HEVC track over 35 s of AC-3, from the engine's loopback and from a plain ffmpeg fMP4 playlist alike). A gap in the audio is harmless: with audio at 0-35 s and 59-60 s the same item plays to 59.99 s, also from a start inside the gap. So when the producer reaches the end of the file and the audio it wrote stops more than half a second short of the video, the final segment gets silence from that point, or from the segment's own start if the audio stopped earlier, up to the end of the picture, in whole frames of the delivered codec (`AudioTailPadding`). The encoders come from the FFmpeg build: AC-3, E-AC-3 and FLAC always, AAC-LC and ALAC since FFmpegBuild 3.10.0; HE-AAC, MP3, Opus and a stand-in sample entry (the APAC bed) are not padded and log `AE#847 audio tail not padded` with the reason. The fill exists only in the segment written at end of file, so on a source that arrives barely faster than its bitrate, with a silent tail longer than the producer's lead, AVPlayer waits at the end of the audio until that segment exists and then plays on.
 
+### Audio shaping
+
+`LoadOptions.audioShaping` / `setAudioShaping(_:)` (AE#923) shape the decoded PCM before it is
+re-encoded (loopback) or rendered (software host, FFmpeg audio-only host). Three settings, any
+combination:
+
+- **Channel cap** (`maxChannels`). The source is folded to at most that many channels with
+  libswresample's own downmix (centre and surrounds at -3 dB, LFE dropped), the same fold the
+  route would otherwise make. A cap decides the bridge encoder like a source of that many channels
+  would, so a 5.1 source capped to stereo is FLAC, not stereo E-AC-3. A source is never upmixed.
+- **Dialogue lift** (`dialogueGainDB`, up to 12 dB). On a source with a front centre the centre is
+  raised wherever it lands, discrete or folded. A stereo source has no centre, so the part both
+  channels share (the mid signal, where a mix pans its dialogue) is raised against their difference.
+  A mono source is left alone. The lift is applied in the remix matrix, so it costs nothing per
+  sample. Measured on a 5.1 fixture with a tone on the centre only and another tone on every other
+  channel, folded to stereo: a 6 dB lift moves the centre tone 6 dB against the other within 0.5 dB,
+  on the bridge and on the software decoder alike.
+- **Night mode** (`compressor`). A feed-forward compressor with a soft knee, one gain for all
+  channels so the image does not move. The `night` preset compresses everything above -30 dBFS
+  4:1 and adds 10 dB: a whisper at -40 dBFS comes up to -30, a full-scale passage comes down to
+  about -12.5.
+
+Whenever shaping is active a peak limiter at -1 dBFS runs last, which is what lets the fold stay
+unnormalized (normalizing a 5.1 fold costs 7.6 dB of level, the opposite of what someone who cannot
+hear the dialogue asked for) and the makeup gain be generous. It has no lookahead, because a
+lookahead would delay the audio against the video, so a transient above the ceiling is clamped
+within its first sample rather than ramped.
+
+The FFmpeg build carries no libavfilter audio filters, so the matrix is handed to libswresample and
+the dynamics are the engine's own (`AudioDynamicsProcessor`).
+
+**What it costs.** Shaping needs PCM. While it is active a stream-copied track is decoded and
+bridged, so Atmos (E-AC-3 JOC) and every bitstream that used to pass through arrive as their channel
+bed, and on the software host the compressed E-AC-3 JOC route and the object render are skipped.
+Turning shaping off goes back to stream copy. Where AVPlayer owns the audio (`.remoteBypass`, the
+native audio-only host) there is no PCM to shape and `$audioShapingState` reads `.unavailable`.
+
 ### Audio a build has no decoder for
 
 AC-4 (ATSC 3.0 / NextGen TV) and MPEG-H 3D Audio have no decoder in the bundled FFmpeg, and there is

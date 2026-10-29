@@ -12,6 +12,14 @@ the public-API contract.
 
 ### Added
 
+- **Audio shaping: a channel cap, a dialogue lift and night mode (#923).** A host can now ask the engine to shape the
+  audio before it reaches the output, through `LoadOptions.audioShaping` and, mid-session, `setAudioShaping(_:)`:
+  fold to at most N channels, raise the dialogue (the centre channel, or the mid signal of a stereo source) by up to
+  12 dB, and compress the dynamic range (`AudioShaping.Compressor.night`). A -1 dBFS limiter keeps all of it from
+  clipping. The common complaint it answers is a 5.1 film folded to TV speakers burying its dialogue under the score.
+  Until now a host could only get this by having its server re-encode the audio, which threw away passthrough for
+  every film and restarted the stream on every toggle. Shaping needs PCM, so while it is on a stream-copied track is
+  bridged (Atmos arrives as its bed), and `$audioShapingState` says whether the session carries it.
 - **Privacy manifests for the required-reason APIs (#920).** The engine calls three categories on Apple's
   required-reason list and now declares them in a `PrivacyInfo.xcprivacy` in its resource bundle: system boot time
   (35F9.1, `systemUptime` for elapsed time), disk space (E174.1, checked before packets spool to disk) and file
