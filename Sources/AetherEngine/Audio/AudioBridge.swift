@@ -1100,7 +1100,8 @@ final class AudioBridge: @unchecked Sendable {
         // already written from it, so it cannot change now). If the decoded frame differs, swr must resample
         // or rematrix and the FLAC is no longer bit-perfect. Surface it loudly; a deferred encoder open (open
         // the encoder from the first decoded frame) is the follow-up if this ever fires on real material.
-        if mode == .lossless,
+        // AE#923: shaping changes the layout on purpose and is not lossless to begin with.
+        if mode == .lossless, !shaping.isActive,
            frameRate != enc.pointee.sample_rate
             || av_channel_layout_compare(&sf.pointee.ch_layout, &enc.pointee.ch_layout) != 0 {
             EngineLog.emit(
