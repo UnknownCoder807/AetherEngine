@@ -1445,6 +1445,9 @@ public final class AetherEngine: ObservableObject {
     /// drainer (SubtitleOverlayDrainer) from the session's SubtitlePacketStore. Replaces
     /// the embedded side-demuxer reader for every host, VOD and live, text and bitmap.
     var subtitleDrainTargets: [SubtitleChannel: Int32] = [:]
+    /// #921: channels whose drain target is a bitmap sidecar read into packets. Such a channel
+    /// drains from the source's own store under `SidecarBitmapSource.streamKey`.
+    var sidecarBitmapSources: [SubtitleChannel: SidecarBitmapSource] = [:]
     var subtitleDrainerTask: Task<Void, Never>?
     /// AE#628: the drain tick whose decode is running off the MainActor, nil while none is. At most
     /// one at a time, because a channel's decoder is one AVCodecContext and the tick in flight owns
