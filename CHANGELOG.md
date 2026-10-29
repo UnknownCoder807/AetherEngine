@@ -10,6 +10,10 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.52.0] - 2026-10-29
+
 ### Added
 
 - **Audio shaping: a channel cap, a dialogue lift and night mode (#923).** A host can now ask the engine to shape the
@@ -31,7 +35,9 @@ the public-API contract.
 
 ### Changed
 
-- **FFmpegBuild 3.10.2.** Only the privacy manifests above; the FFmpeg code is byte-identical to 3.10.1.
+- **FFmpegBuild 3.11.0.** libavfilter gains the audio shaping filters above (`abuffer`, `abuffersink`, `aformat`,
+  `aresample`, `pan`, `dialoguenhance`, `acompressor`, `alimiter`) and `idet`, `fieldmatch` and `decimate` for inverse
+  telecine (#853, not used by the engine yet), all LGPL. 3.10.2 before it added only the privacy manifests above.
 - **A weekly Xcode 26.3 build (#883).** A best-effort workflow builds the package for tvOS and iOS with Xcode 26.3
   (Swift 6.2) every Monday and by hand before a release, so a host still on Xcode 26 hears about a break before the
   release does. It is not a required check and the supported toolchain stays Xcode 27.
