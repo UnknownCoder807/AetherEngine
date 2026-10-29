@@ -370,25 +370,40 @@ combination:
   route would otherwise make. A cap decides the bridge encoder like a source of that many channels
   would, so a 5.1 source capped to stereo is FLAC, not stereo E-AC-3. A source is never upmixed.
 - **Dialogue lift** (`dialogueGainDB`, up to 12 dB). On a source with a front centre the centre is
-  raised wherever it lands, discrete or folded. A stereo source has no centre, so the part both
-  channels share (the mid signal, where a mix pans its dialogue) is raised against their difference.
-  A mono source is left alone. The lift is applied in the remix matrix, so it costs nothing per
-  sample. Measured on a 5.1 fixture with a tone on the centre only and another tone on every other
-  channel, folded to stereo: a 6 dB lift moves the centre tone 6 dB against the other within 0.5 dB,
-  on the bridge and on the software decoder alike.
-- **Night mode** (`compressor`). A feed-forward compressor with a soft knee, one gain for all
+  raised wherever it lands, discrete or folded, in the remix matrix (no cost per sample). Measured
+  on a 5.1 fixture with a tone on the centre only and another tone on every other channel, folded
+  to stereo: 3, 6 and 9 dB asked move the centre tone 3.0, 6.0 and 9.0 dB against the other, on the
+  bridge and on the software decoder alike. A source without a centre that plays as stereo has its
+  dialogue extracted by libavfilter's `dialoguenhance` and folded back onto both sides with `pan`.
+  On a stereo fixture of a centred, gated 1 kHz tone over noise that differs between the sides,
+  3, 6 and 9 dB asked raise the tone 3.9, 7.4 and 10.6 dB against the noise. Chosen over a mid/side
+  lift after measuring both on a mix of centred speech and wide music: the mid/side lift gained
+  2.0 dB against the wide music at +6 dB, `dialoguenhance` 5.1 to 7.2 dB. Neither separates
+  speech from music mixed to the centre itself (0 to 1.2 dB), which no stereo method can. A mono
+  source is left alone.
+- **Night mode** (`compressor`). libavfilter's `acompressor`, peak detection, one gain for all
   channels so the image does not move. The `night` preset compresses everything above -30 dBFS
-  4:1 and adds 10 dB: a whisper at -40 dBFS comes up to -30, a full-scale passage comes down to
-  about -12.5.
+  4:1 and adds 10 dB; measured on a steady 1 kHz tone: 0 dBFS in comes out at -12.2 dBFS,
+  -20 at -17.2, -40 at -30.0.
 
-Whenever shaping is active a peak limiter at -1 dBFS runs last, which is what lets the fold stay
-unnormalized (normalizing a 5.1 fold costs 7.6 dB of level, the opposite of what someone who cannot
-hear the dialogue asked for) and the makeup gain be generous. It has no lookahead, because a
-lookahead would delay the audio against the video, so a transient above the ceiling is clamped
-within its first sample rather than ramped.
+Whenever shaping is active libavfilter's `alimiter` runs last, at -1 dBFS with a 5 ms lookahead and
+its own latency compensation, which is what lets the fold stay unnormalized (normalizing a 5.1 fold
+costs 7.6 dB of level, the opposite of what someone who cannot hear the dialogue asked for) and the
+makeup gain be generous. It replaced an instant-attack limiter after a measurement: on a steady
+overload its THD was -155 dB against -48.6, and on two tones under limiting bass hits its splatter
+above 3 kHz was -67 dB against -42 (relative to the tones), at the input's own floor.
 
-The FFmpeg build carries no libavfilter audio filters, so the matrix is handed to libswresample and
-the dynamics are the engine's own (`AudioDynamicsProcessor`).
+**Timing.** `dialoguenhance` delays its content by three quarters of its FFT window (1536 samples at
+48 kHz, 3072 at 96 kHz) and stamps its output with its input's timestamps regardless. The engine
+therefore runs the graph on a sample counter of its own, drops the delay's priming, pushes the same
+number of silent samples at the end of the stream and carries the timestamps itself, so output
+sample k is input sample k. Measured: an impulse at sample 60000 of a stereo source comes out of
+the bridge at sample 60000 with 96000 samples in and out, and the software decoder presents it at
+1.25000 s, its source time.
+
+The graph (`AudioShapingGraph`) needs FFmpegBuild 3.11.0 or later, which adds `abuffer`,
+`abuffersink`, `aformat`, `aresample`, `pan`, `dialoguenhance`, `acompressor` and `alimiter`.
+Where it cannot be built the remix still applies and the log says the dynamics do not.
 
 **What it costs.** Shaping needs PCM. While it is active a stream-copied track is decoded and
 bridged, so Atmos (E-AC-3 JOC) and every bitstream that used to pass through arrive as their channel
