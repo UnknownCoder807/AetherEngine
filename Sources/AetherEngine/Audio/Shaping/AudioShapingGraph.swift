@@ -34,6 +34,9 @@ final class AudioShapingGraph {
     static let limiterReleaseMilliseconds: Double = 50
 
     private let chain: String
+    /// Only the format pin, for when the full chain cannot be rebuilt: the owner's swresample
+    /// output format is chosen for this graph, so the audio still has to come out through one.
+    private let passthroughChain: String
     private let sampleRate: Int32
     private let channels: Int32
     private let layoutDescription: String
@@ -41,6 +44,8 @@ final class AudioShapingGraph {
     private var inputLayout = AVChannelLayout()
     /// Content delay the graph adds and this class removes, in samples.
     let latency: Int
+    /// The latency of the chain actually built; 0 once `reset()` fell back to the passthrough.
+    private var builtLatency = 0
 
     private var graph: UnsafeMutablePointer<AVFilterGraph>?
     private var source: UnsafeMutablePointer<AVFilterContext>?
@@ -85,9 +90,13 @@ final class AudioShapingGraph {
         }
         parts.append("alimiter=limit=\(f(pow(10, ceilingDBFS / 20))):attack=\(f(limiterAttackMilliseconds))"
                      + ":release=\(f(limiterReleaseMilliseconds)):level=0:latency=1")
-        let fmt = av_get_sample_fmt_name(outputFormat).map { String(cString: $0) } ?? "flt"
-        parts.append("aformat=sample_fmts=\(fmt):channel_layouts=\(layoutDescription)")
+        parts.append(formatPin(outputFormat: outputFormat, layoutDescription: layoutDescription))
         return parts.joined(separator: ",")
+    }
+
+    static func formatPin(outputFormat: AVSampleFormat, layoutDescription: String) -> String {
+        let fmt = av_get_sample_fmt_name(outputFormat).map { String(cString: $0) } ?? "flt"
+        return "aformat=sample_fmts=\(fmt):channel_layouts=\(layoutDescription)"
     }
 
     /// nil when the graph cannot be built (a filter missing from the FFmpeg build, an option it
@@ -101,12 +110,13 @@ final class AudioShapingGraph {
                                                       sourceHasCentre: sourceHasCentre)
         self.chain = Self.chain(shaping: shaping, stereoDialogueEnhance: enhance,
                                 outputFormat: outputFormat, layoutDescription: layoutDescription)
+        self.passthroughChain = Self.formatPin(outputFormat: outputFormat, layoutDescription: layoutDescription)
         self.sampleRate = sampleRate
         self.channels = layout.pointee.nb_channels
         self.layoutDescription = layoutDescription
         self.latency = enhance ? Self.dialogueEnhanceLatency(sampleRate: sampleRate) : 0
         av_channel_layout_copy(&inputLayout, layout)
-        guard build() else {
+        guard build(chain, latency: latency) else {
             free()
             return nil
         }
@@ -123,7 +133,7 @@ final class AudioShapingGraph {
         sink = nil
     }
 
-    private func build() -> Bool {
+    private func build(_ chain: String, latency: Int) -> Bool {
         free()
         guard let g = avfilter_graph_alloc(),
               let abuffer = avfilter_get_by_name("abuffer"),
@@ -146,6 +156,7 @@ final class AudioShapingGraph {
             return false
         }
         inputSamples = 0
+        builtLatency = latency
         trimRemaining = latency
         ended = false
         pending.removeAll(keepingCapacity: true)
@@ -155,8 +166,12 @@ final class AudioShapingGraph {
     /// Drop everything in flight, for a seek or a restart: the filters keep history (the limiter's
     /// lookahead, the compressor's envelope, the enhancer's window) that belongs to the old position.
     func reset() {
-        if !build() {
+        guard !build(chain, latency: latency) else { return }
+        if build(passthroughChain, latency: 0) {
             EngineLog.emit("[AudioShaping] filter graph could not be rebuilt; audio passes unshaped", category: .session)
+        } else {
+            free()
+            EngineLog.emit("[AudioShaping] filter graph could not be rebuilt, not even unshaped; audio drops until the next rebuild", category: .session)
         }
     }
 
@@ -175,9 +190,9 @@ final class AudioShapingGraph {
     /// needs a `reset()` before it takes input again.
     func drain(emit: ([UnsafeMutableRawPointer?], Int, Int64?) -> Void) {
         guard !ended, graph != nil else { return }
-        if latency > 0 {
-            let silence = [Float](repeating: 0, count: latency * Int(channels))
-            silence.withUnsafeBufferPointer { push($0.baseAddress!, frames: latency) }
+        if builtLatency > 0 {
+            let silence = [Float](repeating: 0, count: builtLatency * Int(channels))
+            silence.withUnsafeBufferPointer { push($0.baseAddress!, frames: builtLatency) }
         }
         _ = av_buffersrc_add_frame(source, nil)
         ended = true
