@@ -75,6 +75,7 @@ func printUsage() {
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
+                 [--audio-shaping <spec>] [--switch-audio-shaping <spec>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
@@ -938,6 +939,26 @@ if first == "play" {
             milliseconds: ms,
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
+    // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
+    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`.
+    var audioShaping = AudioShaping()
+    if let spec = takeStringFlag("--audio-shaping", from: &rest) {
+        guard let parsed = parseAudioShapingSpec(spec) else {
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night; got '\(spec)'")
+            exit(64)
+        }
+        audioShaping = parsed
+    }
+    var audioShapingSwitches: [AudioShapingSwitchRequest] = []
+    while let spec = takeStringFlag("--switch-audio-shaping", from: &rest) {
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let parsed = parseAudioShapingSpec(parts[0]) else {
+            print("ERROR: --switch-audio-shaping takes <spec>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        audioShapingSwitches.append(AudioShapingSwitchRequest(
+            shaping: parsed, delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
+    }
     // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
     let pausedMount = takeFlag("--paused", from: &rest)
     // AE#587: LoadOptions.preserveASSMarkup, documented as ASS/SSA only. The report that it leaks
@@ -1066,6 +1087,7 @@ if first == "play" {
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,

@@ -917,11 +917,48 @@ public final class AetherEngine: ObservableObject {
                                         loopbackSession: pipeline.loopback,
                                         softwareHost: pipeline.software,
                                         audioOnlyHost: pipeline.audioOnly)
+        recomputeAudioShapingState()
         guard audioDelivery != next else { return }
         audioDelivery = next
         if next != .none {
             EngineLog.emit("[AetherEngine] AE#462: audio delivery = \(next.rawValue)", category: .engine)
         }
+    }
+
+    /// AE#923: whether this session's audio is shaped as `audioShaping` asks. Derived next to
+    /// `audioDelivery`, from the pipeline's own report, for the same reason.
+    @Published public internal(set) var audioShapingState: AudioShapingState = .off
+
+    /// Whether the pipeline serving the session carries shaping: true when it does, false when this
+    /// session cannot (AVPlayer owns the audio, or there is no audio to shape), nil while no pipeline
+    /// is live or the live one was built before the value changed and its rebuild is on the way.
+    private var livePipelineAppliesShaping: Bool? {
+        func engineOwned(applied: Bool?, delivery: AudioDelivery?) -> Bool? {
+            guard let applied, let delivery else { return nil }
+            if applied { return true }
+            return delivery == .noAudioInSource || delivery == .droppedNoPipeline ? false : nil
+        }
+        switch playbackBackend {
+        case .none, .aether: return nil
+        case .native:
+            if loadedOptions.nativeRemoteHLS { return false }
+            return engineOwned(applied: nativeVideoSession?.audioShapingApplied,
+                               delivery: nativeVideoSession?.audioDelivery)
+        case .software:
+            return engineOwned(applied: softwareHost?.audioShapingApplied, delivery: softwareHost?.audioDelivery)
+        case .audio:
+            if audioAVPlayerHost != nil { return false }
+            return audioHost.flatMap { $0.audioShaping.isActive ? true : nil }
+        }
+    }
+
+    func recomputeAudioShapingState() {
+        let next = AudioShapingState.derive(shaping: loadedOptions.audioShaping,
+                                            pipelineApplies: livePipelineAppliesShaping)
+        guard audioShapingState != next else { return }
+        audioShapingState = next
+        EngineLog.emit("[AetherEngine] AE#923: audio shaping \(next.rawValue) (\(loadedOptions.audioShaping.summary))",
+                       category: .engine)
     }
 
     /// Timing adjustment for subtitles composited into software PiP frames, in media seconds.
@@ -2491,6 +2528,9 @@ public final class AetherEngine: ObservableObject {
     /// would be lost at the next audio-track switch or background return.
     func setLoadedAudioDelay(_ seconds: Double) { loadedOptions.audioDelaySeconds = seconds }
 
+    /// AE#923: the narrow write for `setAudioShaping`, for the same reason as the delay above.
+    func setLoadedAudioShaping(_ shaping: AudioShaping) { loadedOptions.audioShaping = shaping }
+
     /// AE#464 round 2: the fourth narrow write, and the one that makes a session-preserving reload
     /// preserve the session's transport. `autoplay` describes a MOUNT, and a rebuild is not a mount;
     /// writing the session's own transport state here is what both reload branches then replay,
@@ -3881,6 +3921,9 @@ public final class AetherEngine: ObservableObject {
     /// value does not ride the call (every press writes `loadedOptions.audioDelaySeconds` first), so
     /// the rebuild already in flight delivers the newest one. See `reanchorForAudioDelay`.
     var audioDelayReanchorInFlight = false
+
+    /// AE#923: the same latch for `setAudioShaping`'s rebuilds.
+    var audioShapingReanchorInFlight = false
 
     /// The playhead a rebuild of this session has to come back to (#464 round 2).
     var positionForSessionRebuild: Double {
