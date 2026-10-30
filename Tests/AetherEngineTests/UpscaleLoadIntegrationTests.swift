@@ -61,4 +61,56 @@ struct UpscaleLoadIntegrationTests {
         #expect(disabled.sourceSize == CGSize(width: 640, height: 480))
         #expect(disabled.disabledReason == "over budget")
     }
+
+    /// A custom source's in-place rebuild never re-runs the load's decision, so turning the option on there
+    /// could not take effect and is refused; turning it off is honoured by the rebuild. URL sources re-run
+    /// `load()` and are never refused.
+    @Test("turning the option on for a custom source is refused, turning it off is not")
+    func customSourceOnFlipIsRefused() {
+        var off = LoadOptions()
+        off.upscalesLowResolutionVideo = false
+        var on = off
+        on.upscalesLowResolutionVideo = true
+        func refusal(custom: Bool, from: LoadOptions, to: LoadOptions) -> SessionReloadRefusal? {
+            SessionOptionCorrection.upscaleRouteRefusal(isCustomSource: custom, current: from, proposed: to)
+        }
+        #expect(refusal(custom: true, from: off, to: on) == .upscaleRouteNeedsFreshLoad)
+        #expect(refusal(custom: true, from: on, to: off) == nil)
+        #expect(refusal(custom: false, from: off, to: on) == nil)
+        #expect(refusal(custom: true, from: on, to: on) == nil)
+        #expect(refusal(custom: true, from: off, to: off) == nil)
+        #expect(!SessionReloadRefusal.upscaleRouteNeedsFreshLoad.description.isEmpty)
+    }
+
+    @Test("a rebuild hands the next host the session's plan while the option is on and the stage ran clean")
+    func rebuildKeepsThePlan() {
+        let next = UpscaleRouteDecision.forRebuild(sessionPlan: plan, optionOn: true, disabled: nil)
+        #expect(next.plan == plan)
+        #expect(next.status == nil)
+    }
+
+    @Test("a rebuild after the option was turned off builds no stage and publishes nothing")
+    func rebuildAfterOffFlip() {
+        let disabled = UpscaleStatus.afterDisable(reason: "over budget", current: nil, plan: plan)
+        for latched in [nil, disabled] {
+            let next = UpscaleRouteDecision.forRebuild(sessionPlan: plan, optionOn: false, disabled: latched)
+            #expect(next.plan == nil)
+            #expect(next.status == nil)
+        }
+    }
+
+    @Test("a stage that disabled itself stays off for the session and its status is republished")
+    func disableIsLatchedAcrossRebuilds() {
+        let disabled = UpscaleStatus.afterDisable(reason: "3 consecutive failures", current: nil, plan: plan)
+        let next = UpscaleRouteDecision.forRebuild(sessionPlan: plan, optionOn: true, disabled: disabled)
+        #expect(next.plan == nil)
+        #expect(next.status == disabled)
+    }
+
+    @Test("a session that never took the route builds no stage on a rebuild")
+    func rebuildWithoutPlan() {
+        let next = UpscaleRouteDecision.forRebuild(sessionPlan: nil, optionOn: true, disabled: nil)
+        #expect(next.plan == nil)
+        #expect(next.status == nil)
+    }
 }

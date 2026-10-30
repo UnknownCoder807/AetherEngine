@@ -119,6 +119,17 @@ enum UpscaleRouteDecision: Equatable {
         colorTransfer != AVCOL_TRC_SMPTE2084 && colorTransfer != AVCOL_TRC_ARIB_STD_B67
     }
 
+    /// What an in-session rebuild hands the next software host, and the status it republishes before that
+    /// host's first frame. The option turned off builds no stage and publishes nothing; a stage that
+    /// disabled itself stays off for the session and keeps its disabled status.
+    static func forRebuild(
+        sessionPlan: UpscalePlan?, optionOn: Bool, disabled: UpscaleStatus?
+    ) -> (plan: UpscalePlan?, status: UpscaleStatus?) {
+        guard optionOn, let sessionPlan else { return (nil, nil) }
+        if let disabled { return (nil, disabled) }
+        return (sessionPlan, nil)
+    }
+
     var plan: UpscalePlan? {
         if case let .taken(plan) = self { return plan }
         return nil

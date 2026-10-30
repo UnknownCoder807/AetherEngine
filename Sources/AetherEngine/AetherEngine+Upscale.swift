@@ -51,6 +51,7 @@ extension AetherEngine {
 
     /// Connects the stage `host`'s load built to `activeUpscale`. The host's load can already have run it
     /// (the first frame decodes under pause), so what the stage did before the handler existed is caught up.
+    /// A disable is latched for the session (`sourceUpscaleDisabled`), so no later host builds the stage again.
     func wireUpscaleStatus(from host: SoftwarePlaybackHost) {
         #if !targetEnvironment(simulator)
         guard #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *),
@@ -63,8 +64,7 @@ extension AetherEngine {
                 case let .firstFrame(framePlan):
                     self.activeUpscale = UpscaleStatus.afterFirstFrame(framePlan, current: self.activeUpscale)
                 case let .disabled(reason: reason, stats: _):
-                    self.activeUpscale = UpscaleStatus.afterDisable(
-                        reason: reason, current: self.activeUpscale, plan: plan)
+                    self.latchUpscaleDisabled(reason: reason, plan: plan)
                 }
             }
         }
@@ -72,8 +72,14 @@ extension AetherEngine {
             activeUpscale = UpscaleStatus.afterFirstFrame(plan, current: activeUpscale)
         }
         if let reason = upscaler.disabledReason {
-            activeUpscale = UpscaleStatus.afterDisable(reason: reason, current: activeUpscale, plan: plan)
+            latchUpscaleDisabled(reason: reason, plan: plan)
         }
         #endif
+    }
+
+    private func latchUpscaleDisabled(reason: String, plan: UpscalePlan) {
+        let status = UpscaleStatus.afterDisable(reason: reason, current: activeUpscale, plan: plan)
+        activeUpscale = status
+        sourceUpscaleDisabled = status
     }
 }

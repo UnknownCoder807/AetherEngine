@@ -700,6 +700,9 @@ public final class AetherEngine: ObservableObject {
     /// #846: the upscale plan the load decided, carried to every software host this session builds.
     var sourceUpscalePlan: UpscalePlan? = nil
 
+    /// #846: set when the session's stage disabled itself, so no later host of the session builds one again.
+    var sourceUpscaleDisabled: UpscaleStatus? = nil
+
     /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
     /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
     /// on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
@@ -4601,6 +4604,7 @@ public final class AetherEngine: ObservableObject {
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
         sourceUpscalePlan = nil
+        sourceUpscaleDisabled = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -5710,14 +5714,16 @@ public final class AetherEngine: ObservableObject {
             routedSoftware: useSoftwarePath, preferred: options.preferredDecodePath)
         // #846: after every other routing decision, because this one only ever adds the software path and
         // the interlace refute probe above can take that path away again.
-        let upscaleDecision = upscaleRouteDecision(
-            options: options,
-            videoStream: probeOpened ? probe.stream(at: probe.videoStreamIndex) : nil,
-            dvProfile: detectedDVProfileNum,
-            airPlayVideoReceiver: airPlayVideoReceiver,
-            demuxedAudioLive: SessionOptionCorrection.isDemuxedAudioLive(
-                isLive: options.isLive,
-                hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil))
+        let upscaleDecision = !options.upscalesLowResolutionVideo
+            ? UpscaleRouteDecision.notTaken(.preferenceOff)
+            : upscaleRouteDecision(
+                options: options,
+                videoStream: probeOpened ? probe.stream(at: probe.videoStreamIndex) : nil,
+                dvProfile: detectedDVProfileNum,
+                airPlayVideoReceiver: airPlayVideoReceiver,
+                demuxedAudioLive: SessionOptionCorrection.isDemuxedAudioLive(
+                    isLive: options.isLive,
+                    hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil))
         if let line = upscaleDecision.logLine {
             EngineLog.emit(line, category: .engine)
         }
@@ -7084,6 +7090,7 @@ public final class AetherEngine: ObservableObject {
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
         sourceUpscalePlan = nil
+        sourceUpscaleDisabled = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil

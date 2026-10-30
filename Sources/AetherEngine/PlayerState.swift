@@ -524,8 +524,8 @@ public struct LoadOptions: Sendable, Equatable {
     /// switch it off for the session (`AetherEngine.activeUpscale`). Default false.
     ///
     /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change on a URL source, which
-    /// re-runs `load()` and re-decides the route. A custom `IOReader` source rebuilds in place and keeps
-    /// the route it was loaded with.
+    /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
+    /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
     public var upscalesLowResolutionVideo: Bool = false
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.

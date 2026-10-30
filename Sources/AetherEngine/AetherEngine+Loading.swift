@@ -2019,10 +2019,13 @@ extension AetherEngine {
         // on every build. Without it a software host came up aspect-fit whatever the app had set,
         // and only a second write mid-session took effect.
         let host = SoftwarePlaybackHost(videoGravity: _videoGravity)
+        let upscaleRebuild = UpscaleRouteDecision.forRebuild(
+            sessionPlan: sourceUpscalePlan, optionOn: loadedOptions.upscalesLowResolutionVideo,
+            disabled: sourceUpscaleDisabled)
         host.configuredDVProfile = sourceDVProfile
         host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
-        host.upscalePlan = sourceUpscalePlan
+        host.upscalePlan = upscaleRebuild.plan
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
@@ -2233,6 +2236,7 @@ extension AetherEngine {
             host.stop()
             try checkLoadCurrent(generation)
         }
+        if let status = upscaleRebuild.status { activeUpscale = status }
         wireUpscaleStatus(from: host)
         // The audio route is settled by `load`: an object-audio one keeps the HDMI link in Atmos.
         followAtmosOutput()
