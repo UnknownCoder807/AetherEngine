@@ -210,10 +210,10 @@ final class SoftwarePlaybackHost {
     /// Opt-in to full dual-layer Dolby Vision (Profile 7 FEL) decoding and Metal GPU composition over single-layer fallback.
     var preferDualLayerDolbyVision: Bool = false
 
-    /// #846: set by the load before `load(demuxer:...)`; non-nil wraps the chosen decoder in the upscale stage.
+    /// #846: set by the load before `load(demuxer:...)`; non-nil runs the upscale stage on every decoded frame.
     var upscalePlan: UpscalePlan?
 
-    /// The stage `selectVideoDecoder` built for the current plan (a `FrameUpscaler`), nil when none was.
+    /// The stage built for the current plan (a `FrameUpscaler`), nil when none was.
     /// Typed loosely because the class does not exist in simulator builds or before OS 26.
     private(set) var frameUpscaler: AnyObject?
 
@@ -1146,31 +1146,6 @@ final class SoftwarePlaybackHost {
     func selectVideoDecoder(
         codecID: AVCodecID,
         canHardwareDecode: Bool,
-        dvProfile: Int?,
-        frameRate: Double? = nil
-    ) -> any VideoDecodingPipeline {
-        let decoder = baseVideoDecoder(codecID: codecID, canHardwareDecode: canHardwareDecode, dvProfile: dvProfile)
-        return wrappedForUpscale(decoder, frameRate: frameRate)
-    }
-
-    /// #846: never wraps the dual-layer decoder (FEL sources are HDR and refused upstream).
-    private func wrappedForUpscale(_ decoder: any VideoDecodingPipeline, frameRate: Double?) -> any VideoDecodingPipeline {
-        frameUpscaler = nil
-        guard let plan = upscalePlan, !Self.isDualLayer(decoder) else { return decoder }
-        #if !targetEnvironment(simulator)
-        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
-            let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
-            guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return decoder }
-            frameUpscaler = stage
-            return UpscalingVideoDecoder(inner: decoder) { stage.upscale($0) }
-        }
-        #endif
-        return decoder
-    }
-
-    private func baseVideoDecoder(
-        codecID: AVCodecID,
-        canHardwareDecode: Bool,
         dvProfile: Int?
     ) -> any VideoDecodingPipeline {
         if codecID == AV_CODEC_ID_VP9 && canHardwareDecode {
@@ -1200,6 +1175,26 @@ final class SoftwarePlaybackHost {
         } else {
             return SoftwareVideoDecoder()
         }
+    }
+
+    /// #846: `handler` wrapped in the upscale stage when a plan is set and a stage builds, else unchanged.
+    /// Never for the dual-layer decoder (FEL sources are HDR and refused upstream).
+    func upscaledFrameHandler(
+        _ handler: @escaping DecodedFrameHandler,
+        decoder: any VideoDecodingPipeline,
+        frameRate: Double?
+    ) -> DecodedFrameHandler {
+        frameUpscaler = nil
+        guard let plan = upscalePlan, !Self.isDualLayer(decoder) else { return handler }
+        #if !targetEnvironment(simulator)
+        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
+            let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
+            guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return handler }
+            frameUpscaler = stage
+            return UpscalingFrameHandler.wrap(handler) { stage.upscale($0) }
+        }
+        #endif
+        return handler
     }
 
     // MARK: - Load
@@ -1307,8 +1302,7 @@ final class SoftwarePlaybackHost {
             let chosen = selectVideoDecoder(
                 codecID: codecpar.pointee.codec_id,
                 canHardwareDecode: true,
-                dvProfile: dvProfile,
-                frameRate: AetherEngine.detectFrameRate(stream: vStream)
+                dvProfile: dvProfile
             )
             videoDecoder = chosen
             #if DualLayerDolbyVision
@@ -1410,7 +1404,7 @@ final class SoftwarePlaybackHost {
         // Applied here (not init) so it also covers a decoder replaced above.
         (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
-        let onFrame: DecodedFrameHandler = { [weak self] pixelBuffer, pts, hdr10PlusData in
+        let baseOnFrame: DecodedFrameHandler = { [weak self] pixelBuffer, pts, hdr10PlusData in
             guard let self else { return }
             // AE#491: a frame decoded from a pre-seek packet is not late, it is from somewhere else.
             guard self.decodeGeneration == self.seekGeneration else { return }
@@ -1435,6 +1429,9 @@ final class SoftwarePlaybackHost {
                 )
             }
         }
+
+        let onFrame = upscaledFrameHandler(
+            baseOnFrame, decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
 
         if vStream.pointee.codecpar?.pointee.codec_id == AV_CODEC_ID_VP9 {
             let opened = try VideoDecoderOpener.openPreferredOrFallback(
