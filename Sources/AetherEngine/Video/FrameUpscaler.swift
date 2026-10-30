@@ -29,6 +29,17 @@ final class FrameUpscaler: @unchecked Sendable {
     static let budgetWindow = 48
     static let budgetFraction = 0.75
     static let maxConsecutiveFailures = 3
+    /// PTS deltas the live frame interval is the median of.
+    static let intervalWindow = 8
+
+    /// Median of the last `intervalWindow` deltas, `configured` until that many exist. The deinterlacer
+    /// doubles a field-rate source's frame rate, so the stream's declared rate is only a seed.
+    static func liveInterval(deltas: [Double], configured: Double) -> Double {
+        guard deltas.count >= intervalWindow else { return configured }
+        let sorted = deltas.suffix(intervalWindow).sorted()
+        let mid = sorted.count / 2
+        return sorted.count % 2 == 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
+    }
 
     /// Scale factors VT offers for a frame size, empty when the ML scaler is unsupported.
     static func mlScaleFactors(_ width: Int, _ height: Int) -> [Float] {
@@ -59,7 +70,10 @@ final class FrameUpscaler: @unchecked Sendable {
     typealias MLSubmit = (VTLowLatencySuperResolutionScalerParameters, @escaping @Sendable (Error?) -> Void) -> Void
     private var _mlSubmitOverride: MLSubmit?
 
-    private let frameInterval: Double
+    private let configuredInterval: Double
+    private var frameInterval: Double
+    private var ptsDeltas: [Double] = []
+    private var lastPTS: Double?
     private let gpu: GPU
     private var stage: Stage
     private var lastPassThroughNote: String?
@@ -88,13 +102,29 @@ final class FrameUpscaler: @unchecked Sendable {
             return nil
         }
         self.gpu = gpu
+        self.configuredInterval = frameInterval
         self.frameInterval = frameInterval
     }
 
-    func upscale(_ input: CVPixelBuffer) -> CVPixelBuffer? {
+    /// The overrun budget per frame, from the live frame interval.
+    var frameBudgetMs: Double {
+        processLock.lock(); defer { processLock.unlock() }
+        return Self.budgetFraction * frameInterval * 1000
+    }
+
+    /// How long one ML pass may take before the original frame goes out.
+    var mlTimeout: Double {
+        processLock.lock(); defer { processLock.unlock() }
+        return currentMLTimeout
+    }
+
+    private var currentMLTimeout: Double { max(0.05, 3 * frameInterval) }
+
+    func upscale(_ input: CVPixelBuffer, pts: CMTime) -> CVPixelBuffer? {
         processLock.lock()
         defer { processLock.unlock() }
         guard !isDisabled else { return nil }
+        notePTS(pts)
 
         let format = CVPixelBufferGetPixelFormatType(input)
         guard format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
@@ -113,7 +143,7 @@ final class FrameUpscaler: @unchecked Sendable {
         do {
             let output = try stage.process(
                 input, picture: picture, frameIndex: frameIndex,
-                mlTimeout: max(0.05, 3 * frameInterval), submit: _mlSubmitOverride)
+                mlTimeout: currentMLTimeout, submit: _mlSubmitOverride)
             let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
             recordSuccess(ms: ms)
             return output
@@ -121,6 +151,16 @@ final class FrameUpscaler: @unchecked Sendable {
             recordFailure(error)
             return nil
         }
+    }
+
+    private func notePTS(_ pts: CMTime) {
+        guard pts.isNumeric else { return }
+        let seconds = pts.seconds
+        defer { lastPTS = seconds }
+        guard let last = lastPTS, seconds > last else { return }
+        ptsDeltas.append(seconds - last)
+        if ptsDeltas.count > Self.intervalWindow { ptsDeltas.removeFirst() }
+        frameInterval = Self.liveInterval(deltas: ptsDeltas, configured: configuredInterval)
     }
 
     // MARK: - Rebuild and pass-through

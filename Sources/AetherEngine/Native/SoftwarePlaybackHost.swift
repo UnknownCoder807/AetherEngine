@@ -1191,7 +1191,7 @@ final class SoftwarePlaybackHost {
             let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
             guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return handler }
             frameUpscaler = stage
-            return UpscalingFrameHandler.wrap(handler) { stage.upscale($0) }
+            return UpscalingFrameHandler.wrap(handler) { stage.upscale($0, pts: $1) }
         }
         #endif
         return handler

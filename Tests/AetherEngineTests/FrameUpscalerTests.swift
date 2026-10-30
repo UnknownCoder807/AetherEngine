@@ -2,6 +2,7 @@
 import Foundation
 import Testing
 import CoreGraphics
+import CoreMedia
 import CoreVideo
 import Metal
 import VideoToolbox
@@ -235,6 +236,40 @@ struct FrameUpscalerTests {
             Issue.record("last event \(String(describing: all.last))")
         }
     }
+
+    /// Deinterlaced SD runs at field rate: the configured interval says 25 fps, the frames arrive at 50.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func budgetFollowsTheDeliveredFrameRate() throws {
+        let up = try upscaler(try plan(720, 480, ml: []), frameInterval: 1.0 / 25)
+        let input = try TestFrames.nv12(720, 480)
+        #expect(abs(up.frameBudgetMs - 30) < 0.001)
+        for i in 0..<8 { _ = up.upscale(input, pts: CMTime(value: Int64(i), timescale: 50)) }
+        #expect(abs(up.frameBudgetMs - 30) < 0.001, "seven deltas still use the configured interval")
+        _ = up.upscale(input, pts: CMTime(value: 8, timescale: 50))
+        #expect(abs(up.frameBudgetMs - 15) < 0.001)
+        #expect(abs(up.mlTimeout - 0.06) < 0.0001)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func liveIntervalIgnoresNonPositiveDeltas() throws {
+        #expect(FrameUpscaler.liveInterval(deltas: [], configured: 0.04) == 0.04)
+        #expect(FrameUpscaler.liveInterval(deltas: Array(repeating: 0.02, count: 7), configured: 0.04) == 0.04)
+        #expect(FrameUpscaler.liveInterval(deltas: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 5], configured: 0.04) == 0.02)
+        let up = try upscaler(try plan(720, 480, ml: []), frameInterval: 1.0 / 25)
+        let input = try TestFrames.nv12(720, 480)
+        for v in [0, 0, 1, 1, 0, 2, 3, 4, 5, 6, 7, 8, 9] as [Int64] {
+            _ = up.upscale(input, pts: CMTime(value: v, timescale: 50))
+        }
+        #expect(abs(up.frameBudgetMs - 15) < 0.001)
+    }
+}
+
+@available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+private extension FrameUpscaler {
+    /// No timing: the configured interval stays in force.
+    func upscale(_ input: CVPixelBuffer) -> CVPixelBuffer? { upscale(input, pts: .invalid) }
 }
 
 private final class BufferLog: @unchecked Sendable {

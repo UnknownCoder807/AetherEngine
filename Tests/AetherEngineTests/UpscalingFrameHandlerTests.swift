@@ -17,9 +17,13 @@ struct UpscalingFrameHandlerTests {
 
     @Test func framesPassThroughTheStageInOrder() {
         let seen = Mutex<[(Int, Double, Data?)]>([])
+        let stagePTS = Mutex<[Double]>([])
         let handler = UpscalingFrameHandler.wrap({ buf, pts, data in
             seen.withLock { $0.append((CVPixelBufferGetWidth(buf), pts.seconds, data)) }
-        }, upscale: { makeBuffer(width: CVPixelBufferGetWidth($0) * 10) })
+        }, upscale: { buf, pts in
+            stagePTS.withLock { $0.append(pts.seconds) }
+            return makeBuffer(width: CVPixelBufferGetWidth(buf) * 10)
+        })
         let tag = Data([1, 2, 3])
         handler(makeBuffer(width: 16), CMTime(seconds: 1, preferredTimescale: 600), nil)
         handler(makeBuffer(width: 32), CMTime(seconds: 2, preferredTimescale: 600), tag)
@@ -28,6 +32,7 @@ struct UpscalingFrameHandlerTests {
         #expect(got.map(\.0) == [160, 320, 480])
         #expect(got.map(\.1) == [1, 2, 3])
         #expect(got[1].2 == tag)
+        #expect(stagePTS.withLock { $0 } == [1, 2, 3])
     }
 
     @Test func nilFromTheStageDeliversTheOriginal() {
@@ -36,7 +41,7 @@ struct UpscalingFrameHandlerTests {
         let seen = Mutex<[Bool]>([])
         let handler = UpscalingFrameHandler.wrap({ buf, _, _ in
             seen.withLock { $0.append(ObjectIdentifier(buf) == originalID) }
-        }, upscale: { _ in nil })
+        }, upscale: { _, _ in nil })
         handler(original, .zero, nil)
         #expect(seen.withLock { $0 } == [true])
     }
