@@ -45,6 +45,7 @@ enum UpscaleRouteDecision: Equatable {
         case unsupportedOS
         case metalFXUnsupported
         case hdrOrDolbyVision
+        case notEightBit420
         case geometryUnknown
         case notBelow1080p
         case displayNotLarger
@@ -54,7 +55,7 @@ enum UpscaleRouteDecision: Equatable {
 
     static func decide(
         preference: Bool, osSupportsStage: Bool, metalFXSupported: Bool,
-        source: SourceGeometry, isSDR: Bool, isDolbyVision: Bool,
+        source: SourceGeometry, isSDR: Bool, isDolbyVision: Bool, isEightBit420: Bool,
         display: CGSize, airPlayVideoReceiver: Bool, demuxedAudioLive: Bool,
         mlScaleFactors: (Int, Int) -> [Float]
     ) -> UpscaleRouteDecision {
@@ -62,6 +63,7 @@ enum UpscaleRouteDecision: Equatable {
         guard osSupportsStage else { return .notTaken(.unsupportedOS) }
         guard metalFXSupported else { return .notTaken(.metalFXUnsupported) }
         guard isSDR, !isDolbyVision else { return .notTaken(.hdrOrDolbyVision) }
+        guard isEightBit420 else { return .notTaken(.notEightBit420) }
         guard source.width > 0, source.height > 0 else { return .notTaken(.geometryUnknown) }
         guard source.width < 1920, source.height < 1080 else { return .notTaken(.notBelow1080p) }
         guard let plan = makePlan(source: source, display: display, mlScaleFactors: mlScaleFactors),
@@ -119,6 +121,19 @@ enum UpscaleRouteDecision: Equatable {
         colorTransfer != AVCOL_TRC_SMPTE2084 && colorTransfer != AVCOL_TRC_ARIB_STD_B67
     }
 
+    /// The stage takes 8-bit 4:2:0 decoder output only. A known pixel format decides; without one the raw
+    /// sample depth does, and an unknown depth counts as not 8-bit.
+    static func isEightBit420(pixelFormat: Int32, bitsPerRawSample: Int32) -> Bool {
+        let format = AVPixelFormat(rawValue: pixelFormat)
+        guard format != AV_PIX_FMT_NONE, let desc = av_pix_fmt_desc_get(format) else {
+            return (1...8).contains(bitsPerRawSample)
+        }
+        let d = desc.pointee
+        let excluded = UInt64(AV_PIX_FMT_FLAG_RGB) | UInt64(AV_PIX_FMT_FLAG_HWACCEL) | UInt64(AV_PIX_FMT_FLAG_PAL)
+        return d.nb_components >= 3 && d.comp.0.depth == 8 && d.log2_chroma_w == 1 && d.log2_chroma_h == 1
+            && d.flags & excluded == 0
+    }
+
     /// What an in-session rebuild hands the next software host, and the status it republishes before that
     /// host's first frame. The option turned off builds no stage and publishes nothing; a stage that
     /// disabled itself stays off for the session and keeps its disabled status.
@@ -160,6 +175,7 @@ extension UpscaleRouteDecision.Reason {
         case .unsupportedOS: return "needs OS 26"
         case .metalFXUnsupported: return "MetalFX spatial scaling unsupported on this device"
         case .hdrOrDolbyVision: return "HDR or Dolby Vision source"
+        case .notEightBit420: return "source is not 8-bit 4:2:0"
         case .geometryUnknown: return "source size unknown"
         case .notBelow1080p: return "source is not below 1080p"
         case .displayNotLarger: return "display is not larger than the source"

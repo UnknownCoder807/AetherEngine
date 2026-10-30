@@ -1,5 +1,6 @@
 import Testing
 import CoreGraphics
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("Upscale route decision")
@@ -10,14 +11,14 @@ struct UpscaleRouteDecisionTests {
     private func decide(
         preference: Bool = true, os: Bool = true, metalFX: Bool = true,
         source: SourceGeometry = SourceGeometry(width: 1280, height: 720, sarNum: 1, sarDen: 1),
-        sdr: Bool = true, dv: Bool = false,
+        sdr: Bool = true, dv: Bool = false, eightBit: Bool = true,
         display: CGSize = CGSize(width: 3840, height: 2160),
         airPlay: Bool = false, demuxedLive: Bool = false,
         factors: (Int, Int) -> [Float] = UpscaleRouteDecisionTests.defaultFactors
     ) -> UpscaleRouteDecision {
         UpscaleRouteDecision.decide(
             preference: preference, osSupportsStage: os, metalFXSupported: metalFX,
-            source: source, isSDR: sdr, isDolbyVision: dv, display: display,
+            source: source, isSDR: sdr, isDolbyVision: dv, isEightBit420: eightBit, display: display,
             airPlayVideoReceiver: airPlay, demuxedAudioLive: demuxedLive, mlScaleFactors: factors)
     }
 
@@ -82,6 +83,37 @@ struct UpscaleRouteDecisionTests {
     @Test func hdrAndDolbyVisionAreRefused() {
         #expect(decide(sdr: false) == .notTaken(.hdrOrDolbyVision))
         #expect(decide(dv: true) == .notTaken(.hdrOrDolbyVision))
+    }
+
+    @Test func tenBitSDRIsRefusedAndEightBitTaken() {
+        #expect(decide(eightBit: false) == .notTaken(.notEightBit420))
+        #expect(decide(eightBit: true).plan != nil)
+        #expect(decide(eightBit: false).logLine?.contains("8-bit 4:2:0") == true)
+    }
+
+    @Test func bitDepthIsCheckedAfterHDRAndBeforeGeometry() {
+        #expect(decide(sdr: false, eightBit: false) == .notTaken(.hdrOrDolbyVision))
+        #expect(decide(source: geo(0, 0), eightBit: false) == .notTaken(.notEightBit420))
+    }
+
+    @Test func eightBit420FromCodecParameters() {
+        func check(_ f: AVPixelFormat, _ bits: Int32 = 0) -> Bool {
+            UpscaleRouteDecision.isEightBit420(pixelFormat: f.rawValue, bitsPerRawSample: bits)
+        }
+        #expect(check(AV_PIX_FMT_YUV420P))
+        #expect(check(AV_PIX_FMT_YUVJ420P))
+        #expect(check(AV_PIX_FMT_NV12))
+        #expect(!check(AV_PIX_FMT_YUV420P10LE))
+        #expect(!check(AV_PIX_FMT_P010LE))
+        #expect(!check(AV_PIX_FMT_YUV422P))
+        #expect(!check(AV_PIX_FMT_YUV444P))
+        #expect(!check(AV_PIX_FMT_RGB24))
+        // A known format wins over a contradicting raw sample count.
+        #expect(check(AV_PIX_FMT_YUV420P, 10))
+        #expect(check(AV_PIX_FMT_NONE, 8))
+        #expect(check(AV_PIX_FMT_NONE, 1))
+        #expect(!check(AV_PIX_FMT_NONE, 10))
+        #expect(!check(AV_PIX_FMT_NONE, 0))
     }
 
     @Test func displayNotLargerIsRefused() {

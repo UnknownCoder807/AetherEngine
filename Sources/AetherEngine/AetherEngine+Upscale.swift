@@ -19,6 +19,7 @@ extension AetherEngine {
 
         var source = SourceGeometry(width: 0, height: 0, sarNum: 0, sarDen: 0)
         var isSDR = true
+        var isEightBit420 = true
         if let stream = videoStream, let cp = stream.pointee.codecpar {
             let sar = PixelAspectPolicy.declaredPixelAspect(
                 bitstream: cp.pointee.sample_aspect_ratio, container: stream.pointee.sample_aspect_ratio,
@@ -26,6 +27,8 @@ extension AetherEngine {
             source = SourceGeometry(width: Int(cp.pointee.width), height: Int(cp.pointee.height),
                                     sarNum: Int(sar?.num ?? 0), sarDen: Int(sar?.den ?? 0))
             isSDR = UpscaleRouteDecision.isSDR(colorTransfer: cp.pointee.color_trc)
+            isEightBit420 = UpscaleRouteDecision.isEightBit420(
+                pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
         }
 
         var osSupportsStage = false
@@ -43,7 +46,7 @@ extension AetherEngine {
 
         return UpscaleRouteDecision.decide(
             preference: true, osSupportsStage: osSupportsStage, metalFXSupported: metalFXSupported,
-            source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil,
+            source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil, isEightBit420: isEightBit420,
             display: DisplayPixelSize.current() ?? .zero,
             airPlayVideoReceiver: airPlayVideoReceiver, demuxedAudioLive: demuxedAudioLive,
             mlScaleFactors: mlScaleFactors)
