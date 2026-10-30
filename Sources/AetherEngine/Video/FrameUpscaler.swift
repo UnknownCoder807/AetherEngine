@@ -505,7 +505,41 @@ private final class MLScaler {
             throw MLTimeout(seconds: timeout)
         }
         if let error = result { throw error }
+        try clampBorder(destination, luma: mlBorderClamp)
         return destination
+    }
+}
+
+/// VT super resolution rings at the frame edge (measured up to 39 code values), so this many outer luma
+/// samples are replaced by the nearest clean row or column.
+let mlBorderClamp = 12
+
+/// Replicates row/column `luma` (and `luma / 2` in chroma) over the outer band on all four sides.
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+private func clampBorder(_ buffer: CVPixelBuffer, luma k: Int) throws {
+    CVPixelBufferLockBaseAddress(buffer, [])
+    defer { CVPixelBufferUnlockBaseAddress(buffer, []) }
+    for plane in 0..<2 {
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, plane) else {
+            throw UpscaleError("plane \(plane) has no base address")
+        }
+        let band = plane == 0 ? k : k / 2
+        let bytes = plane == 0 ? 1 : 2
+        let w = CVPixelBufferGetWidthOfPlane(buffer, plane), h = CVPixelBufferGetHeightOfPlane(buffer, plane)
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(buffer, plane)
+        guard band > 0, w > 2 * band, h > 2 * band else { continue }
+        let rowBytes = w * bytes
+        for row in 0..<band {
+            memcpy(base + row * stride, base + band * stride, rowBytes)
+            memcpy(base + (h - 1 - row) * stride, base + (h - 1 - band) * stride, rowBytes)
+        }
+        for row in 0..<h {
+            let line = base + row * stride
+            for x in 0..<band {
+                memcpy(line + x * bytes, line + band * bytes, bytes)
+                memcpy(line + (w - 1 - x) * bytes, line + (w - 1 - band) * bytes, bytes)
+            }
+        }
     }
 }
 

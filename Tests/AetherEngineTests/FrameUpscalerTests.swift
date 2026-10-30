@@ -95,11 +95,8 @@ struct FrameUpscalerTests {
         print(String(format: "[FrameUpscalerTests] 720x480 MetalFX -> 2880x2160: mean %.2f ms", up.stats.meanMs))
     }
 
-    /// MetalFX alone keeps every sample. VT's super resolution rings in the outermost ~12 source pixels
-    /// even on a flat field (measured: Y 126 comes back as 49...154 at the very edge, the deviation scaling
-    /// with the level, as if the model pads with zeros), and its interior carries a +-1 texture that
-    /// MetalFX's sharpening lifts to +-3, so the ML pipeline is held to the interior: no shift in the
-    /// mean, nothing past 3 code values.
+    /// MetalFX alone keeps every sample. VT's ML pass carries a +-1 texture (MetalFX sharpening lifts it a
+    /// little) and its edge ringing is clamped away, so the ML paths get +-4 with no border exemption.
     @Test
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func flatGreyStaysFlatGrey() throws {
@@ -110,12 +107,39 @@ struct FrameUpscalerTests {
         #expect(all.c.lowerBound >= 126 && all.c.upperBound <= 130, "MetalFX C \(all.c)")
 
         guard UpscalerGate.mlAvailable else { return }
-        let both = try #require(try upscaler(try plan(720, 480, sar: (8, 9), ml: [2])).upscale(grey))
-        let inner = TestFrames.planeRange(both, margin: 32)
-        #expect(inner.y.lowerBound >= 123 && inner.y.upperBound <= 129, "ML+MetalFX Y \(inner.y)")
-        #expect(inner.c.lowerBound >= 125 && inner.c.upperBound <= 131, "ML+MetalFX C \(inner.c)")
-        #expect(abs(inner.meanY - 126) < 0.5, "ML+MetalFX mean Y \(inner.meanY)")
-        #expect(abs(inner.meanC - 128) < 0.5, "ML+MetalFX mean C \(inner.meanC)")
+        let mlOnly = try upscaler(try plan(720, 480, display: CGSize(width: 1440, height: 960), ml: [2]))
+        let both = try upscaler(try plan(720, 480, sar: (8, 9), ml: [2]))
+        for (name, up) in [("ML", mlOnly), ("ML+MetalFX", both)] {
+            let out = try #require(up.upscale(grey))
+            let r = TestFrames.planeRange(out)
+            #expect(r.y.lowerBound >= 122 && r.y.upperBound <= 130, "\(name) Y \(r.y)")
+            #expect(abs(r.meanY - 126) < 0.5, "\(name) mean Y \(r.meanY)")
+            #expect(abs(r.meanC - 128) < 0.5, "\(name) mean C \(r.meanC)")
+        }
+    }
+
+    /// The edge clamp is pinned on a vertical gradient: the outer 12 rows repeat row 12 (top) and row
+    /// h-13 (bottom), the outer 12 columns repeat column 12 / w-13.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func mlOutputBorderIsClamped() throws {
+        let up = try upscaler(try plan(1280, 720, display: CGSize(width: 1920, height: 1080), ml: [1.5]))
+        let out = try #require(up.upscale(try TestFrames.nv12(1280, 720, vertical: true)))
+        CVPixelBufferLockBaseAddress(out, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(out, .readOnly) }
+        let p = CVPixelBufferGetBaseAddressOfPlane(out, 0)!.assumingMemoryBound(to: UInt8.self)
+        let s = CVPixelBufferGetBytesPerRowOfPlane(out, 0)
+        let w = CVPixelBufferGetWidth(out), h = CVPixelBufferGetHeight(out)
+        func y(_ x: Int, _ r: Int) -> UInt8 { p[r * s + x] }
+        #expect(y(w / 2, 12) != y(w / 2, h - 13), "the input must not be flat")
+        var mismatches = 0
+        for r in 0..<12 {
+            for x in 0..<w where y(x, r) != y(x, 12) || y(x, h - 1 - r) != y(x, h - 13) { mismatches += 1 }
+        }
+        for r in 0..<h {
+            for x in 0..<12 where y(x, r) != y(12, r) || y(w - 1 - x, r) != y(w - 13, r) { mismatches += 1 }
+        }
+        #expect(mismatches == 0)
     }
 
     @Test
@@ -242,7 +266,8 @@ private enum TestFrames {
     }
 
     /// A 420v BT.709 frame, a soft gradient unless `y`/`c` pin it flat.
-    static func nv12(_ w: Int, _ h: Int, par: (Int, Int)? = nil, y fixedY: UInt8? = nil, c fixedC: UInt8? = nil) throws -> CVPixelBuffer {
+    static func nv12(_ w: Int, _ h: Int, par: (Int, Int)? = nil, y fixedY: UInt8? = nil, c fixedC: UInt8? = nil,
+                     vertical: Bool = false) throws -> CVPixelBuffer {
         let pb = try buffer(w, h, format: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_709_2, .shouldPropagate)
         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, kCVImageBufferTransferFunction_ITU_R_709_2, .shouldPropagate)
@@ -258,7 +283,7 @@ private enum TestFrames {
         let yp = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!.assumingMemoryBound(to: UInt8.self)
         let cp = CVPixelBufferGetBaseAddressOfPlane(pb, 1)!.assumingMemoryBound(to: UInt8.self)
         for row in 0..<h {
-            for x in 0..<w { yp[row * ys + x] = fixedY ?? UInt8(40 + (x * 160) / max(w - 1, 1)) }
+            for x in 0..<w { yp[row * ys + x] = fixedY ?? UInt8(40 + ((vertical ? row : x) * 160) / max((vertical ? h : w) - 1, 1)) }
         }
         for row in 0..<(h / 2) {
             for x in 0..<(w / 2) {
@@ -277,19 +302,18 @@ private enum TestFrames {
         for row in rows { memset(p + row * stride, Int32(value), CVPixelBufferGetWidth(pb)) }
     }
 
-    /// Min/max of each plane, skipping `margin` luma pixels at every edge.
-    static func planeRange(_ pb: CVPixelBuffer, margin: Int = 0)
+    /// Min/max and mean of each plane.
+    static func planeRange(_ pb: CVPixelBuffer)
         -> (y: ClosedRange<Int>, c: ClosedRange<Int>, meanY: Double, meanC: Double) {
         CVPixelBufferLockBaseAddress(pb, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(pb, .readOnly) }
         func scan(_ plane: Int, _ bytes: Int) -> (ClosedRange<Int>, Double) {
             let p = CVPixelBufferGetBaseAddressOfPlane(pb, plane)!.assumingMemoryBound(to: UInt8.self)
             let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, plane)
-            let m = plane == 0 ? margin : margin / 2
             let w = CVPixelBufferGetWidthOfPlane(pb, plane), h = CVPixelBufferGetHeightOfPlane(pb, plane)
             var lo = 255, hi = 0, sum = 0, count = 0
-            for row in m..<(h - m) {
-                for x in (m * bytes)..<((w - m) * bytes) {
+            for row in 0..<h {
+                for x in 0..<(w * bytes) {
                     let v = Int(p[row * stride + x])
                     lo = min(lo, v); hi = max(hi, v); sum += v; count += 1
                 }
