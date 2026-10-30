@@ -27,6 +27,10 @@ struct FrameUpscalerTests {
 
     private static let uhd = CGSize(width: 3840, height: 2160)
 
+    init() {
+        if #available(macOS 26, iOS 26, tvOS 26, visionOS 26, *) { FrameUpscaler.resetMetalFXCostMemoryForTesting() }
+    }
+
     private func plan(_ w: Int, _ h: Int, sar: (Int, Int) = (1, 1), display: CGSize = uhd, ml: [Float]) throws -> UpscalePlan {
         try #require(UpscaleRouteDecision.makePlan(
             source: SourceGeometry(width: w, height: h, sarNum: sar.0, sarDen: sar.1),
@@ -268,6 +272,58 @@ struct FrameUpscalerTests {
         if case let .firstFrame(p, degraded) = events.all.last {
             #expect(degraded && p.sourceWidth == 640)
         } else { Issue.record("last event \(String(describing: events.all.last))") }
+    }
+
+    /// A degrade is remembered for the process: a fresh stage with the same plan and interval (a host
+    /// rebuild) starts ML only instead of paying for another overrun window.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func degradeIsRememberedForTheProcess() throws {
+        let p = try plan(720, 480, sar: (8, 9), ml: [2])
+        let input = try TestFrames.nv12(720, 480, par: (8, 9))
+        let first = try upscaler(p, frameInterval: 0.0001)
+        for _ in 0..<FrameUpscaler.budgetWindow { _ = first.upscale(input) }
+        try #require(first.isDegraded && !first.isDisabled)
+
+        let up = try upscaler(p, frameInterval: 0.0001)
+        let events = EventLog()
+        up.onEvent = { events.add($0) }
+        let out = try #require(up.upscale(input))
+        #expect(CVPixelBufferGetWidth(out) == 1440 && CVPixelBufferGetHeight(out) == 960)
+        #expect(up.isDegraded && !up.isDisabled)
+        let all = events.all
+        try #require(all.count == 2)
+        if case let .degraded(dp, reason, _) = all[0] {
+            #expect(dp.targetWidth == 1440 && dp.targetHeight == 960)
+            #expect(reason.contains("MetalFX to 2880x2160 overran on this device earlier"), "\(reason)")
+        } else { Issue.record("first event \(all[0])") }
+        if case let .firstFrame(fp, degraded) = all[1] { #expect(degraded && fp.targetWidth == 1440) } else {
+            Issue.record("second event \(all[1])")
+        }
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func lighterOrSlowerPlansAreNotAffected() throws {
+        MetalFXCostMemory.record(.init(width: 2880, height: 2160, frameInterval: 1.0 / 60, meanMs: 20))
+        let input = try TestFrames.nv12(720, 480, par: (8, 9))
+        let lighter = try upscaler(try plan(720, 480, sar: (8, 9), display: CGSize(width: 1920, height: 1080), ml: []),
+                                   frameInterval: 1.0 / 60)
+        let a = try #require(lighter.upscale(input))
+        #expect(CVPixelBufferGetWidth(a) == 1440 && CVPixelBufferGetHeight(a) == 1080 && !lighter.isDisabled)
+        let slower = try upscaler(try plan(720, 480, sar: (8, 9), ml: []), frameInterval: 1.0 / 24)
+        let b = try #require(slower.upscale(input))
+        #expect(CVPixelBufferGetWidth(b) == 2880 && CVPixelBufferGetHeight(b) == 2160 && !slower.isDisabled)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func metalFXOnlyPlanStartsDisabledWhenRemembered() throws {
+        MetalFXCostMemory.record(.init(width: 2880, height: 2160, frameInterval: 1.0 / 24, meanMs: 40))
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: []), frameInterval: 1.0 / 24)
+        #expect(up.upscale(try TestFrames.nv12(720, 480, par: (8, 9))) == nil)
+        #expect(up.isDisabled && !up.isDegraded)
+        #expect(up.disabledReason == "MetalFX too slow on this device at 2880x2160", "\(String(describing: up.disabledReason))")
     }
 
     @Test

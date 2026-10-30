@@ -11,7 +11,9 @@ import VideoToolbox
 /// The per-frame upscale stage (#846): optional VT low-latency super resolution, then MetalFX Spatial to
 /// the plan's target size. Synchronous; `upscale` returns nil whenever the caller should deliver the
 /// original frame. A sustained overrun of an ML + MetalFX stage first drops MetalFX (ML output at its own
-/// size); failures and any further overrun disable it for good, each logged once.
+/// size); failures and any further overrun disable it for good, each logged once. A MetalFX overrun is
+/// remembered for the process (`MetalFXCostMemory`), so a later stage at least as heavy and as fast starts
+/// without MetalFX.
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 final class FrameUpscaler: @unchecked Sendable {
 
@@ -132,6 +134,7 @@ final class FrameUpscaler: @unchecked Sendable {
     private var consecutiveFailures = 0
     private var firstFrameSent = false
     private var backgroundRefusalNoted = false
+    private var rememberedOverrunNoted = false
     private var frameIndex: Int64 = 0
     private let processLock = NSLock()
 
@@ -188,6 +191,8 @@ final class FrameUpscaler: @unchecked Sendable {
         if picture.width != stage.plan.sourceWidth || picture.height != stage.plan.sourceHeight {
             guard rebuild(for: input, width: picture.width, height: picture.height) else { return nil }
         }
+        applyRememberedOverrun()
+        guard !isDisabled else { return nil }
         lastPassThroughNote = nil
 
         let start = DispatchTime.now().uptimeNanoseconds
@@ -338,24 +343,50 @@ final class FrameUpscaler: @unchecked Sendable {
 
     /// The first rung of the overrun ladder: keep ML, drop MetalFX, start a fresh budget window.
     private func degrade(over: String, window: StageTimes) {
+        let full = stage.plan
         guard let plan = stage.dropMetalFX() else {
             disable(reason: "over budget, " + over)
             return
         }
+        MetalFXCostMemory.record(MetalFXCostMemory.Overrun(
+            width: full.targetWidth, height: full.targetHeight, frameInterval: frameInterval, meanMs: window.total))
+        EngineLog.emit("[Upscale] degraded: over budget (\(over)), dropping MetalFX, ML only to "
+                       + "\(plan.targetWidth)x\(plan.targetHeight) (\(window.breakdown))", category: .swPlayback)
+        enterDegraded(plan, reason: "over budget, " + over)
+    }
+
+    private func enterDegraded(_ plan: UpscalePlan, reason: String) {
         degraded = true
         recentTimes.removeAll()
         stageFrames = 0
         timingLines = 0
-        let reason = "over budget, " + over
         stateLock.lock()
         _isDegraded = true
         _deliveredPlan = plan
         let stats = _stats
         let handler = _onEvent
         stateLock.unlock()
-        EngineLog.emit("[Upscale] degraded: over budget (\(over)), dropping MetalFX, ML only to "
-                       + "\(plan.targetWidth)x\(plan.targetHeight) (\(window.breakdown))", category: .swPlayback)
         handler?(.degraded(plan, reason: reason, stats: stats))
+    }
+
+    /// A MetalFX stage that an earlier overrun in this process covers drops MetalFX before running, or
+    /// switches off when it has no ML pass to keep.
+    private func applyRememberedOverrun() {
+        guard !degraded, stage.plan.needsMetalFX,
+              let overrun = MetalFXCostMemory.overrun(covering: stage.plan, frameInterval: frameInterval) else { return }
+        let full = stage.plan
+        let size = "\(full.targetWidth)x\(full.targetHeight)"
+        guard full.mlScale != nil, let plan = stage.dropMetalFX() else {
+            disable(reason: "MetalFX too slow on this device at \(size)")
+            return
+        }
+        let reason = String(format: "MetalFX to %@ overran on this device earlier (%.1f ms at %.1f ms)",
+                            size, overrun.meanMs, overrun.frameInterval * 1000)
+        if !rememberedOverrunNoted {
+            rememberedOverrunNoted = true
+            EngineLog.emit("[Upscale] starting ML only: " + reason, category: .swPlayback)
+        }
+        enterDegraded(plan, reason: reason)
     }
 
     private func recordFailure(_ error: Error) {
@@ -395,6 +426,49 @@ final class FrameUpscaler: @unchecked Sendable {
         handler?(.disabled(reason: reason, stats: stats))
         stage.release()
     }
+}
+
+// MARK: - Process-wide MetalFX cost
+
+/// MetalFX overruns seen in this process: a stage whose MetalFX output is at least as large as a recorded
+/// one, at a frame interval no longer, would overrun again, so it starts without MetalFX.
+enum MetalFXCostMemory {
+    struct Overrun: Equatable, Sendable {
+        var width: Int, height: Int
+        var frameInterval: Double
+        var meanMs: Double
+        var pixels: Int { width * height }
+
+        /// 1% slack, so 24 fps counts as at least as fast as 23.976.
+        func covers(pixels other: Int, frameInterval interval: Double) -> Bool {
+            other >= pixels && interval <= frameInterval * 1.01
+        }
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var overruns: [Overrun] = []
+
+    static func record(_ overrun: Overrun) {
+        lock.lock(); defer { lock.unlock() }
+        guard !overruns.contains(where: { $0.pixels <= overrun.pixels && $0.frameInterval >= overrun.frameInterval })
+        else { return }
+        overruns.removeAll { $0.pixels >= overrun.pixels && $0.frameInterval <= overrun.frameInterval }
+        overruns.append(overrun)
+    }
+
+    static func overrun(covering plan: UpscalePlan, frameInterval: Double) -> Overrun? {
+        lock.lock(); defer { lock.unlock() }
+        return overruns.first { $0.covers(pixels: plan.targetWidth * plan.targetHeight, frameInterval: frameInterval) }
+    }
+
+    static func reset() {
+        lock.lock(); overruns.removeAll(); lock.unlock()
+    }
+}
+
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+extension FrameUpscaler {
+    static func resetMetalFXCostMemoryForTesting() { MetalFXCostMemory.reset() }
 }
 
 // MARK: - GPU state shared across rebuilds
