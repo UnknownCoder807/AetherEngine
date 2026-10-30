@@ -12,6 +12,12 @@ the public-API contract.
 
 ### Fixed
 
+- **A backward seek no longer doubles the retained bitmap subtitle images (#929).** The AE#879 byte budget only
+  evicted history behind the playhead, so after a seek back the old position's floor and lead counted as cues ahead
+  and stayed until playback reached them again: on a dense PGS track (4 MB images every 3 s, seek from 144 s back to
+  20 s) the retained images grew from 165 MB to 246 MB and held there. Cues starting beyond the decode lead that the
+  drain has not reached yet are now evicted first, furthest first, since the drain decodes them again from the packet
+  store on its way there; history behind is evicted only after them.
 - **A controlled HTTP probe no longer pays one round trip per 64 KiB (#927).** `probe(url:limits:)` read a known-size
   source in fixed 64 KiB ranges, one at a time, so the playback analysis depth it keeps (up to 50 MiB) cost ~800
   serial requests: 0.48 s against a local origin, and a 30 s `timedOut` once each response took 100 ms. A range that
