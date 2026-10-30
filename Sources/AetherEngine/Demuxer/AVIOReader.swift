@@ -1156,6 +1156,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#860: the `Content-Type` of the first 2xx answer this open got (or the warm's), the one
     /// statement about the source an extensionless URL makes. winCond-guarded, write-once.
     private var openContentType: String?
+    /// AE#860: the open's response declared a disc image, or served `application/octet-stream` over
+    /// a body with a volume signature at sector 16. winCond-guarded, set once by `open()`.
+    private var openSuggestsDisc = false
     private var headSpanServeLogged = false
     private var headSpanPlaybackServeLogged = false
     private var tailSpanServeLogged = false
@@ -1514,9 +1517,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 close()
                 throw AVIOReaderError.dashManifest
             }
-            if !isLive, routesDiscMediaType, gotData,
-               DiscImageMediaType.isDiscImage(contentType: openResponseContentType) {
-                EngineLog.emit("[AVIOReader] \(label) the source declares a disc image type (AE#860); handing it to the disc adapter.", category: .demux)
+            if !isLive, routesDiscMediaType, gotData {
+                let contentType = openResponseContentType
+                var discPrefix: [UInt8] = []
+                if DiscImageMediaType.isGeneric(contentType: contentType) {
+                    discPrefix = warm.map { Array($0.head.data.prefix(DiscImageMediaType.volumeSignatureEnd)) }
+                        ?? awaitWindowPrefix(count: DiscImageMediaType.volumeSignatureEnd)
+                    try probeControl?.check()
+                    guard !isClosed else { throw CancellationError() }
+                }
+                noteOpenSuggestsDisc(DiscImageMediaType.suggestsDiscImage(contentType: contentType, prefix: discPrefix))
+            }
+            if !isLive, routesDiscMediaType, gotData, openSuggestsDiscImage {
+                EngineLog.emit("[AVIOReader] \(label) the source declares a disc image type or carries a volume signature (AE#860); handing it to the disc adapter.", category: .demux)
                 markClosed()
                 close()
                 if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
@@ -1657,8 +1670,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         close()
                         throw AVIOReaderError.dashManifest
                     }
-                    if routesDiscMediaType, DiscImageMediaType.isDiscImage(contentType: openResponseContentType) {
-                        EngineLog.emit("[AVIOReader] \(label) the source declares a disc image type (AE#860); handing it to the disc adapter.", category: .demux)
+                    // The probe reader's first chunk already covers sector 16, so this costs no request.
+                    noteOpenSuggestsDisc(DiscImageMediaType.suggestsDiscImage(
+                        contentType: openResponseContentType,
+                        prefix: [UInt8](data.prefix(DiscImageMediaType.volumeSignatureEnd))))
+                    if routesDiscMediaType, openSuggestsDiscImage {
+                        EngineLog.emit("[AVIOReader] \(label) the source declares a disc image type or carries a volume signature (AE#860); handing it to the disc adapter.", category: .demux)
                         markClosed()
                         close()
                         throw AVIOReaderError.discImageMediaType
@@ -1852,6 +1869,37 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.lock()
         defer { winCond.unlock() }
         return openContentType
+    }
+
+    /// AE#860: what the open learned about a disc behind this source. `ProbeHTTPReader` turns its
+    /// disc probe on from it; the demuxer's URL open reroutes on it before this reader is used.
+    var openSuggestsDiscImage: Bool {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return openSuggestsDisc
+    }
+
+    private func noteOpenSuggestsDisc(_ suggests: Bool) {
+        winCond.lock()
+        openSuggestsDisc = suggests
+        winCond.unlock()
+    }
+
+    /// How long the open waits for sector 16 of an `application/octet-stream` body (AE#860). The
+    /// bytes are already on their way on the opening connection, so this is normally one window
+    /// fill; a slower origin just goes unsniffed.
+    static let discSignatureWait: TimeInterval = 2
+
+    /// The first `count` bytes of the opening window, waiting on the same connection until they are
+    /// there, it ended, or `discSignatureWait` passed. Shorter when the body is.
+    private func awaitWindowPrefix(count: Int) -> [UInt8] {
+        winCond.lock()
+        defer { winCond.unlock() }
+        let deadline = Date(timeIntervalSinceNow: Self.discSignatureWait)
+        while window.count < count && !connEnded && !isClosed {
+            if !winCond.wait(until: deadline) { break }
+        }
+        return window.prefix(Swift.min(count, window.count))
     }
 
     private func firstWindowPrefix(max: Int = 16) -> [UInt8] {
