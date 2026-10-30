@@ -531,10 +531,12 @@ private final class MLScaler {
 
     deinit { end() }
 
+    /// Off the decode thread: after timed-out passes VT may be wedged, and nothing waits for the session to end.
     func end() {
         guard !ended else { return }
         ended = true
-        processor.endSession()
+        let processor = UncheckedSendable(processor)
+        DispatchQueue.global(qos: .utility).async { processor.value.endSession() }
     }
 
     func process(_ input: CVPixelBuffer, frameIndex: Int64, timeout: Double,
@@ -613,6 +615,11 @@ private func clampBorder(_ buffer: CVPixelBuffer, luma k: Int) throws {
             }
         }
     }
+}
+
+private struct UncheckedSendable<Value>: @unchecked Sendable {
+    let value: Value
+    init(_ value: Value) { self.value = value }
 }
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
