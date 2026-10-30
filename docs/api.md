@@ -63,7 +63,8 @@ the original cause remains available as described under [Diagnostics](#diagnosti
 `HLSIngestDiagnosticReason` from an underlying `HLSIngestError`, including through
 Foundation error wrappers. `HLSIngestError.diagnosticReason` exposes the same value
 directly. Missing EXTM3U, missing TARGETDURATION, an empty segment list, invalid
-response/encoding, unsupported encryption and key/decryption failures have
+response/encoding, an `EXT-X-BYTERANGE` the playlist or the origin's answer cannot
+satisfy (`invalidByteRange`), unsupported encryption and key/decryption failures have
 distinct stable raw values; an unknown playlist or decryption message becomes a
 finite fallback, never a new token containing that message. This adds diagnostic
 detail without changing the failure's classification or recovery policy. Explicit

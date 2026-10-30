@@ -44,6 +44,17 @@ the public-API contract.
   manifest or TS bytes carry on as before, so a playlist served as text still reaches the AE#140 reroute. A text type
   without a length stays a stream, since a mislabelled TS feed never ends. Reported with a measured fork fix by
   TheMothX (Crivid IPTV Player).
+- **HLS ingest reads `EXT-X-BYTERANGE` segments as their sub-range.**
+  A packager that writes one file per stream lists every segment as a byte range of that file. The live and VOD
+  ingest ignored the tag and fetched the URI whole, so each 2 s segment delivered the entire file: a live channel
+  replayed its first seconds and never reached the playlist's edge. The parser now reads
+  `#EXT-X-BYTERANGE:<length>[@<offset>]` (an omitted offset continues the previous sub-range of the same URI,
+  and a playlist where that is undefined is refused, as RFC 8216 requires), and the segment is fetched with a
+  `Range` request, on the persistent HTTP/1.1 path as well. An origin that ignores `Range` and answers 200 with
+  the whole resource has the sub-range cut from it; one whose 206 starts elsewhere or ends short, or whose resource
+  is too short for the range, fails the segment rather than playing the wrong bytes. The VOD carriage probe reads
+  the first segment's own range too, so a single-file VOD is not refused for the size of its whole file. Those
+  failures and a malformed tag report the new `HLSIngestDiagnosticReason.invalidByteRange` (`invalid_byte_range`).
 
 ## [7.52.0] - 2026-10-29
 
