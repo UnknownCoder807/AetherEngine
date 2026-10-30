@@ -210,6 +210,13 @@ final class SoftwarePlaybackHost {
     /// Opt-in to full dual-layer Dolby Vision (Profile 7 FEL) decoding and Metal GPU composition over single-layer fallback.
     var preferDualLayerDolbyVision: Bool = false
 
+    /// #846: set by the load before `load(demuxer:...)`; non-nil wraps the chosen decoder in the upscale stage.
+    var upscalePlan: UpscalePlan?
+
+    /// The stage `selectVideoDecoder` built for the current plan (a `FrameUpscaler`), nil when none was.
+    /// Typed loosely because the class does not exist in simulator builds or before OS 26.
+    private(set) var frameUpscaler: AnyObject?
+
     /// Forwarded Dolby Vision profile number (e.g. 7, 8) if detected from bitstream or container
     var configuredDVProfile: Int?
 
@@ -1139,6 +1146,31 @@ final class SoftwarePlaybackHost {
     func selectVideoDecoder(
         codecID: AVCodecID,
         canHardwareDecode: Bool,
+        dvProfile: Int?,
+        frameRate: Double? = nil
+    ) -> any VideoDecodingPipeline {
+        let decoder = baseVideoDecoder(codecID: codecID, canHardwareDecode: canHardwareDecode, dvProfile: dvProfile)
+        return wrappedForUpscale(decoder, frameRate: frameRate)
+    }
+
+    /// #846: never wraps the dual-layer decoder (FEL sources are HDR and refused upstream).
+    private func wrappedForUpscale(_ decoder: any VideoDecodingPipeline, frameRate: Double?) -> any VideoDecodingPipeline {
+        frameUpscaler = nil
+        guard let plan = upscalePlan, !Self.isDualLayer(decoder) else { return decoder }
+        #if !targetEnvironment(simulator)
+        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
+            let interval = frameRate.flatMap { $0.isFinite && $0 > 0 ? 1 / $0 : nil } ?? 1.0 / 25
+            guard let stage = FrameUpscaler(plan: plan, frameInterval: interval) else { return decoder }
+            frameUpscaler = stage
+            return UpscalingVideoDecoder(inner: decoder) { stage.upscale($0) }
+        }
+        #endif
+        return decoder
+    }
+
+    private func baseVideoDecoder(
+        codecID: AVCodecID,
+        canHardwareDecode: Bool,
         dvProfile: Int?
     ) -> any VideoDecodingPipeline {
         if codecID == AV_CODEC_ID_VP9 && canHardwareDecode {
@@ -1275,7 +1307,8 @@ final class SoftwarePlaybackHost {
             let chosen = selectVideoDecoder(
                 codecID: codecpar.pointee.codec_id,
                 canHardwareDecode: true,
-                dvProfile: dvProfile
+                dvProfile: dvProfile,
+                frameRate: AetherEngine.detectFrameRate(stream: vStream)
             )
             videoDecoder = chosen
             #if DualLayerDolbyVision
