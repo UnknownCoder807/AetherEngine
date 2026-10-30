@@ -51,6 +51,75 @@ struct UpscaleColorKernelTests {
         #expect(white.allSatisfy { $0 >= 254 })
     }
 
+    @Test func matrixFollowsTheBufferTag() throws {
+        let h = try KernelHarness()
+        let pb = try h.makePixelBuffer(width: 16, height: 16, videoRange: true)
+        #expect(UpscaleMatrix.of(pb) == .bt709, "untagged")
+        let cases: [(CFString, UpscaleMatrix)] = [
+            (kCVImageBufferYCbCrMatrix_ITU_R_601_4, .bt601), (kCVImageBufferYCbCrMatrix_ITU_R_709_2, .bt709),
+            (kCVImageBufferYCbCrMatrix_ITU_R_2020, .bt2020), (kCVImageBufferYCbCrMatrix_SMPTE_240M_1995, .bt709),
+        ]
+        for (tag, matrix) in cases {
+            CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tag, .shouldPropagate)
+            #expect(UpscaleMatrix.of(pb) == matrix, "\(tag)")
+        }
+    }
+
+    /// Saturated red and blue, encoded with each matrix: decoded within 2, round-tripped within 1.
+    @Test(arguments: [UpscaleMatrix.bt601, .bt709])
+    func saturatedColoursDecodeWithTheirMatrix(_ matrix: UpscaleMatrix) throws {
+        let h = try KernelHarness()
+        for rgb in [(255, 0, 0), (0, 0, 255)] {
+            let ycc = Self.encode(rgb, matrix)
+            let src = try h.makePixelBuffer(width: 16, height: 16, videoRange: true)
+            h.fill(src) { _, _ in ycc }
+            let rgba = try h.makeRGBA(width: 16, height: 16)
+            try h.nv12ToRGBA(src, rgba: rgba, videoRange: true, matrix: matrix)
+            let got = h.rgb(rgba, 8, 8).map(Int.init)
+            let want = [rgb.0, rgb.1, rgb.2]
+            #expect(zip(got, want).allSatisfy { abs($0 - $1) <= 2 }, "\(matrix) \(want): decoded \(got) from \(ycc)")
+
+            let dst = try h.makePixelBuffer(width: 16, height: 16, videoRange: true)
+            try h.rgbaToNV12(rgba, dst: dst, videoRange: true, matrix: matrix)
+            let y = Int(h.luma(dst, 8, 8)), c = h.chroma(dst, 4, 4)
+            #expect(abs(y - Int(ycc.0)) <= 1 && abs(Int(c.0) - Int(ycc.1)) <= 1 && abs(Int(c.1) - Int(ycc.2)) <= 1,
+                    "\(matrix) \(want): \(ycc) came back as \((y, c.0, c.1))")
+        }
+    }
+
+    @Test func fullRangeRoundTripIsWithinOneCodeValue() throws {
+        let h = try KernelHarness()
+        let (w, ht) = (64, 64)
+        let src = try h.makePixelBuffer(width: w, height: ht, videoRange: false)
+        h.fill(src) { x, y in
+            (UInt8(40 + (x * 170) / (w - 1)), UInt8(108 + (y * 40) / (ht - 1)), UInt8(148 - (x * 40) / (w - 1)))
+        }
+        let rgba = try h.makeRGBA(width: w, height: ht)
+        let dst = try h.makePixelBuffer(width: w, height: ht, videoRange: false)
+        try h.nv12ToRGBA(src, rgba: rgba, videoRange: false)
+        try h.rgbaToNV12(rgba, dst: dst, videoRange: false)
+        var maxY = 0, maxC = 0
+        for y in 0..<ht { for x in 0..<w { maxY = max(maxY, abs(Int(h.luma(src, x, y)) - Int(h.luma(dst, x, y)))) } }
+        for y in 0..<(ht / 2) {
+            for x in 0..<(w / 2) {
+                let a = h.chroma(src, x, y), b = h.chroma(dst, x, y)
+                maxC = max(maxC, abs(Int(a.0) - Int(b.0)), abs(Int(a.1) - Int(b.1)))
+            }
+        }
+        #expect(maxY <= 1, "Y \(maxY)")
+        #expect(maxC <= 1, "C \(maxC)")
+    }
+
+    /// Video-range Y'CbCr of an 8-bit RGB triple under `matrix`, rounded.
+    private static func encode(_ rgb: (Int, Int, Int), _ matrix: UpscaleMatrix) -> (UInt8, UInt8, UInt8) {
+        let r = Double(rgb.0) / 255, g = Double(rgb.1) / 255, b = Double(rgb.2) / 255
+        let kr = Double(matrix.kr), kb = Double(matrix.kb)
+        let y = kr * r + (1 - kr - kb) * g + kb * b
+        let cb = (b - y) / (2 * (1 - kb)), cr = (r - y) / (2 * (1 - kr))
+        func q(_ v: Double) -> UInt8 { UInt8(max(0, min(255, v.rounded()))) }
+        return (q(16 + 219 * y), q(128 + 224 * cb), q(128 + 224 * cr))
+    }
+
     @Test func fullRangeIsHonoured() throws {
         let h = try KernelHarness()
         let src = try h.makePixelBuffer(width: 16, height: 16, videoRange: false)
@@ -149,12 +218,13 @@ private struct KernelHarness {
         return (mt, tex)
     }
 
-    private func run(_ pipeline: MTLComputePipelineState, grid: (Int, Int), videoRange: Bool, textures: [MTLTexture]) throws {
+    private func run(_ pipeline: MTLComputePipelineState, grid: (Int, Int), videoRange: Bool, matrix: UpscaleMatrix,
+                     textures: [MTLTexture]) throws {
         guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { throw Failure() }
         enc.setComputePipelineState(pipeline)
         for (i, t) in textures.enumerated() { enc.setTexture(t, index: i) }
-        var range: UInt32 = videoRange ? 1 : 0
-        enc.setBytes(&range, length: 4, index: 0)
+        var params = UpscaleColorParams(videoRange: videoRange, matrix: matrix)
+        enc.setBytes(&params, length: MemoryLayout<UpscaleColorParams>.size, index: 0)
         let tg = MTLSize(width: 8, height: 8, depth: 1)
         enc.dispatchThreads(MTLSize(width: grid.0, height: grid.1, depth: 1), threadsPerThreadgroup: tg)
         enc.endEncoding()
@@ -163,17 +233,17 @@ private struct KernelHarness {
         if cb.status != .completed { throw Failure() }
     }
 
-    func nv12ToRGBA(_ pb: CVPixelBuffer, rgba: MTLTexture, videoRange: Bool) throws {
+    func nv12ToRGBA(_ pb: CVPixelBuffer, rgba: MTLTexture, videoRange: Bool, matrix: UpscaleMatrix = .bt709) throws {
         let y = try planeTexture(pb, plane: 0, format: .r8Unorm)
         let c = try planeTexture(pb, plane: 1, format: .rg8Unorm)
-        try run(toRGBA, grid: (rgba.width, rgba.height), videoRange: videoRange, textures: [y.0, c.0, rgba])
+        try run(toRGBA, grid: (rgba.width, rgba.height), videoRange: videoRange, matrix: matrix, textures: [y.0, c.0, rgba])
         withExtendedLifetime((y.1, c.1)) {}
     }
 
-    func rgbaToNV12(_ rgba: MTLTexture, dst: CVPixelBuffer, videoRange: Bool) throws {
+    func rgbaToNV12(_ rgba: MTLTexture, dst: CVPixelBuffer, videoRange: Bool, matrix: UpscaleMatrix = .bt709) throws {
         let y = try planeTexture(dst, plane: 0, format: .r8Unorm)
         let c = try planeTexture(dst, plane: 1, format: .rg8Unorm)
-        try run(toNV12, grid: (rgba.width / 2, rgba.height / 2), videoRange: videoRange, textures: [rgba, y.0, c.0])
+        try run(toNV12, grid: (rgba.width / 2, rgba.height / 2), videoRange: videoRange, matrix: matrix, textures: [rgba, y.0, c.0])
         withExtendedLifetime((y.1, c.1)) {}
     }
 }

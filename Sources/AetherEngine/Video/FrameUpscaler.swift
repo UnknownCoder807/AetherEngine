@@ -324,11 +324,11 @@ private final class GPU {
     }
 
     func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
-                  textures: [MTLTexture], videoRange: Bool, grid: (Int, Int)) {
+                  textures: [MTLTexture], color: UpscaleColorParams, grid: (Int, Int)) {
         encoder.setComputePipelineState(pipeline)
         for (i, t) in textures.enumerated() { encoder.setTexture(t, index: i) }
-        var range: UInt32 = videoRange ? 1 : 0
-        encoder.setBytes(&range, length: MemoryLayout<UInt32>.size, index: 0)
+        var params = color
+        encoder.setBytes(&params, length: MemoryLayout<UpscaleColorParams>.size, index: 0)
         let w = pipeline.threadExecutionWidth
         let h = max(1, pipeline.maxTotalThreadsPerThreadgroup / w)
         encoder.dispatchThreads(MTLSize(width: grid.0, height: grid.1, depth: 1),
@@ -407,7 +407,8 @@ private final class Stage {
     func process(_ original: CVPixelBuffer, picture: FrameUpscaler.PictureRegion, frameIndex: Int64,
                  mlTimeout: Double, submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
         let format = CVPixelBufferGetPixelFormatType(original)
-        let videoRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        let color = UpscaleColorParams(videoRange: format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                                       matrix: UpscaleMatrix.of(original))
         let input: CVPixelBuffer
         if picture.width == CVPixelBufferGetWidth(original) && picture.height == CVPixelBufferGetHeight(original) {
             input = original
@@ -431,12 +432,12 @@ private final class Stage {
             let oc = try gpu.planeTexture(output, plane: 1, format: .rg8Unorm)
             guard let cb = gpu.queue.makeCommandBuffer() else { throw UpscaleError("no command buffer") }
             guard let enc = cb.makeComputeCommandEncoder() else { throw UpscaleError("no encoder") }
-            gpu.dispatch(enc, gpu.toRGBA, textures: [sy.0, sc.0, rgba], videoRange: videoRange,
+            gpu.dispatch(enc, gpu.toRGBA, textures: [sy.0, sc.0, rgba], color: color,
                          grid: (rgba.width, rgba.height))
             enc.endEncoding()
             scaler.encode(commandBuffer: cb)
             guard let enc2 = cb.makeComputeCommandEncoder() else { throw UpscaleError("no encoder") }
-            gpu.dispatch(enc2, gpu.toNV12, textures: [scaled, oy.0, oc.0], videoRange: videoRange,
+            gpu.dispatch(enc2, gpu.toNV12, textures: [scaled, oy.0, oc.0], color: color,
                          grid: (scaled.width / 2, scaled.height / 2))
             enc2.endEncoding()
             cb.commit()
