@@ -327,6 +327,33 @@ struct FrameUpscalerTests {
         }
         #expect(up.disabledReason?.contains("too many ML timeouts") == true, "\(String(describing: up.disabledReason))")
     }
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func kernelsCompileOncePerDevice() throws {
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let a = try #require(UpscaleKernels.shared(for: device))
+        let b = try #require(UpscaleKernels.shared(for: device))
+        #expect(a === b)
+        _ = try upscaler(try plan(720, 480, ml: []))
+        #expect(UpscaleKernels.shared(for: device) === a)
+    }
+
+    /// Another size mid-stream republishes: the engine replaces `activeUpscale` with the new plan.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func firstFrameIsSentAgainAfterARebuild() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: []))
+        let events = EventLog()
+        up.onEvent = { events.add($0) }
+        for _ in 0..<3 { _ = try #require(up.upscale(try TestFrames.nv12(720, 480, par: (8, 9)))) }
+        for _ in 0..<3 { _ = try #require(up.upscale(try TestFrames.nv12(704, 576))) }
+        let plans = events.all.compactMap { e -> UpscalePlan? in if case let .firstFrame(p) = e { return p }; return nil }
+        try #require(plans.count == 2)
+        #expect(plans.map(\.sourceWidth) == [720, 704] && plans.map(\.sourceHeight) == [480, 576])
+        let status = UpscaleStatus.afterFirstFrame(plans[1], current: UpscaleStatus.afterFirstFrame(plans[0], current: nil))
+        #expect(status.sourceSize == CGSize(width: 704, height: 576))
+        #expect(status.targetSize == CGSize(width: plans[1].targetWidth, height: plans[1].targetHeight))
+    }
 }
 
 private final class CompletionLog: @unchecked Sendable {

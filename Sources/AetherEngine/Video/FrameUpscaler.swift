@@ -189,6 +189,8 @@ final class FrameUpscaler: @unchecked Sendable {
             disable(reason: "rebuild for \(width)x\(height) failed: \(error)")
             return false
         }
+        // The next upscaled frame republishes the plan.
+        firstFrameSent = false
         EngineLog.emit("[Upscale] input size changed: \(width)x\(height) -> \(plan.targetWidth)x\(plan.targetHeight)"
                        + (plan.mlScale.map { " (ML \(String(format: "%g", $0))x)" } ?? ""), category: .swPlayback)
         return true
@@ -318,6 +320,34 @@ private struct UpscaleError: Error, CustomStringConvertible {
     }
 }
 
+/// The colour kernels, compiled once per process and device rather than per stage.
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+final class UpscaleKernels: @unchecked Sendable {
+    let toRGBA: MTLComputePipelineState
+    let toNV12: MTLComputePipelineState
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var byDevice: [UInt64: UpscaleKernels] = [:]
+
+    private init(toRGBA: MTLComputePipelineState, toNV12: MTLComputePipelineState) {
+        self.toRGBA = toRGBA
+        self.toNV12 = toNV12
+    }
+
+    static func shared(for device: MTLDevice) -> UpscaleKernels? {
+        lock.lock(); defer { lock.unlock() }
+        if let kernels = byDevice[device.registryID] { return kernels }
+        guard let library = try? device.makeLibrary(source: UpscaleShaderSource.source, options: nil),
+              let f1 = library.makeFunction(name: "nv12ToRGBA"), let f2 = library.makeFunction(name: "rgbaToNV12"),
+              let toRGBA = try? device.makeComputePipelineState(function: f1),
+              let toNV12 = try? device.makeComputePipelineState(function: f2)
+        else { return nil }
+        let kernels = UpscaleKernels(toRGBA: toRGBA, toNV12: toNV12)
+        byDevice[device.registryID] = kernels
+        return kernels
+    }
+}
+
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 private final class GPU {
     let device: MTLDevice
@@ -328,18 +358,15 @@ private final class GPU {
 
     init?() {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
-              let library = try? device.makeLibrary(source: UpscaleShaderSource.source, options: nil),
-              let f1 = library.makeFunction(name: "nv12ToRGBA"), let f2 = library.makeFunction(name: "rgbaToNV12"),
-              let toRGBA = try? device.makeComputePipelineState(function: f1),
-              let toNV12 = try? device.makeComputePipelineState(function: f2)
+              let kernels = UpscaleKernels.shared(for: device)
         else { return nil }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess,
               let cache else { return nil }
         self.device = device
         self.queue = queue
-        self.toRGBA = toRGBA
-        self.toNV12 = toNV12
+        self.toRGBA = kernels.toRGBA
+        self.toNV12 = kernels.toNV12
         self.textureCache = cache
     }
 
