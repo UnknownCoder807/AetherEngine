@@ -12,6 +12,13 @@ the public-API contract.
 
 ### Fixed
 
+- **An extensionless remote disc image served as `application/octet-stream` is recognized (AE#860, thanks @qoli).**
+  The AE#860 fix only routed a declared disc type, so an origin that labels everything `application/octet-stream`
+  still handed the ISO 9660 / UDF filesystem to libavformat raw. Under that generic type the open now reads the
+  volume descriptor identifier at sector 16 from the bytes it already has (`CD001`, `BEA01`, `NSR02`, `NSR03`), with
+  no extra request, and sends a match to the disc adapter. The signature is a hint like the type: `DiscReader` still
+  decides, and a body whose structure is missing or does not parse plays as ordinary media. The controlled probe
+  turns its disc probe on the same way.
 - **A backward seek no longer doubles the retained bitmap subtitle images (#929).** The AE#879 byte budget only
   evicted history behind the playhead, so after a seek back the old position's floor and lead counted as cues ahead
   and stayed until playback reached them again: on a dense PGS track (4 MB images every 3 s, seek from 144 s back to

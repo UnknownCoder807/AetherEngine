@@ -44,10 +44,11 @@ final class ProbeHTTPReader: IOReader, @unchecked Sendable {
     static let rangeCeiling = 4 * 1024 * 1024
     private let reader: AVIOReader
     private let isDiscImageURL: Bool
-    /// AE#860: an extensionless URL counts once its response declared a disc image type; the
-    /// disc readers still decide whether one is there.
+    /// AE#860: an extensionless URL counts once its response declared a disc image type, or served
+    /// `application/octet-stream` over a volume signature; the disc readers still decide.
     var discImageProbeEnabled: Bool {
-        isDiscImageURL || DiscImageMediaType.isDiscImage(contentType: reader.openResponseContentType)
+        isDiscImageURL || reader.openSuggestsDiscImage
+            || DiscImageMediaType.isDiscImage(contentType: reader.openResponseContentType)
     }
 
     init(url: URL, headers: [String: String], control: ProbeControl,

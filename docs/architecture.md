@@ -540,7 +540,7 @@ Sources/AetherEngine/
 │   └── SubtitleDeliveryStatement.swift      Value + formatter for the #357 line stating what a drain tick did with the packets it found, so "nothing appeared on screen" is attributable from outside instead of inferred from an absent log line; `harvestHole` names the tick that decoded nothing on purpose, which would otherwise read as `empty` (#362); `landingWithheld=` counts the sets refused the landing because the ground between them and the playhead was never read (#416)
 ├── Disc/
 │   ├── DiscReader.swift                     Disc detection + routing: local `.iso` URLs and custom ISO readers into the demux path; enumerates titles and threads the selected one (DVD vs Blu-ray)
-│   ├── DiscImageMediaType.swift             The `Content-Type` values that send an extensionless HTTP URL to the disc adapter, and the process memo of URLs found to be discs (AE#860)
+│   ├── DiscImageMediaType.swift             The `Content-Type` values (and, under `application/octet-stream`, the sector-16 volume signatures) that send an extensionless HTTP URL to the disc adapter, and the process memo of URLs found to be discs (AE#860)
 │   ├── DiscMetadata.swift                   Public `TitleInfo` / `ChapterInfo` plus the internal disc title + chapter model (45 kHz ticks, extent keys)
 │   ├── ISO9660Reader.swift                  Read-only ISO9660 bridge-filesystem reader (DVD-Video images)
 │   ├── DVDIFOParser.swift                   DVD VMGI TT_SRPT title list + each VTS IFO program chain (per-title duration + chapters) and stream attribute tables (track languages, declared subpicture streams)
