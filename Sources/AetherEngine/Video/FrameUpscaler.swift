@@ -31,6 +31,8 @@ final class FrameUpscaler: @unchecked Sendable {
     static let maxConsecutiveFailures = 3
     /// PTS deltas the live frame interval is the median of.
     static let intervalWindow = 8
+    /// A gap longer than this is a seek or a stall, not a frame period.
+    static let maxFrameDelta = 0.5
 
     /// Median of the last `intervalWindow` deltas, `configured` until that many exist. The deinterlacer
     /// doubles a field-rate source's frame rate, so the stream's declared rate is only a seed.
@@ -59,6 +61,10 @@ final class FrameUpscaler: @unchecked Sendable {
     var disabledReason: String? { stateLock.lock(); defer { stateLock.unlock() }; return _disabledReason }
 
     var stats: Stats { stateLock.lock(); defer { stateLock.unlock() }; return _stats }
+
+    /// The plan of the last `.firstFrame` event, nil before the first upscaled frame.
+    var deliveredPlan: UpscalePlan? { stateLock.lock(); defer { stateLock.unlock() }; return _deliveredPlan }
+    private var _deliveredPlan: UpscalePlan?
 
     var plan: UpscalePlan { processLock.lock(); defer { processLock.unlock() }; return stage.plan }
 
@@ -161,7 +167,7 @@ final class FrameUpscaler: @unchecked Sendable {
         guard pts.isNumeric else { return }
         let seconds = pts.seconds
         defer { lastPTS = seconds }
-        guard let last = lastPTS, seconds > last else { return }
+        guard let last = lastPTS, seconds > last, seconds - last <= Self.maxFrameDelta else { return }
         ptsDeltas.append(seconds - last)
         if ptsDeltas.count > Self.intervalWindow { ptsDeltas.removeFirst() }
         frameInterval = Self.liveInterval(deltas: ptsDeltas, configured: configuredInterval)
@@ -258,6 +264,9 @@ final class FrameUpscaler: @unchecked Sendable {
 
         if !firstFrameSent {
             firstFrameSent = true
+            stateLock.lock()
+            _deliveredPlan = stage.plan
+            stateLock.unlock()
             handler?(.firstFrame(stage.plan))
         }
         let budgetMs = Self.budgetFraction * frameInterval * 1000

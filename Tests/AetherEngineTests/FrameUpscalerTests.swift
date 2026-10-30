@@ -266,6 +266,25 @@ struct FrameUpscalerTests {
     }
     @Test
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func seekGapsDoNotStretchTheInterval() throws {
+        let up = try upscaler(try plan(720, 480, ml: []), frameInterval: 1.0 / 25)
+        let input = try TestFrames.nv12(720, 480)
+        for i in 0..<10 { _ = up.upscale(input, pts: CMTime(value: Int64(i) * 5, timescale: 1)) }
+        #expect(abs(up.frameBudgetMs - 30) < 0.001)
+        #expect(abs(up.mlTimeout - 0.12) < 0.0001)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func deliveredPlanFollowsTheFirstFrame() throws {
+        let up = try upscaler(try plan(720, 480, ml: []), frameInterval: 1.0 / 25)
+        #expect(up.deliveredPlan == nil)
+        _ = up.upscale(try TestFrames.nv12(720, 480), pts: .zero)
+        #expect(up.deliveredPlan?.sourceWidth == 720)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func backgroundRefusalIsClassified() {
         let notPermitted = NSError(domain: MTLCommandBufferErrorDomain,
                                    code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))

@@ -71,8 +71,8 @@ extension AetherEngine {
                 }
             }
         }
-        if upscaler.stats.framesUpscaled > 0 {
-            activeUpscale = UpscaleStatus.afterFirstFrame(plan, current: activeUpscale)
+        if let delivered = upscaler.deliveredPlan {
+            activeUpscale = UpscaleStatus.afterFirstFrame(delivered, current: activeUpscale)
         }
         if let reason = upscaler.disabledReason {
             latchUpscaleDisabled(reason: reason, plan: plan)
