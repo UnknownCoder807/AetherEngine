@@ -48,6 +48,14 @@ final class FrameUpscaler: @unchecked Sendable {
 
     var plan: UpscalePlan { processLock.lock(); defer { processLock.unlock() }; return stage.plan }
 
+    /// Test seam: replaces `VTFrameProcessor.process` for the ML pass.
+    var mlSubmitOverride: MLSubmit? {
+        get { processLock.lock(); defer { processLock.unlock() }; return _mlSubmitOverride }
+        set { processLock.lock(); _mlSubmitOverride = newValue; processLock.unlock() }
+    }
+    typealias MLSubmit = (VTLowLatencySuperResolutionScalerParameters, @escaping @Sendable (Error?) -> Void) -> Void
+    private var _mlSubmitOverride: MLSubmit?
+
     private let frameInterval: Double
     private let gpu: GPU
     private var stage: Stage
@@ -90,16 +98,18 @@ final class FrameUpscaler: @unchecked Sendable {
             notePassThrough("pixel format \(fourCC(format)) is not 8-bit 4:2:0")
             return nil
         }
-        let width = CVPixelBufferGetWidth(input), height = CVPixelBufferGetHeight(input)
-        if width != stage.plan.sourceWidth || height != stage.plan.sourceHeight {
-            guard rebuild(for: input, width: width, height: height) else { return nil }
+        let picture = Self.pictureRegion(of: input)
+        if picture.width != stage.plan.sourceWidth || picture.height != stage.plan.sourceHeight {
+            guard rebuild(for: input, width: picture.width, height: picture.height) else { return nil }
         }
         lastPassThroughNote = nil
 
         let start = DispatchTime.now().uptimeNanoseconds
         frameIndex += 1
         do {
-            let output = try stage.process(input, frameIndex: frameIndex)
+            let output = try stage.process(
+                input, picture: picture, frameIndex: frameIndex,
+                mlTimeout: max(0.05, 3 * frameInterval), submit: _mlSubmitOverride)
             let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
             recordSuccess(ms: ms)
             return output
@@ -140,6 +150,28 @@ final class FrameUpscaler: @unchecked Sendable {
         guard note != lastPassThroughNote else { return }
         lastPassThroughNote = note
         EngineLog.emit("[Upscale] passing frames through: \(note)", category: .swPlayback)
+    }
+
+    /// The clean aperture when the buffer carries one smaller than itself (cropped streams such as H.264
+    /// coded 1280x736 shown 1280x720), else the whole buffer. The origin is kept even for 4:2:0 chroma.
+    static func pictureRegion(of buffer: CVPixelBuffer) -> PictureRegion {
+        let bw = CVPixelBufferGetWidth(buffer), bh = CVPixelBufferGetHeight(buffer)
+        let whole = PictureRegion(x: 0, y: 0, width: bw, height: bh)
+        guard let ap = CVBufferCopyAttachment(buffer, kCVImageBufferCleanApertureKey, nil) as? [String: Any],
+              let aw = (ap[kCVImageBufferCleanApertureWidthKey as String] as? NSNumber)?.doubleValue,
+              let ah = (ap[kCVImageBufferCleanApertureHeightKey as String] as? NSNumber)?.doubleValue
+        else { return whole }
+        let ho = (ap[kCVImageBufferCleanApertureHorizontalOffsetKey as String] as? NSNumber)?.doubleValue ?? 0
+        let vo = (ap[kCVImageBufferCleanApertureVerticalOffsetKey as String] as? NSNumber)?.doubleValue ?? 0
+        let w = min(bw, Int(aw.rounded(.down))), h = min(bh, Int(ah.rounded(.down)))
+        guard w > 0, h > 0, w < bw || h < bh else { return whole }
+        let x = min(max(0, Int(((Double(bw) - aw) / 2 + ho).rounded(.down))) & ~1, bw - w)
+        let y = min(max(0, Int(((Double(bh) - ah) / 2 + vo).rounded(.down))) & ~1, bh - h)
+        return PictureRegion(x: x, y: y, width: w, height: h)
+    }
+
+    struct PictureRegion: Equatable {
+        var x: Int, y: Int, width: Int, height: Int
     }
 
     private static func pixelAspectRatio(of buffer: CVPixelBuffer) -> (Int, Int) {
@@ -270,6 +302,13 @@ private final class Stage {
     private let rgba: MTLTexture?
     private let scaled: MTLTexture?
     private var outputPools: [OSType: CVPixelBufferPool] = [:]
+    private var cropPools: [OSType: CVPixelBufferPool] = [:]
+
+    static let droppedAttachmentKeys: Set<String> = [
+        kCVImageBufferCleanApertureKey as String, kCVImageBufferPreferredCleanApertureKey as String,
+        kCVImageBufferFieldCountKey as String, kCVImageBufferFieldDetailKey as String,
+        kCVImageBufferDisplayDimensionsKey as String,
+    ]
 
     init(plan: UpscalePlan, gpu: GPU) throws {
         self.plan = plan
@@ -320,10 +359,21 @@ private final class Stage {
 
     func release() { ml?.end() }
 
-    func process(_ input: CVPixelBuffer, frameIndex: Int64) throws -> CVPixelBuffer {
-        let format = CVPixelBufferGetPixelFormatType(input)
+    func process(_ original: CVPixelBuffer, picture: FrameUpscaler.PictureRegion, frameIndex: Int64,
+                 mlTimeout: Double, submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
+        let format = CVPixelBufferGetPixelFormatType(original)
         let videoRange = format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        let mlOut = try ml?.process(input, frameIndex: frameIndex)
+        let input: CVPixelBuffer
+        if picture.width == CVPixelBufferGetWidth(original) && picture.height == CVPixelBufferGetHeight(original) {
+            input = original
+        } else {
+            if cropPools[format] == nil {
+                cropPools[format] = try makePool(width: picture.width, height: picture.height, format: format)
+            }
+            input = try pooledBuffer(cropPools[format]!)
+            try copyPlanes(from: original, to: input, origin: (picture.x, picture.y))
+        }
+        let mlOut = try ml?.process(input, frameIndex: frameIndex, timeout: mlTimeout, submit: submit)
         let output: CVPixelBuffer
 
         if let scaler, let rgba, let scaled {
@@ -363,8 +413,10 @@ private final class Stage {
         }
 
         CVBufferRemoveAllAttachments(output)
-        if let attachments = CVBufferCopyAttachments(input, .shouldPropagate) {
-            CVBufferSetAttachments(output, attachments, .shouldPropagate)
+        if let attachments = CVBufferCopyAttachments(original, .shouldPropagate) as? [String: Any] {
+            // Geometry and field keys describe the input buffer, not this one.
+            let carried = attachments.filter { !Self.droppedAttachmentKeys.contains($0.key) }
+            CVBufferSetAttachments(output, carried as CFDictionary, .shouldPropagate)
         }
         let square: [String: Int] = [kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: 1,
                                      kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: 1]
@@ -392,6 +444,7 @@ private final class MLScaler {
     private let sourceFormat: OSType
     private var copiesInput = false
     private var ended = false
+    private var abandoned: [(CVPixelBuffer, CVPixelBuffer)] = []
 
     init(width: Int, height: Int, scale: Float) throws {
         let config = VTLowLatencySuperResolutionScalerConfiguration(frameWidth: width, frameHeight: height, scaleFactor: scale)
@@ -414,10 +467,13 @@ private final class MLScaler {
         processor.endSession()
     }
 
-    func process(_ input: CVPixelBuffer, frameIndex: Int64) throws -> CVPixelBuffer {
+    func process(_ input: CVPixelBuffer, frameIndex: Int64, timeout: Double,
+                 submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
         if !copiesInput, CVPixelBufferGetPixelFormatType(input) == sourceFormat, CVPixelBufferGetIOSurface(input) != nil {
             do {
-                return try run(input, frameIndex: frameIndex)
+                return try run(input, frameIndex: frameIndex, timeout: timeout, submit: submit)
+            } catch let error as MLTimeout {
+                throw error
             } catch {
                 copiesInput = true
                 EngineLog.emit("[Upscale] ML scaler refused the decoder buffer (\(error)), copying input from now on",
@@ -426,10 +482,11 @@ private final class MLScaler {
         }
         let copy = try pooledBuffer(sourcePool)
         try copyPlanes(from: input, to: copy)
-        return try run(copy, frameIndex: frameIndex)
+        return try run(copy, frameIndex: frameIndex, timeout: timeout, submit: submit)
     }
 
-    private func run(_ source: CVPixelBuffer, frameIndex: Int64) throws -> CVPixelBuffer {
+    private func run(_ source: CVPixelBuffer, frameIndex: Int64, timeout: Double,
+                     submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
         let destination = try pooledBuffer(destinationPool)
         let pts = CMTime(value: frameIndex, timescale: 600)
         guard let sf = VTFrameProcessorFrame(buffer: source, presentationTimeStamp: pts),
@@ -437,8 +494,17 @@ private final class MLScaler {
         else { throw UpscaleError("VTFrameProcessorFrame refused a buffer") }
         let params = VTLowLatencySuperResolutionScalerParameters(sourceFrame: sf, destinationFrame: df)
         let done = Completion()
-        processor.process(parameters: params) { _, error in done.finish(error) }
-        if let error = done.wait() { throw error }
+        if let submit {
+            submit(params) { done.finish($0) }
+        } else {
+            processor.process(parameters: params) { _, error in done.finish(error) }
+        }
+        guard let result = done.wait(timeout: timeout) else {
+            // VT may still write these later: keep them out of the pools for good.
+            abandoned.append((source, destination))
+            throw MLTimeout(seconds: timeout)
+        }
+        if let error = result { throw error }
         return destination
     }
 }
@@ -446,9 +512,21 @@ private final class MLScaler {
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 private final class Completion: @unchecked Sendable {
     private let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
     private var error: Error?
-    func finish(_ error: Error?) { self.error = error; semaphore.signal() }
-    func wait() -> Error? { semaphore.wait(); return error }
+    func finish(_ error: Error?) { lock.lock(); self.error = error; lock.unlock(); semaphore.signal() }
+    /// nil on timeout, else `.some(error)`.
+    func wait(timeout: Double) -> Error?? {
+        guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
+        lock.lock(); defer { lock.unlock() }
+        return .some(error)
+    }
+}
+
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+private struct MLTimeout: Error, CustomStringConvertible {
+    let seconds: Double
+    var description: String { String(format: "ML pass did not complete within %.0f ms", seconds * 1000) }
 }
 
 // MARK: - Buffers
@@ -483,11 +561,12 @@ private func pooledBuffer(_ pool: CVPixelBufferPool) throws -> CVPixelBuffer {
     return buffer
 }
 
-/// Plane-by-plane copy between two 8-bit bi-planar buffers of the same size; the values carry over as is.
+/// Plane-by-plane copy of `dst`'s size from `src` at `origin` (even), 8-bit bi-planar; the values carry over as is.
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
-private func copyPlanes(from src: CVPixelBuffer, to dst: CVPixelBuffer) throws {
-    guard CVPixelBufferGetWidth(src) == CVPixelBufferGetWidth(dst),
-          CVPixelBufferGetHeight(src) == CVPixelBufferGetHeight(dst),
+private func copyPlanes(from src: CVPixelBuffer, to dst: CVPixelBuffer, origin: (x: Int, y: Int) = (0, 0)) throws {
+    guard origin.x % 2 == 0, origin.y % 2 == 0,
+          CVPixelBufferGetWidth(src) >= origin.x + CVPixelBufferGetWidth(dst),
+          CVPixelBufferGetHeight(src) >= origin.y + CVPixelBufferGetHeight(dst),
           CVPixelBufferGetPlaneCount(src) == 2, CVPixelBufferGetPlaneCount(dst) == 2
     else { throw UpscaleError("plane copy between mismatched buffers") }
     CVPixelBufferLockBaseAddress(src, .readOnly)
@@ -502,9 +581,11 @@ private func copyPlanes(from src: CVPixelBuffer, to dst: CVPixelBuffer) throws {
         else { throw UpscaleError("plane \(plane) has no base address") }
         let sStride = CVPixelBufferGetBytesPerRowOfPlane(src, plane)
         let dStride = CVPixelBufferGetBytesPerRowOfPlane(dst, plane)
-        let rowBytes = min(sStride, dStride, CVPixelBufferGetWidthOfPlane(src, plane) * (plane == 0 ? 1 : 2))
-        for row in 0..<CVPixelBufferGetHeightOfPlane(src, plane) {
-            memcpy(d + row * dStride, s + row * sStride, rowBytes)
+        let shift = plane == 0 ? 0 : 1
+        let rowBytes = CVPixelBufferGetWidthOfPlane(dst, plane) * (plane == 0 ? 1 : 2)
+        let from = s + (origin.y >> shift) * sStride + (origin.x >> shift) * (plane == 0 ? 1 : 2)
+        for row in 0..<CVPixelBufferGetHeightOfPlane(dst, plane) {
+            memcpy(d + row * dStride, from + row * sStride, rowBytes)
         }
     }
 }

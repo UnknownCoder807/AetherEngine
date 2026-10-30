@@ -21,7 +21,7 @@ private enum UpscalerGate {
 
 /// One frame in, one frame out: sizes, colour tags, flat-field fidelity, mid-stream size changes and
 /// the disable paths. GPU and OS 26 gated; the ML tests also need VT low-latency super resolution.
-@Suite("Frame upscaler", .serialized, .enabled(if: UpscalerGate.gpuAvailable))
+@Suite("Frame upscaler", .serialized, .timeLimit(.minutes(1)), .enabled(if: UpscalerGate.gpuAvailable))
 struct FrameUpscalerTests {
 
     private static let uhd = CGSize(width: 3840, height: 2160)
@@ -129,6 +129,57 @@ struct FrameUpscalerTests {
         #expect(!up.isDisabled)
     }
 
+    /// A cropped stream: the decoder buffer has padding rows below a clean aperture. The aperture is the
+    /// picture, the padding (white here) must not reach the output, and the output carries no aperture or
+    /// field tags of the input's geometry.
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func upscalesTheCleanApertureOnly() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: []))
+        let input = try TestFrames.nv12(720, 496, par: (8, 9), y: 126, c: 128)
+        TestFrames.paint(input, rows: 480..<496, y: 235)
+        let aperture: [String: Any] = [kCVImageBufferCleanApertureWidthKey as String: 720,
+                                       kCVImageBufferCleanApertureHeightKey as String: 480,
+                                       kCVImageBufferCleanApertureHorizontalOffsetKey as String: 0,
+                                       kCVImageBufferCleanApertureVerticalOffsetKey as String: -8]
+        CVBufferSetAttachment(input, kCVImageBufferCleanApertureKey, aperture as CFDictionary, .shouldPropagate)
+        CVBufferSetAttachment(input, kCVImageBufferFieldCountKey, 1 as CFNumber, .shouldPropagate)
+
+        let out = try #require(up.upscale(input))
+        #expect(CVPixelBufferGetWidth(out) == 2880 && CVPixelBufferGetHeight(out) == 2160)
+        #expect(up.plan.sourceWidth == 720 && up.plan.sourceHeight == 480)
+        #expect(CVBufferCopyAttachment(out, kCVImageBufferCleanApertureKey, nil) == nil)
+        #expect(CVBufferCopyAttachment(out, kCVImageBufferFieldCountKey, nil) == nil)
+        #expect(CVBufferCopyAttachment(out, kCVImageBufferYCbCrMatrixKey, nil) != nil)
+        let range = TestFrames.planeRange(out)
+        #expect(range.y.lowerBound >= 124 && range.y.upperBound <= 128, "Y \(range.y)")
+    }
+
+    /// A VT pass that never calls back (session invalidated by backgrounding, media-services reset) must
+    /// not hold the frame thread: bounded wait, original frame delivered, and the abandoned destination
+    /// never handed out later.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func hungMLPassTimesOutAndNeverReusesItsBuffer() throws {
+        let up = try upscaler(try plan(1280, 720, display: CGSize(width: 1920, height: 1080), ml: [1.5]),
+                              frameInterval: 1.0 / 60)
+        let hung = BufferLog()
+        up.mlSubmitOverride = { params, _ in if let b = params.destinationFrame?.buffer { hung.add(b) } }
+        let input = try TestFrames.nv12(1280, 720)
+        for _ in 0..<2 {
+            let t0 = Date()
+            #expect(up.upscale(input) == nil)
+            #expect(Date().timeIntervalSince(t0) < 0.5)
+        }
+        #expect(up.stats.failures == 2 && !up.isDisabled)
+        up.mlSubmitOverride = nil
+        for _ in 0..<6 {
+            let out = try #require(up.upscale(input))
+            #expect(!hung.contains(out))
+        }
+        #expect(hung.count == 2)
+    }
+
     @Test
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func unsupportedFormatPassesThrough() throws {
@@ -160,6 +211,14 @@ struct FrameUpscalerTests {
             Issue.record("last event \(String(describing: all.last))")
         }
     }
+}
+
+private final class BufferLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var buffers: [CVPixelBuffer] = []
+    func add(_ b: CVPixelBuffer) { lock.lock(); buffers.append(b); lock.unlock() }
+    func contains(_ b: CVPixelBuffer) -> Bool { lock.lock(); defer { lock.unlock() }; return buffers.contains { $0 === b } }
+    var count: Int { lock.lock(); defer { lock.unlock() }; return buffers.count }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
@@ -208,6 +267,14 @@ private enum TestFrames {
             }
         }
         return pb
+    }
+
+    static func paint(_ pb: CVPixelBuffer, rows: Range<Int>, y value: UInt8) {
+        CVPixelBufferLockBaseAddress(pb, [])
+        defer { CVPixelBufferUnlockBaseAddress(pb, []) }
+        let stride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0)
+        let p = CVPixelBufferGetBaseAddressOfPlane(pb, 0)!.assumingMemoryBound(to: UInt8.self)
+        for row in rows { memset(p + row * stride, Int32(value), CVPixelBufferGetWidth(pb)) }
     }
 
     /// Min/max of each plane, skipping `margin` luma pixels at every edge.
