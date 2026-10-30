@@ -1,4 +1,5 @@
 import CoreGraphics
+import AetherLibavutil
 
 /// Coded picture size plus sample aspect ratio, the geometry the upscale decision works from.
 struct SourceGeometry: Equatable {
@@ -112,6 +113,11 @@ enum UpscaleRouteDecision: Equatable {
     }
 
     private static func even(_ value: Int) -> Int { value & ~1 }
+
+    /// Only PQ and HLG count as HDR here; an unspecified or unknown transfer is treated as SDR.
+    static func isSDR(colorTransfer: AVColorTransferCharacteristic) -> Bool {
+        colorTransfer != AVCOL_TRC_SMPTE2084 && colorTransfer != AVCOL_TRC_ARIB_STD_B67
+    }
 
     var plan: UpscalePlan? {
         if case let .taken(plan) = self { return plan }

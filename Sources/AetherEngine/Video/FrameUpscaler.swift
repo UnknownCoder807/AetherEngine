@@ -44,6 +44,9 @@ final class FrameUpscaler: @unchecked Sendable {
 
     var isDisabled: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _isDisabled }
 
+    /// Why the stage switched itself off, nil while it runs.
+    var disabledReason: String? { stateLock.lock(); defer { stateLock.unlock() }; return _disabledReason }
+
     var stats: Stats { stateLock.lock(); defer { stateLock.unlock() }; return _stats }
 
     var plan: UpscalePlan { processLock.lock(); defer { processLock.unlock() }; return stage.plan }
@@ -70,6 +73,7 @@ final class FrameUpscaler: @unchecked Sendable {
     private let stateLock = NSLock()
     private var _onEvent: (@Sendable (Event) -> Void)?
     private var _isDisabled = false
+    private var _disabledReason: String?
     private var _stats = Stats(framesUpscaled: 0, failures: 0, meanMs: 0, maxMs: 0)
 
     init?(plan: UpscalePlan, frameInterval: Double) {
@@ -224,6 +228,7 @@ final class FrameUpscaler: @unchecked Sendable {
         stateLock.lock()
         guard !_isDisabled else { stateLock.unlock(); return }
         _isDisabled = true
+        _disabledReason = reason
         let stats = _stats
         let handler = _onEvent
         stateLock.unlock()

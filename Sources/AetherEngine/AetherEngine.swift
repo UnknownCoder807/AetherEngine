@@ -697,6 +697,9 @@ public final class AetherEngine: ObservableObject {
     /// Enhancement layer type for Profile 7 streams ("FEL" or "MEL") extracted from the first RPU.
     var sourceElType: String? = nil
 
+    /// #846: the upscale plan the load decided, carried to every software host this session builds.
+    var sourceUpscalePlan: UpscalePlan? = nil
+
     /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
     /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
     /// on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
@@ -1160,6 +1163,12 @@ public final class AetherEngine: ObservableObject {
     /// this one's rectangle. The native and bypass paths mount an `AVPlayerLayer`, which measures its
     /// own `videoRect` and carries `AVPlayerItem.presentationSize`; this stays nil there.
     @Published public internal(set) var softwareDisplaySize: CGSize?
+
+    /// #846: what the low-resolution upscale stage (`LoadOptions.upscalesLowResolutionVideo`) does for this
+    /// session. Published on the first upscaled frame, not when the load decides the route, and again with
+    /// `disabledReason` set if the stage switches itself off. nil when the stage is not running, and
+    /// cleared with the session.
+    @Published public internal(set) var activeUpscale: UpscaleStatus?
 
     /// #288: the native-path counterpart of `softwarePiPSource.layer`. `AVPictureInPictureController`
     /// wants the layer, not the player, so a host presenting its own PiP on the native path (tvOS has
@@ -4591,6 +4600,7 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        sourceUpscalePlan = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -5698,6 +5708,21 @@ public final class AetherEngine: ObservableObject {
         }
         useSoftwarePath = VideoRoutingPolicy.usesSoftwarePath(
             routedSoftware: useSoftwarePath, preferred: options.preferredDecodePath)
+        // #846: after every other routing decision, because this one only ever adds the software path and
+        // the interlace refute probe above can take that path away again.
+        let upscaleDecision = upscaleRouteDecision(
+            options: options,
+            videoStream: probeOpened ? probe.stream(at: probe.videoStreamIndex) : nil,
+            dvProfile: detectedDVProfileNum,
+            airPlayVideoReceiver: airPlayVideoReceiver,
+            demuxedAudioLive: SessionOptionCorrection.isDemuxedAudioLive(
+                isLive: options.isLive,
+                hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil))
+        if let line = upscaleDecision.logLine {
+            EngineLog.emit(line, category: .engine)
+        }
+        sourceUpscalePlan = upscaleDecision.plan
+        if sourceUpscalePlan != nil { useSoftwarePath = true }
         // TEST-ONLY: forces SW path for aetherctl live --sw; unset in shipping builds.
         if Self.forceSoftwarePathForTesting {
             useSoftwarePath = true
@@ -7058,6 +7083,7 @@ public final class AetherEngine: ObservableObject {
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        sourceUpscalePlan = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
@@ -8205,6 +8231,7 @@ public final class AetherEngine: ObservableObject {
         // #353: the picture belongs to the session. Left standing, the next source would be laid out
         // against this one's rectangle for as long as it takes its own first frame to arrive.
         softwareDisplaySize = nil
+        activeUpscale = nil
         decodedVideoFormat = nil
         // #314: same detach on the software path, where the outgoing renderer's decode thread is what
         // can still hand a frame over while the next host comes up.

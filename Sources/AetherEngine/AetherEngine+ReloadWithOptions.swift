@@ -385,10 +385,15 @@ enum SessionOptionCorrection {
         // for exactly that shape), so this is the demuxed-audio population rather than a superset of
         // it. `load`'s own guard re-checks that the main container carries no audio; erring towards
         // the refusal here is the safe direction, because the session it leaves alone is playing.
-        if isLive, hasCompanionAudioReader {
+        if isDemuxedAudioLive(isLive: isLive, hasCompanionAudioReader: hasCompanionAudioReader) {
             return .demuxedAudioLiveIsNativeOnly
         }
         return nil
+    }
+
+    /// A live source whose audio arrives through a companion reader, which only the native path merges.
+    static func isDemuxedAudioLive(isLive: Bool, hasCompanionAudioReader: Bool) -> Bool {
+        isLive && hasCompanionAudioReader
     }
 
     /// Why a `preferDualLayerDolbyVision` or `dolbyVisionHandling` correction cannot be honoured, or nil
@@ -449,7 +454,7 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "upscalesLowResolutionVideo", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",

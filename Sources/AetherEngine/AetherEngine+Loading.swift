@@ -2022,6 +2022,7 @@ extension AetherEngine {
         host.configuredDVProfile = sourceDVProfile
         host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
+        host.upscalePlan = sourceUpscalePlan
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
@@ -2232,6 +2233,7 @@ extension AetherEngine {
             host.stop()
             try checkLoadCurrent(generation)
         }
+        wireUpscaleStatus(from: host)
         // The audio route is settled by `load`: an object-audio one keeps the HDMI link in Atmos.
         followAtmosOutput()
     }
