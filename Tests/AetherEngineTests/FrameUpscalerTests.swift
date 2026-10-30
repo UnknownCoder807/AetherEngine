@@ -295,6 +295,48 @@ struct FrameUpscalerTests {
         for _ in 0..<3 { #expect(up.upscale(input) == nil) }
         #expect(up.isDisabled)
     }
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func lateCompletionReleasesTheAbandonedBuffers() throws {
+        let up = try upscaler(try plan(1280, 720, display: CGSize(width: 1920, height: 1080), ml: [1.5]),
+                              frameInterval: 1.0 / 60)
+        let late = CompletionLog()
+        up.mlSubmitOverride = { _, done in late.add(done) }
+        #expect(up.upscale(try TestFrames.nv12(1280, 720)) == nil)
+        #expect(up.abandonedMLPasses == 1)
+        late.finishAll()
+        #expect(up.abandonedMLPasses == 0)
+        #expect(!up.isDisabled)
+    }
+
+    /// Timeouts that never complete keep their buffers out of the pools; past 8 the stage gives up.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func tooManyOutstandingTimeoutsDisable() throws {
+        let up = try upscaler(try plan(1280, 720, display: CGSize(width: 1920, height: 1080), ml: [1.5]),
+                              frameInterval: 1.0 / 60)
+        let input = try TestFrames.nv12(1280, 720)
+        for i in 1...9 {
+            up.mlSubmitOverride = { _, _ in }
+            #expect(up.upscale(input) == nil)
+            #expect(up.isDisabled == (i == 9), "timeout \(i)")
+            guard i < 9 else { break }
+            #expect(up.abandonedMLPasses == i)
+            up.mlSubmitOverride = nil
+            #expect(up.upscale(input) != nil, "recovery after timeout \(i)")
+        }
+        #expect(up.disabledReason?.contains("too many ML timeouts") == true, "\(String(describing: up.disabledReason))")
+    }
+}
+
+private final class CompletionLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: [@Sendable (Error?) -> Void] = []
+    func add(_ done: @escaping @Sendable (Error?) -> Void) { lock.lock(); pending.append(done); lock.unlock() }
+    func finishAll() {
+        lock.lock(); let all = pending; pending = []; lock.unlock()
+        for done in all { done(nil) }
+    }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)

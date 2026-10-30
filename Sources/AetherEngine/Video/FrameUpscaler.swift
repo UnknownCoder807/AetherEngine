@@ -62,6 +62,9 @@ final class FrameUpscaler: @unchecked Sendable {
 
     var plan: UpscalePlan { processLock.lock(); defer { processLock.unlock() }; return stage.plan }
 
+    /// Timed-out ML passes whose buffers are still held back for a late completion.
+    var abandonedMLPasses: Int { processLock.lock(); defer { processLock.unlock() }; return stage.abandonedMLPasses }
+
     /// Test seam: replaces `VTFrameProcessor.process` for the ML pass.
     var mlSubmitOverride: MLSubmit? {
         get { processLock.lock(); defer { processLock.unlock() }; return _mlSubmitOverride }
@@ -278,6 +281,10 @@ final class FrameUpscaler: @unchecked Sendable {
         stateLock.lock()
         _stats.failures += 1
         stateLock.unlock()
+        if let timeout = error as? MLTimeout, timeout.outstanding > MLScaler.maxAbandoned {
+            disable(reason: "too many ML timeouts, \(timeout.outstanding) passes never completed")
+            return
+        }
         if consecutiveFailures >= Self.maxConsecutiveFailures {
             disable(reason: "\(consecutiveFailures) consecutive failures, last: \(error)")
         }
@@ -427,6 +434,8 @@ private final class Stage {
 
     func release() { ml?.end() }
 
+    var abandonedMLPasses: Int { ml?.abandonedCount ?? 0 }
+
     func process(_ original: CVPixelBuffer, picture: FrameUpscaler.PictureRegion, frameIndex: Int64,
                  mlTimeout: Double, submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
         let format = CVPixelBufferGetPixelFormatType(original)
@@ -514,7 +523,11 @@ private final class MLScaler {
     private let sourceFormat: OSType
     private var copiesInput = false
     private var ended = false
-    private var abandoned: [(CVPixelBuffer, CVPixelBuffer)] = []
+    private let abandoned = AbandonedPasses()
+
+    /// Outstanding timed-out passes past which the stage disables itself.
+    static let maxAbandoned = 8
+    var abandonedCount: Int { abandoned.count }
 
     init(width: Int, height: Int, scale: Float) throws {
         let config = VTLowLatencySuperResolutionScalerConfiguration(frameWidth: width, frameHeight: height, scaleFactor: scale)
@@ -574,9 +587,11 @@ private final class MLScaler {
             processor.process(parameters: params) { _, error in done.finish(error) }
         }
         guard let result = done.wait(timeout: timeout) else {
-            // VT may still write these later: keep them out of the pools for good.
-            abandoned.append((source, destination))
-            throw MLTimeout(seconds: timeout)
+            // VT may still write these later: keep them out of the pools until it calls back.
+            let abandoned = abandoned
+            let id = abandoned.insert(source, destination)
+            if !done.abandon(onLateFinish: { abandoned.remove(id) }) { abandoned.remove(id) }
+            throw MLTimeout(seconds: timeout, outstanding: abandoned.count)
         }
         if let error = result { throw error }
         try clampBorder(destination, luma: mlBorderClamp)
@@ -627,7 +642,25 @@ private final class Completion: @unchecked Sendable {
     private let semaphore = DispatchSemaphore(value: 0)
     private let lock = NSLock()
     private var error: Error?
-    func finish(_ error: Error?) { lock.lock(); self.error = error; lock.unlock(); semaphore.signal() }
+    private var finished = false
+    private var onLateFinish: (@Sendable () -> Void)?
+    func finish(_ error: Error?) {
+        lock.lock()
+        self.error = error
+        finished = true
+        let late = onLateFinish
+        onLateFinish = nil
+        lock.unlock()
+        semaphore.signal()
+        late?()
+    }
+    /// After a timed-out wait: `onLateFinish` runs when the pass completes. False when it already has.
+    func abandon(onLateFinish: @escaping @Sendable () -> Void) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard !finished else { return false }
+        self.onLateFinish = onLateFinish
+        return true
+    }
     /// nil on timeout, else `.some(error)`.
     func wait(timeout: Double) -> Error?? {
         guard semaphore.wait(timeout: .now() + timeout) == .success else { return nil }
@@ -637,8 +670,24 @@ private final class Completion: @unchecked Sendable {
 }
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+private final class AbandonedPasses: @unchecked Sendable {
+    private let lock = NSLock()
+    private var nextID = 0
+    private var buffers: [Int: (CVPixelBuffer, CVPixelBuffer)] = [:]
+    var count: Int { lock.lock(); defer { lock.unlock() }; return buffers.count }
+    func insert(_ source: CVPixelBuffer, _ destination: CVPixelBuffer) -> Int {
+        lock.lock(); defer { lock.unlock() }
+        nextID += 1
+        buffers[nextID] = (source, destination)
+        return nextID
+    }
+    func remove(_ id: Int) { lock.lock(); buffers[id] = nil; lock.unlock() }
+}
+
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 private struct MLTimeout: Error, CustomStringConvertible {
     let seconds: Double
+    let outstanding: Int
     var description: String { String(format: "ML pass did not complete within %.0f ms", seconds * 1000) }
 }
 
