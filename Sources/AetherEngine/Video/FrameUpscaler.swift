@@ -81,6 +81,7 @@ final class FrameUpscaler: @unchecked Sendable {
     private var totalMs = 0.0
     private var consecutiveFailures = 0
     private var firstFrameSent = false
+    private var backgroundRefusalNoted = false
     private var frameIndex: Int64 = 0
     private let processLock = NSLock()
 
@@ -228,8 +229,18 @@ final class FrameUpscaler: @unchecked Sendable {
 
     // MARK: - Accounting
 
+    /// A command buffer refused because the app is in the background (iOS): not a fault of the stage.
+    static func isBackgroundRefusal(_ error: Error) -> Bool {
+        if let wrapped = error as? UpscaleError, let underlying = wrapped.underlying {
+            return isBackgroundRefusal(underlying)
+        }
+        let ns = error as NSError
+        return ns.domain == MTLCommandBufferErrorDomain && ns.code == Int(MTLCommandBufferError.Code.notPermitted.rawValue)
+    }
+
     private func recordSuccess(ms: Double) {
         consecutiveFailures = 0
+        backgroundRefusalNoted = false
         totalMs += ms
         recentMs.append(ms)
         if recentMs.count > Self.budgetWindow { recentMs.removeFirst() }
@@ -255,6 +266,14 @@ final class FrameUpscaler: @unchecked Sendable {
     }
 
     private func recordFailure(_ error: Error) {
+        if Self.isBackgroundRefusal(error) {
+            if !backgroundRefusalNoted {
+                backgroundRefusalNoted = true
+                EngineLog.emit("[Upscale] GPU work not permitted in the background, passing frames through",
+                               category: .swPlayback)
+            }
+            return
+        }
         consecutiveFailures += 1
         stateLock.lock()
         _stats.failures += 1
@@ -285,7 +304,11 @@ final class FrameUpscaler: @unchecked Sendable {
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 private struct UpscaleError: Error, CustomStringConvertible {
     let description: String
-    init(_ description: String) { self.description = description }
+    let underlying: Error?
+    init(_ description: String, underlying: Error? = nil) {
+        self.description = description
+        self.underlying = underlying
+    }
 }
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
@@ -445,7 +468,8 @@ private final class Stage {
             withExtendedLifetime((sy.1, sc.1, oy.1, oc.1)) {}
             CVMetalTextureCacheFlush(gpu.textureCache, 0)
             guard cb.status == .completed else {
-                throw UpscaleError("command buffer \(cb.status.rawValue): \(cb.error.map { "\($0)" } ?? "no error")")
+                throw UpscaleError("command buffer \(cb.status.rawValue): \(cb.error.map { "\($0)" } ?? "no error")",
+                                   underlying: cb.error)
             }
         } else if let mlOut {
             if CVPixelBufferGetPixelFormatType(mlOut) == format {
@@ -519,6 +543,8 @@ private final class MLScaler {
             do {
                 return try run(input, frameIndex: frameIndex, timeout: timeout, submit: submit)
             } catch let error as MLTimeout {
+                throw error
+            } catch where FrameUpscaler.isBackgroundRefusal(error) {
                 throw error
             } catch {
                 copiesInput = true

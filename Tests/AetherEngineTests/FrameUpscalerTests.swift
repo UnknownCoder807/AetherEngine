@@ -264,6 +264,37 @@ struct FrameUpscalerTests {
         }
         #expect(abs(up.frameBudgetMs - 15) < 0.001)
     }
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func backgroundRefusalIsClassified() {
+        let notPermitted = NSError(domain: MTLCommandBufferErrorDomain,
+                                   code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))
+        #expect(FrameUpscaler.isBackgroundRefusal(notPermitted))
+        #expect(!FrameUpscaler.isBackgroundRefusal(NSError(domain: MTLCommandBufferErrorDomain,
+                                                           code: Int(MTLCommandBufferError.Code.timeout.rawValue))))
+        #expect(!FrameUpscaler.isBackgroundRefusal(NSError(domain: NSCocoaErrorDomain,
+                                                           code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))))
+    }
+
+    /// iOS refuses GPU work in the background. That must neither count as a failure nor disable the stage
+    /// for the rest of the film; any other error still does after three in a row.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func backgroundRefusalNeverDisables() throws {
+        let up = try upscaler(try plan(1280, 720, display: CGSize(width: 1920, height: 1080), ml: [1.5]))
+        let input = try TestFrames.nv12(1280, 720)
+        let notPermitted = NSError(domain: MTLCommandBufferErrorDomain,
+                                   code: Int(MTLCommandBufferError.Code.notPermitted.rawValue))
+        up.mlSubmitOverride = { _, done in done(notPermitted) }
+        for _ in 0..<6 { #expect(up.upscale(input) == nil) }
+        #expect(!up.isDisabled && up.stats.failures == 0)
+        up.mlSubmitOverride = nil
+        #expect(up.upscale(input) != nil)
+
+        up.mlSubmitOverride = { _, done in done(NSError(domain: NSCocoaErrorDomain, code: 1)) }
+        for _ in 0..<3 { #expect(up.upscale(input) == nil) }
+        #expect(up.isDisabled)
+    }
 }
 
 @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
