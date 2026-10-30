@@ -10,6 +10,24 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.53.0] - 2026-10-30
+
+### Added
+
+- **Opt-in upscaling of SDR video below 1080p (#846).** `LoadOptions.upscalesLowResolutionVideo` (off by default)
+  routes an 8-bit SDR source whose coded size is below 1920x1080 to the software host, where every decoded frame
+  goes through Apple's `VTLowLatencySuperResolutionScaler` as far as its per-device limits allow (2x for SD, 1.5x
+  for 720p, read at runtime) and then MetalFX Spatial for the rest of the way to the display size, delivered as
+  square-pixel 420v in the source's own YCbCr matrix. 1080p and above, HDR, Dolby Vision and 10-bit sources keep
+  their route. The stage times every step and keeps itself inside the frame budget: an overrun first drops MetalFX
+  (ML only, the system scales the rest), a second one switches the stage off for the session, and a MetalFX overrun
+  is remembered for the process so the next title starts without it. Measured on an Apple TV 4K (A15): ML 3 to 8 ms
+  per frame, MetalFX to 4K 16 to 21 ms, so that box runs ML only. `$activeUpscale` (`UpscaleStatus`) reports the
+  plan, a degrade and a disable; turning the option on mid-session on a custom `IOReader` source is refused with
+  `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`. Requires OS 26. Requested by cryptochrome.
+
 ### Fixed
 
 - **An AV1 Matroska file built on forward key frames starts and seeks (AE#931, thanks @1096bimu).**
