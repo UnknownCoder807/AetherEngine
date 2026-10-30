@@ -12,6 +12,16 @@ the public-API contract.
 
 ### Fixed
 
+- **An AV1 Matroska file built on forward key frames starts and seeks (AE#931, thanks @1096bimu).**
+  Such an encode can open every GOP with a Temporal Unit holding a Sequence Header and a hidden Key Frame
+  (`show_frame = 0`) that refreshes all eight reference slots, which decodes from a cold start. FFmpeg flagged
+  none of them as keyframes (`av1_parser` reports only a shown Key Frame and its verdict replaces the Matroska
+  block flag, and muxers leave the flag off too), so the file had no keyframe, no Cues and no index: the
+  loopback producer waited for a random access point that never came and wrote nothing (empty `init.mp4`,
+  `seg-0.m4s final finalize failed`), and the first seek on the software path ended the session with "could not
+  reposition". FFmpegBuild 3.11.1 carries the fix (FFmpeg PR 25607); a hidden Key Frame with a partial refresh,
+  as libaom writes, stays an inter frame. `Issue931AV1DelayedRAPTests` pins it through the Demuxer.
+
 - **An extensionless remote disc image served as `application/octet-stream` is recognized (AE#860, thanks @qoli).**
   The AE#860 fix only routed a declared disc type, so an origin that labels everything `application/octet-stream`
   still handed the ISO 9660 / UDF filesystem to libavformat raw. Under that generic type the open now reads the
