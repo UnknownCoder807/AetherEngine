@@ -64,15 +64,19 @@ extension AetherEngine {
             Task { @MainActor in
                 guard let self, let host, self.softwareHost === host else { return }
                 switch event {
-                case let .firstFrame(framePlan):
-                    self.activeUpscale = UpscaleStatus.afterFirstFrame(framePlan, current: self.activeUpscale)
+                case let .firstFrame(framePlan, degraded):
+                    self.activeUpscale = UpscaleStatus.afterFirstFrame(
+                        framePlan, degraded: degraded, current: self.activeUpscale)
+                case let .degraded(framePlan, reason: _, stats: _):
+                    self.activeUpscale = UpscaleStatus.afterFirstFrame(
+                        framePlan, degraded: true, current: self.activeUpscale)
                 case let .disabled(reason: reason, stats: _):
                     self.latchUpscaleDisabled(reason: reason, plan: plan)
                 }
             }
         }
-        if let delivered = upscaler.deliveredPlan {
-            activeUpscale = UpscaleStatus.afterFirstFrame(delivered, current: activeUpscale)
+        if let delivered = upscaler.delivered {
+            activeUpscale = UpscaleStatus.afterFirstFrame(delivered.plan, degraded: delivered.degraded, current: activeUpscale)
         }
         if let reason = upscaler.disabledReason {
             latchUpscaleDisabled(reason: reason, plan: plan)

@@ -1758,18 +1758,23 @@ public struct UpscaleStatus: Sendable, Equatable {
     /// Set when the stage switched itself off mid-session (repeated failures or a sustained overrun of
     /// the frame budget); frames are then delivered as decoded.
     public let disabledReason: String?
+    /// True once a sustained overrun made the stage drop MetalFX and deliver the VideoToolbox output at
+    /// its own size (`targetSize`, carrying the source's pixel aspect). Kept when it later disables.
+    public let degraded: Bool
 
-    init(plan: UpscalePlan, disabledReason: String? = nil) {
+    init(plan: UpscalePlan, degraded: Bool = false, disabledReason: String? = nil) {
         sourceSize = CGSize(width: plan.sourceWidth, height: plan.sourceHeight)
         mlScale = plan.mlScale
         targetSize = CGSize(width: plan.targetWidth, height: plan.targetHeight)
+        self.degraded = degraded
         self.disabledReason = disabledReason
     }
 
-    /// The first upscaled frame publishes `plan`, unless a disable was already published.
-    static func afterFirstFrame(_ plan: UpscalePlan, current: UpscaleStatus?) -> UpscaleStatus {
+    /// An upscaled frame of a new plan (first frame, rebuild, degrade) publishes it, unless a disable
+    /// was already published.
+    static func afterFirstFrame(_ plan: UpscalePlan, degraded: Bool = false, current: UpscaleStatus?) -> UpscaleStatus {
         if let current, current.disabledReason != nil { return current }
-        return UpscaleStatus(plan: plan)
+        return UpscaleStatus(plan: plan, degraded: degraded)
     }
 
     /// A disable keeps what was published and adds the reason; `plan` stands in when nothing was.
@@ -1777,13 +1782,15 @@ public struct UpscaleStatus: Sendable, Equatable {
         UpscaleStatus(sourceSize: current?.sourceSize ?? CGSize(width: plan.sourceWidth, height: plan.sourceHeight),
                       mlScale: current.map(\.mlScale) ?? plan.mlScale,
                       targetSize: current?.targetSize ?? CGSize(width: plan.targetWidth, height: plan.targetHeight),
+                      degraded: current?.degraded ?? false,
                       disabledReason: reason)
     }
 
-    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, disabledReason: String?) {
+    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, disabledReason: String?) {
         self.sourceSize = sourceSize
         self.mlScale = mlScale
         self.targetSize = targetSize
+        self.degraded = degraded
         self.disabledReason = disabledReason
     }
 }

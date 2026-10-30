@@ -52,6 +52,20 @@ struct UpscaleLoadIntegrationTests {
         #expect(UpscaleStatus.afterFirstFrame(plan, current: disabled) == disabled)
     }
 
+    @Test("a degrade publishes the ML-only plan as degraded, and a later disable keeps both")
+    func degradeIsPublished() {
+        var mlOnly = plan
+        mlOnly.targetWidth = 1440
+        mlOnly.targetHeight = 960
+        let first = UpscaleStatus.afterFirstFrame(plan, current: nil)
+        #expect(!first.degraded)
+        let degraded = UpscaleStatus.afterFirstFrame(mlOnly, degraded: true, current: first)
+        #expect(degraded.degraded && degraded.targetSize == CGSize(width: 1440, height: 960) && degraded.mlScale == 2)
+        let disabled = UpscaleStatus.afterDisable(reason: "over budget", current: degraded, plan: plan)
+        #expect(disabled.degraded && disabled.targetSize == CGSize(width: 1440, height: 960))
+        #expect(UpscaleStatus.afterFirstFrame(mlOnly, degraded: true, current: disabled) == disabled)
+    }
+
     @Test("a disable keeps the plan the first frame published over the one the load decided")
     func disableKeepsThePublishedPlan() {
         var rebuilt = plan

@@ -10,7 +10,8 @@ import VideoToolbox
 
 /// The per-frame upscale stage (#846): optional VT low-latency super resolution, then MetalFX Spatial to
 /// the plan's target size. Synchronous; `upscale` returns nil whenever the caller should deliver the
-/// original frame. Failures and a sustained overrun disable it for good, each logged once.
+/// original frame. A sustained overrun of an ML + MetalFX stage first drops MetalFX (ML output at its own
+/// size); failures and any further overrun disable it for good, each logged once.
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 final class FrameUpscaler: @unchecked Sendable {
 
@@ -19,14 +20,42 @@ final class FrameUpscaler: @unchecked Sendable {
         var failures: Int
         var meanMs: Double
         var maxMs: Double
+        /// Per-stage means over the last budget window.
+        var stageMeanMs = StageTimes()
+    }
+
+    /// Wall-clock milliseconds of one frame's steps; `metalGPU` is the command buffer's GPU time.
+    struct StageTimes: Equatable, Sendable {
+        var copy = 0.0, ml = 0.0, clamp = 0.0, metal = 0.0, metalGPU = 0.0, attach = 0.0, total = 0.0
+
+        static func mean(_ all: [StageTimes]) -> StageTimes {
+            guard !all.isEmpty else { return StageTimes() }
+            let n = Double(all.count)
+            func avg(_ k: KeyPath<StageTimes, Double>) -> Double { all.reduce(0) { $0 + $1[keyPath: k] } / n }
+            return StageTimes(copy: avg(\.copy), ml: avg(\.ml), clamp: avg(\.clamp), metal: avg(\.metal),
+                              metalGPU: avg(\.metalGPU), attach: avg(\.attach), total: avg(\.total))
+        }
+
+        var breakdown: String {
+            String(format: "copy %.1f, ml %.1f, clamp %.1f, metal %.1f wall / %.1f gpu, attach %.1f",
+                   copy, ml, clamp, metal, metalGPU, attach)
+        }
+
+        func logLine(frames: Int, intervalMs: Double) -> String {
+            String(format: "total %.1f ms (%@) over %d frames at %.1f ms interval", total, breakdown, frames, intervalMs)
+        }
     }
 
     enum Event: Sendable {
-        case firstFrame(UpscalePlan)
+        case firstFrame(UpscalePlan, degraded: Bool)
+        /// The overrun ladder dropped MetalFX: frames now go out at the plan's (ML output) size.
+        case degraded(UpscalePlan, reason: String, stats: Stats)
         case disabled(reason: String, stats: Stats)
     }
 
     static let budgetWindow = 48
+    /// Timing lines logged per stage, one per budget window.
+    static let timingLinesPerStage = 10
     static let budgetFraction = 0.75
     static let maxConsecutiveFailures = 3
     /// PTS deltas the live frame interval is the median of.
@@ -62,9 +91,18 @@ final class FrameUpscaler: @unchecked Sendable {
 
     var stats: Stats { stateLock.lock(); defer { stateLock.unlock() }; return _stats }
 
-    /// The plan of the last `.firstFrame` event, nil before the first upscaled frame.
+    /// The plan of the last `.firstFrame` or `.degraded` event, nil before the first upscaled frame.
     var deliveredPlan: UpscalePlan? { stateLock.lock(); defer { stateLock.unlock() }; return _deliveredPlan }
     private var _deliveredPlan: UpscalePlan?
+
+    /// `deliveredPlan` with whether it is the degraded (ML only) rung, read together.
+    var delivered: (plan: UpscalePlan, degraded: Bool)? {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return _deliveredPlan.map { ($0, _isDegraded) }
+    }
+
+    /// True once the overrun ladder dropped MetalFX; a rebuild for another size stays ML only.
+    var isDegraded: Bool { stateLock.lock(); defer { stateLock.unlock() }; return _isDegraded }
 
     var plan: UpscalePlan { processLock.lock(); defer { processLock.unlock() }; return stage.plan }
 
@@ -86,7 +124,10 @@ final class FrameUpscaler: @unchecked Sendable {
     private let gpu: GPU
     private var stage: Stage
     private var lastPassThroughNote: String?
-    private var recentMs: [Double] = []
+    private var recentTimes: [StageTimes] = []
+    private var degraded = false
+    private var stageFrames = 0
+    private var timingLines = 0
     private var totalMs = 0.0
     private var consecutiveFailures = 0
     private var firstFrameSent = false
@@ -98,6 +139,7 @@ final class FrameUpscaler: @unchecked Sendable {
     private var _onEvent: (@Sendable (Event) -> Void)?
     private var _isDisabled = false
     private var _disabledReason: String?
+    private var _isDegraded = false
     private var _stats = Stats(framesUpscaled: 0, failures: 0, meanMs: 0, maxMs: 0)
 
     init?(plan: UpscalePlan, frameInterval: Double) {
@@ -151,11 +193,12 @@ final class FrameUpscaler: @unchecked Sendable {
         let start = DispatchTime.now().uptimeNanoseconds
         frameIndex += 1
         do {
+            var times = StageTimes()
             let output = try stage.process(
                 input, picture: picture, frameIndex: frameIndex,
-                mlTimeout: currentMLTimeout, submit: _mlSubmitOverride)
-            let ms = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
-            recordSuccess(ms: ms)
+                mlTimeout: currentMLTimeout, submit: _mlSubmitOverride, times: &times)
+            times.total = elapsedMs(since: start)
+            recordSuccess(times)
             return output
         } catch {
             recordFailure(error)
@@ -190,15 +233,19 @@ final class FrameUpscaler: @unchecked Sendable {
             return false
         }
         do {
-            stage = try Stage(plan: plan, gpu: gpu)
+            stage = try Stage(plan: plan, gpu: gpu, mlOnly: degraded && plan.mlScale != nil)
         } catch {
             disable(reason: "rebuild for \(width)x\(height) failed: \(error)")
             return false
         }
         // The next upscaled frame republishes the plan.
         firstFrameSent = false
-        EngineLog.emit("[Upscale] input size changed: \(width)x\(height) -> \(plan.targetWidth)x\(plan.targetHeight)"
-                       + (plan.mlScale.map { " (ML \(String(format: "%g", $0))x)" } ?? ""), category: .swPlayback)
+        stageFrames = 0
+        timingLines = 0
+        let built = stage.plan
+        EngineLog.emit("[Upscale] input size changed: \(width)x\(height) -> \(built.targetWidth)x\(built.targetHeight)"
+                       + (built.mlScale.map { " (ML \(String(format: "%g", $0))x)" } ?? "")
+                       + (degraded && !built.needsMetalFX ? ", ML only (degraded)" : ""), category: .swPlayback)
         return true
     }
 
@@ -249,16 +296,18 @@ final class FrameUpscaler: @unchecked Sendable {
         return ns.domain == MTLCommandBufferErrorDomain && ns.code == Int(MTLCommandBufferError.Code.notPermitted.rawValue)
     }
 
-    private func recordSuccess(ms: Double) {
+    private func recordSuccess(_ times: StageTimes) {
         consecutiveFailures = 0
         backgroundRefusalNoted = false
-        totalMs += ms
-        recentMs.append(ms)
-        if recentMs.count > Self.budgetWindow { recentMs.removeFirst() }
+        totalMs += times.total
+        recentTimes.append(times)
+        if recentTimes.count > Self.budgetWindow { recentTimes.removeFirst() }
+        let windowMean = StageTimes.mean(recentTimes)
         stateLock.lock()
         _stats.framesUpscaled += 1
         _stats.meanMs = totalMs / Double(_stats.framesUpscaled)
-        _stats.maxMs = max(_stats.maxMs, ms)
+        _stats.maxMs = max(_stats.maxMs, times.total)
+        _stats.stageMeanMs = windowMean
         let handler = _onEvent
         stateLock.unlock()
 
@@ -267,16 +316,46 @@ final class FrameUpscaler: @unchecked Sendable {
             stateLock.lock()
             _deliveredPlan = stage.plan
             stateLock.unlock()
-            handler?(.firstFrame(stage.plan))
+            handler?(.firstFrame(stage.plan, degraded: degraded))
+        }
+        stageFrames += 1
+        if stageFrames % Self.budgetWindow == 0, timingLines < Self.timingLinesPerStage {
+            timingLines += 1
+            EngineLog.emit("[Upscale] timing: " + windowMean.logLine(frames: recentTimes.count, intervalMs: frameInterval * 1000),
+                           category: .swPlayback)
         }
         let budgetMs = Self.budgetFraction * frameInterval * 1000
-        if recentMs.count == Self.budgetWindow {
-            let windowMean = recentMs.reduce(0, +) / Double(recentMs.count)
-            if windowMean > budgetMs {
-                disable(reason: String(format: "over budget, %.2f ms mean over %d frames against %.2f ms",
-                                       windowMean, Self.budgetWindow, budgetMs))
+        if recentTimes.count == Self.budgetWindow, windowMean.total > budgetMs {
+            let over = String(format: "%.2f ms mean over %d frames against %.2f ms",
+                              windowMean.total, Self.budgetWindow, budgetMs)
+            if !degraded, stage.plan.mlScale != nil, stage.plan.needsMetalFX {
+                degrade(over: over, window: windowMean)
+            } else {
+                disable(reason: "over budget, " + over)
             }
         }
+    }
+
+    /// The first rung of the overrun ladder: keep ML, drop MetalFX, start a fresh budget window.
+    private func degrade(over: String, window: StageTimes) {
+        guard let plan = stage.dropMetalFX() else {
+            disable(reason: "over budget, " + over)
+            return
+        }
+        degraded = true
+        recentTimes.removeAll()
+        stageFrames = 0
+        timingLines = 0
+        let reason = "over budget, " + over
+        stateLock.lock()
+        _isDegraded = true
+        _deliveredPlan = plan
+        let stats = _stats
+        let handler = _onEvent
+        stateLock.unlock()
+        EngineLog.emit("[Upscale] degraded: over budget (\(over)), dropping MetalFX, ML only to "
+                       + "\(plan.targetWidth)x\(plan.targetHeight) (\(window.breakdown))", category: .swPlayback)
+        handler?(.degraded(plan, reason: reason, stats: stats))
     }
 
     private func recordFailure(_ error: Error) {
@@ -310,7 +389,8 @@ final class FrameUpscaler: @unchecked Sendable {
         let handler = _onEvent
         stateLock.unlock()
         EngineLog.emit(String(format: "[Upscale] disabled: %@ (frames %d, failures %d, mean %.2f ms, max %.2f ms)",
-                              reason, stats.framesUpscaled, stats.failures, stats.meanMs, stats.maxMs),
+                              reason, stats.framesUpscaled, stats.failures, stats.meanMs, stats.maxMs)
+                       + (stats.framesUpscaled > 0 ? " (\(stats.stageMeanMs.breakdown))" : ""),
                        category: .swPlayback)
         handler?(.disabled(reason: reason, stats: stats))
         stage.release()
@@ -406,12 +486,14 @@ private final class GPU {
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 private final class Stage {
-    let plan: UpscalePlan
+    private(set) var plan: UpscalePlan
     private let gpu: GPU
     private let ml: MLScaler?
-    private let scaler: MTLFXSpatialScaler?
-    private let rgba: MTLTexture?
-    private let scaled: MTLTexture?
+    private var scaler: MTLFXSpatialScaler?
+    private var rgba: MTLTexture?
+    private var scaled: MTLTexture?
+    /// Set on the ML-only rung: the output is the coded picture times the ML factor, not square.
+    private var sourcePAR: (Int, Int)?
     private var outputPools: [OSType: CVPixelBufferPool] = [:]
     private var cropPools: [OSType: CVPixelBufferPool] = [:]
 
@@ -421,10 +503,17 @@ private final class Stage {
         kCVImageBufferDisplayDimensionsKey as String,
     ]
 
-    init(plan: UpscalePlan, gpu: GPU) throws {
+    /// `mlOnly` builds the degraded rung of `plan`: its ML pass, delivered at the ML output size.
+    init(plan: UpscalePlan, gpu: GPU, mlOnly: Bool = false) throws {
         self.plan = plan
         self.gpu = gpu
         ml = try plan.mlScale.map { try MLScaler(width: plan.sourceWidth, height: plan.sourceHeight, scale: $0) }
+        if mlOnly, let ml {
+            self.plan = Self.mlOnlyPlan(plan, ml: ml)
+            sourcePAR = Self.pixelAspect(of: plan)
+            scaler = nil; rgba = nil; scaled = nil
+            return
+        }
 
         let inW = ml?.outputWidth ?? plan.sourceWidth
         let inH = ml?.outputHeight ?? plan.sourceHeight
@@ -472,8 +561,37 @@ private final class Stage {
 
     var abandonedMLPasses: Int { ml?.abandonedCount ?? 0 }
 
+    /// Switches this stage to its ML-only rung between two frames; nil when it has no ML or no MetalFX.
+    func dropMetalFX() -> UpscalePlan? {
+        guard let ml, scaler != nil else { return nil }
+        sourcePAR = Self.pixelAspect(of: plan)
+        plan = Self.mlOnlyPlan(plan, ml: ml)
+        scaler = nil; rgba = nil; scaled = nil
+        outputPools.removeAll()
+        return plan
+    }
+
+    private static func mlOnlyPlan(_ plan: UpscalePlan, ml: MLScaler) -> UpscalePlan {
+        var p = plan
+        p.mlOutputWidth = ml.outputWidth
+        p.mlOutputHeight = ml.outputHeight
+        p.targetWidth = ml.outputWidth
+        p.targetHeight = ml.outputHeight
+        return p
+    }
+
+    /// The pixel aspect the full plan's target implies for the coded source (8:9 for 720x480 -> 2880x2160).
+    private static func pixelAspect(of plan: UpscalePlan) -> (Int, Int) {
+        let num = plan.targetWidth * plan.sourceHeight, den = plan.targetHeight * plan.sourceWidth
+        guard num > 0, den > 0 else { return (1, 1) }
+        var a = num, b = den
+        while b != 0 { (a, b) = (b, a % b) }
+        return (num / a, den / a)
+    }
+
     func process(_ original: CVPixelBuffer, picture: FrameUpscaler.PictureRegion, frameIndex: Int64,
-                 mlTimeout: Double, submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
+                 mlTimeout: Double, submit: FrameUpscaler.MLSubmit?,
+                 times: inout FrameUpscaler.StageTimes) throws -> CVPixelBuffer {
         let format = CVPixelBufferGetPixelFormatType(original)
         let color = UpscaleColorParams(videoRange: format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
                                        matrix: UpscaleMatrix.of(original))
@@ -481,16 +599,19 @@ private final class Stage {
         if picture.width == CVPixelBufferGetWidth(original) && picture.height == CVPixelBufferGetHeight(original) {
             input = original
         } else {
+            let t0 = DispatchTime.now().uptimeNanoseconds
             if cropPools[format] == nil {
                 cropPools[format] = try makePool(width: picture.width, height: picture.height, format: format)
             }
             input = try pooledBuffer(cropPools[format]!)
             try copyPlanes(from: original, to: input, origin: (picture.x, picture.y))
+            times.copy += elapsedMs(since: t0)
         }
-        let mlOut = try ml?.process(input, frameIndex: frameIndex, timeout: mlTimeout, submit: submit)
+        let mlOut = try ml?.process(input, frameIndex: frameIndex, timeout: mlTimeout, submit: submit, times: &times)
         let output: CVPixelBuffer
 
         if let scaler, let rgba, let scaled {
+            let t0 = DispatchTime.now().uptimeNanoseconds
             output = try makeOutput(format: format, width: plan.targetWidth, height: plan.targetHeight)
             let source = mlOut ?? input
             // The ML pass carries sample values through unchanged, so its output keeps the input's range.
@@ -512,6 +633,8 @@ private final class Stage {
             cb.waitUntilCompleted()
             withExtendedLifetime((sy.1, sc.1, oy.1, oc.1)) {}
             CVMetalTextureCacheFlush(gpu.textureCache, 0)
+            times.metal = elapsedMs(since: t0)
+            times.metalGPU = max(0, (cb.gpuEndTime - cb.gpuStartTime) * 1000)
             guard cb.status == .completed else {
                 throw UpscaleError("command buffer \(cb.status.rawValue): \(cb.error.map { "\($0)" } ?? "no error")",
                                    underlying: cb.error)
@@ -520,22 +643,34 @@ private final class Stage {
             if CVPixelBufferGetPixelFormatType(mlOut) == format {
                 output = mlOut
             } else {
+                let t0 = DispatchTime.now().uptimeNanoseconds
                 output = try makeOutput(format: format, width: CVPixelBufferGetWidth(mlOut), height: CVPixelBufferGetHeight(mlOut))
                 try copyPlanes(from: mlOut, to: output)
+                times.copy += elapsedMs(since: t0)
             }
         } else {
             throw UpscaleError("plan has no stage")
         }
 
+        let t0 = DispatchTime.now().uptimeNanoseconds
         CVBufferRemoveAllAttachments(output)
         if let attachments = CVBufferCopyAttachments(original, .shouldPropagate) as? [String: Any] {
             // Geometry and field keys describe the input buffer, not this one.
             let carried = attachments.filter { !Self.droppedAttachmentKeys.contains($0.key) }
             CVBufferSetAttachments(output, carried as CFDictionary, .shouldPropagate)
         }
-        let square: [String: Int] = [kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: 1,
-                                     kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: 1]
-        CVBufferSetAttachment(output, kCVImageBufferPixelAspectRatioKey, square as CFDictionary, .shouldPropagate)
+        if let sourcePAR {
+            // The ML-only rung keeps the source's pixel shape: the decoder's tag, else the plan's.
+            let par = CVBufferCopyAttachment(original, kCVImageBufferPixelAspectRatioKey, nil)
+                ?? ([kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: sourcePAR.0,
+                     kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: sourcePAR.1] as CFDictionary)
+            CVBufferSetAttachment(output, kCVImageBufferPixelAspectRatioKey, par, .shouldPropagate)
+        } else {
+            let square: [String: Int] = [kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String: 1,
+                                         kCVImageBufferPixelAspectRatioVerticalSpacingKey as String: 1]
+            CVBufferSetAttachment(output, kCVImageBufferPixelAspectRatioKey, square as CFDictionary, .shouldPropagate)
+        }
+        times.attach = elapsedMs(since: t0)
         return output
     }
 
@@ -589,10 +724,10 @@ private final class MLScaler {
     }
 
     func process(_ input: CVPixelBuffer, frameIndex: Int64, timeout: Double,
-                 submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
+                 submit: FrameUpscaler.MLSubmit?, times: inout FrameUpscaler.StageTimes) throws -> CVPixelBuffer {
         if !copiesInput, CVPixelBufferGetPixelFormatType(input) == sourceFormat, CVPixelBufferGetIOSurface(input) != nil {
             do {
-                return try run(input, frameIndex: frameIndex, timeout: timeout, submit: submit)
+                return try run(input, frameIndex: frameIndex, timeout: timeout, submit: submit, times: &times)
             } catch let error as MLTimeout {
                 throw error
             } catch where FrameUpscaler.isBackgroundRefusal(error) {
@@ -603,13 +738,18 @@ private final class MLScaler {
                                category: .swPlayback)
             }
         }
+        let t0 = DispatchTime.now().uptimeNanoseconds
         let copy = try pooledBuffer(sourcePool)
         try copyPlanes(from: input, to: copy)
-        return try run(copy, frameIndex: frameIndex, timeout: timeout, submit: submit)
+        times.copy += elapsedMs(since: t0)
+        return try run(copy, frameIndex: frameIndex, timeout: timeout, submit: submit, times: &times)
     }
 
     private func run(_ source: CVPixelBuffer, frameIndex: Int64, timeout: Double,
-                     submit: FrameUpscaler.MLSubmit?) throws -> CVPixelBuffer {
+                     submit: FrameUpscaler.MLSubmit?, times: inout FrameUpscaler.StageTimes) throws -> CVPixelBuffer {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        var mlTimed = false
+        defer { if !mlTimed { times.ml += elapsedMs(since: t0) } }
         let destination = try pooledBuffer(destinationPool)
         let pts = CMTime(value: frameIndex, timescale: 600)
         guard let sf = VTFrameProcessorFrame(buffer: source, presentationTimeStamp: pts),
@@ -630,7 +770,11 @@ private final class MLScaler {
             throw MLTimeout(seconds: timeout, outstanding: abandoned.count)
         }
         if let error = result { throw error }
+        times.ml += elapsedMs(since: t0)
+        mlTimed = true
+        let t1 = DispatchTime.now().uptimeNanoseconds
         try clampBorder(destination, luma: mlBorderClamp)
+        times.clamp = elapsedMs(since: t1)
         return destination
     }
 }
@@ -666,6 +810,10 @@ private func clampBorder(_ buffer: CVPixelBuffer, luma k: Int) throws {
             }
         }
     }
+}
+
+private func elapsedMs(since start: UInt64) -> Double {
+    Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
 }
 
 private struct UncheckedSendable<Value>: @unchecked Sendable {

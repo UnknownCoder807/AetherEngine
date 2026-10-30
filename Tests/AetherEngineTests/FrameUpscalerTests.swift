@@ -215,6 +215,87 @@ struct FrameUpscalerTests {
         #expect(up.upscale(try TestFrames.nv12(720, 480)) != nil)
     }
 
+    /// The ladder: an over-budget ML + MetalFX stage first drops MetalFX and delivers the clamped ML output
+    /// at its own size with the source's pixel aspect; only the ML-only stage tripping again disables.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func ladderDropsMetalFXBeforeDisabling() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: [2]), frameInterval: 0.0001)
+        let events = EventLog()
+        up.onEvent = { events.add($0) }
+        let input = try TestFrames.nv12(720, 480, par: (8, 9))
+        for _ in 0..<FrameUpscaler.budgetWindow {
+            let out = try #require(up.upscale(input))
+            #expect(CVPixelBufferGetWidth(out) == 2880 && CVPixelBufferGetHeight(out) == 2160)
+        }
+        #expect(!up.isDisabled && up.isDegraded)
+        #expect(up.plan.targetWidth == 1440 && up.plan.targetHeight == 960 && !up.plan.needsMetalFX)
+        let degraded = events.all.compactMap { e -> UpscalePlan? in
+            if case let .degraded(p, _, _) = e { return p }; return nil
+        }
+        #expect(degraded.map(\.targetWidth) == [1440] && degraded.map(\.targetHeight) == [960])
+
+        for i in 0..<(FrameUpscaler.budgetWindow - 1) {
+            let out = try #require(up.upscale(input), "frame \(i)")
+            #expect(CVPixelBufferGetWidth(out) == 1440 && CVPixelBufferGetHeight(out) == 960)
+            let par = try #require(CVBufferCopyAttachment(out, kCVImageBufferPixelAspectRatioKey, nil) as? [String: Any])
+            #expect(par[kCVImageBufferPixelAspectRatioHorizontalSpacingKey as String] as? Int == 8)
+            #expect(par[kCVImageBufferPixelAspectRatioVerticalSpacingKey as String] as? Int == 9)
+            #expect(!up.isDisabled)
+        }
+        _ = up.upscale(input)
+        #expect(up.isDisabled)
+        #expect(up.upscale(input) == nil)
+        if case .disabled = events.all.last {} else { Issue.record("last event \(String(describing: events.all.last))") }
+    }
+
+    /// A degraded stage stays ML only when another input size rebuilds it, and republishes as degraded.
+    @Test(.enabled(if: UpscalerGate.mlAvailable))
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func degradedStageStaysMLOnlyAcrossARebuild() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: [2]), frameInterval: 0.0001)
+        let events = EventLog()
+        up.onEvent = { events.add($0) }
+        let sd = try TestFrames.nv12(720, 480, par: (8, 9))
+        for _ in 0..<FrameUpscaler.budgetWindow { _ = up.upscale(sd) }
+        try #require(up.isDegraded && !up.isDisabled)
+        let other = try TestFrames.nv12(640, 360)
+        guard FrameUpscaler.mlScaleFactors(640, 360).contains(where: { $0 > 1 }) else { return }
+        let out = try #require(up.upscale(other))
+        #expect(!up.plan.needsMetalFX && up.plan.sourceWidth == 640)
+        #expect(CVPixelBufferGetWidth(out) == up.plan.targetWidth && CVPixelBufferGetHeight(out) == up.plan.targetHeight)
+        #expect(CVPixelBufferGetWidth(out) < 3840)
+        if case let .firstFrame(p, degraded) = events.all.last {
+            #expect(degraded && p.sourceWidth == 640)
+        } else { Issue.record("last event \(String(describing: events.all.last))") }
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func metalFXOnlyStillDisablesDirectly() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: []), frameInterval: 0.0001)
+        let input = try TestFrames.nv12(720, 480, par: (8, 9))
+        for _ in 0..<FrameUpscaler.budgetWindow { _ = up.upscale(input) }
+        #expect(up.isDisabled && !up.isDegraded)
+    }
+
+    @Test
+    @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
+    func timingBreakdownIsRecorded() throws {
+        let up = try upscaler(try plan(720, 480, sar: (8, 9), ml: FrameUpscaler.mlScaleFactors(720, 480)))
+        let input = try TestFrames.nv12(720, 480, par: (8, 9))
+        for _ in 0..<FrameUpscaler.budgetWindow { _ = try #require(up.upscale(input)) }
+        let t = up.stats.stageMeanMs
+        for (name, v) in [("copy", t.copy), ("ml", t.ml), ("clamp", t.clamp), ("metal", t.metal),
+                          ("metalGPU", t.metalGPU), ("attach", t.attach)] {
+            #expect(v >= 0, "\(name) \(v)")
+        }
+        #expect(t.total > 0 && t.metal > 0)
+        let sum = t.copy + t.ml + t.clamp + t.metal + t.attach
+        #expect(abs(t.total - sum) <= max(1, 0.2 * t.total), "total \(t.total) vs sum \(sum)")
+        print("[FrameUpscalerTests] \(t.logLine(frames: FrameUpscaler.budgetWindow, intervalMs: 1000.0 / 24))")
+    }
+
     @Test
     @available(macOS 26, iOS 26, tvOS 26, visionOS 26, *)
     func budgetGuardDisablesAfterSustainedOverrun() throws {
@@ -366,7 +447,7 @@ struct FrameUpscalerTests {
         up.onEvent = { events.add($0) }
         for _ in 0..<3 { _ = try #require(up.upscale(try TestFrames.nv12(720, 480, par: (8, 9)))) }
         for _ in 0..<3 { _ = try #require(up.upscale(try TestFrames.nv12(704, 576))) }
-        let plans = events.all.compactMap { e -> UpscalePlan? in if case let .firstFrame(p) = e { return p }; return nil }
+        let plans = events.all.compactMap { e -> UpscalePlan? in if case let .firstFrame(p, _) = e { return p }; return nil }
         try #require(plans.count == 2)
         #expect(plans.map(\.sourceWidth) == [720, 704] && plans.map(\.sourceHeight) == [480, 576])
         let status = UpscaleStatus.afterFirstFrame(plans[1], current: UpscaleStatus.afterFirstFrame(plans[0], current: nil))
