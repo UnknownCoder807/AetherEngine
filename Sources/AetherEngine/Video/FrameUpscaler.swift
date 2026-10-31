@@ -563,7 +563,8 @@ private final class Stage {
     private(set) var plan: UpscalePlan
     private let gpu: GPU
     private let ml: MLScaler?
-    private var scaler: MTLFXSpatialScaler?
+    // Capture the scaler only after its OS availability check; the stage also supports ML-only plans.
+    private var encodeSpatialScale: ((MTLCommandBuffer) -> Void)?
     private var rgba: MTLTexture?
     private var scaled: MTLTexture?
     /// Set on the ML-only rung: the output is the coded picture times the ML factor, not square.
@@ -585,7 +586,7 @@ private final class Stage {
         if mlOnly, let ml {
             self.plan = Self.mlOnlyPlan(plan, ml: ml)
             sourcePAR = Self.pixelAspect(of: plan)
-            scaler = nil; rgba = nil; scaled = nil
+            encodeSpatialScale = nil; rgba = nil; scaled = nil
             return
         }
 
@@ -593,8 +594,11 @@ private final class Stage {
         let inH = ml?.outputHeight ?? plan.sourceHeight
         guard inW != plan.targetWidth || inH != plan.targetHeight else {
             guard ml != nil else { throw UpscaleError("plan scales nothing") }
-            scaler = nil; rgba = nil; scaled = nil
+            encodeSpatialScale = nil; rgba = nil; scaled = nil
             return
+        }
+        guard #available(tvOS 27.1, *) else {
+            throw UpscaleError("MetalFX spatial scaling requires tvOS 27.1 or newer")
         }
         guard MTLFXSpatialScalerDescriptor.supportsDevice(gpu.device) else {
             throw UpscaleError("MetalFX spatial scaling unsupported")
@@ -624,7 +628,9 @@ private final class Stage {
         scaler.outputTexture = scaled
         scaler.inputContentWidth = inW
         scaler.inputContentHeight = inH
-        self.scaler = scaler
+        self.encodeSpatialScale = { commandBuffer in
+            scaler.encode(commandBuffer: commandBuffer)
+        }
         self.rgba = rgba
         self.scaled = scaled
     }
@@ -637,10 +643,10 @@ private final class Stage {
 
     /// Switches this stage to its ML-only rung between two frames; nil when it has no ML or no MetalFX.
     func dropMetalFX() -> UpscalePlan? {
-        guard let ml, scaler != nil else { return nil }
+        guard let ml, encodeSpatialScale != nil else { return nil }
         sourcePAR = Self.pixelAspect(of: plan)
         plan = Self.mlOnlyPlan(plan, ml: ml)
-        scaler = nil; rgba = nil; scaled = nil
+        encodeSpatialScale = nil; rgba = nil; scaled = nil
         outputPools.removeAll()
         return plan
     }
@@ -684,7 +690,7 @@ private final class Stage {
         let mlOut = try ml?.process(input, frameIndex: frameIndex, timeout: mlTimeout, submit: submit, times: &times)
         let output: CVPixelBuffer
 
-        if let scaler, let rgba, let scaled {
+        if let encodeSpatialScale, let rgba, let scaled {
             let t0 = DispatchTime.now().uptimeNanoseconds
             output = try makeOutput(format: format, width: plan.targetWidth, height: plan.targetHeight)
             let source = mlOut ?? input
@@ -698,7 +704,7 @@ private final class Stage {
             gpu.dispatch(enc, gpu.toRGBA, textures: [sy.0, sc.0, rgba], color: color,
                          grid: (rgba.width, rgba.height))
             enc.endEncoding()
-            scaler.encode(commandBuffer: cb)
+            encodeSpatialScale(cb)
             guard let enc2 = cb.makeComputeCommandEncoder() else { throw UpscaleError("no encoder") }
             gpu.dispatch(enc2, gpu.toNV12, textures: [scaled, oy.0, oc.0], color: color,
                          grid: (scaled.width / 2, scaled.height / 2))

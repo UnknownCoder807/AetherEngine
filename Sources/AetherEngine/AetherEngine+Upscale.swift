@@ -34,7 +34,7 @@ extension AetherEngine {
         var osSupportsStage = false
         var metalFXSupported = false
         var mlScaleFactors: (Int, Int) -> [Float] = { _, _ in [] }
-        if #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) {
+        if #available(tvOS 27.1, iOS 26, macOS 26, visionOS 26, *) {
             osSupportsStage = true
             // The stage is not built for the simulator, which therefore counts as a device without it.
             #if !targetEnvironment(simulator)
