@@ -544,6 +544,24 @@ public struct LoadOptions: Sendable, Equatable {
     /// A tuning field, with the same fresh-load rule for a custom source as `preferDualLayerDolbyVision`.
     public var dualLayerRoute: DualLayerRoute = .softwareHost
 
+    /// Whether a Profile 7 FEL source on the native route gets its enhancement-layer luma residual folded
+    /// into the Profile 8.1 RPU's luma curve per scene (AE#988, the `DolbyVisionFelCurves` package trait).
+    /// Default true, which is the behaviour of every build with the trait. False keeps the plain mode 2
+    /// conversion: no GOP held back between demuxer and segmenter, no base- and enhancement-layer decode
+    /// per scene, so a start or a seek is as fast as on a build without the trait (AE#1018 measured a
+    /// resume 0.5 to 4 s faster on an Apple TV 4K). Use it to turn the fold off for a title a viewer
+    /// reports, or to compare the two on one build.
+    ///
+    /// Independent of this field, the fold pauses on its own where its RPU cannot reach the picture: on tvOS,
+    /// at a display without Dolby Vision whose panel presents HDR10 (predicted at load, see AE#1018), off the
+    /// `forceDolbyVisionOnNonDVDisplay` route (measured: tvOS hands such a panel the base layer). A Mac, a
+    /// panel in SDR and the Profile 5 route all apply the RPU, so the fold stays on there.
+    ///
+    /// Without the `DolbyVisionFelCurves` trait this field is ignored, like `preferDualLayerDolbyVision`
+    /// without `DualLayerDolbyVision`. A tuning field: `reloadAtCurrentPosition(applying:)` carries a
+    /// change, and every producer the session builds afterwards (seek, revive) reads the new value.
+    public var foldsDolbyVisionFEL: Bool = true
+
     /// Opt in to upscaling SDR video below 1080p (coded width under 1920 and height under 1080) to the
     /// display's native pixel size (#846). Such a source routes through `SoftwarePlaybackHost`, where every
     /// decoded frame runs VideoToolbox low-latency super resolution where the device and frame size allow
@@ -558,6 +576,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
     /// in place, and turning it on is refused with `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`.
     public var upscalesLowResolutionVideo: Bool = false
+
+    /// Which scaler the upscale stage runs when `upscalesLowResolutionVideo` is on (AE#1039). `.automatic`
+    /// (the default) is the route described there. `.lineArt` replaces it with a 2x line-art network
+    /// (Anime4K Upscale CNN S) made for animation, and widens the route to 1080p sources and 10-bit SDR.
+    /// It suits drawn content only, so a host sets it per title (from the genre, or a per-show switch).
+    /// Ignored while `upscalesLowResolutionVideo` is off. A tuning field like it.
+    public var upscaleScaler: UpscaleScaler = .automatic
 
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
@@ -662,6 +687,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// Opt in to strict software DVR storage bounds and runtime capacity leases.
     /// Nil preserves the default spool behavior.
     public var softwareDVRRetention: SoftwareDVRRetentionOptions? = nil
+
+    /// Disk budget in bytes for the software live DVR ring. Nil keeps the default (a quarter of the free
+    /// space, at most 2 GiB). An explicit value replaces the 2 GiB cap and is still clamped to a quarter of
+    /// the free space the other sessions have not claimed, with the 64 MiB playback floor. For a window
+    /// that has to hold hours of broadcast: 2 GiB is about 50 minutes of 5.7 Mbps MPEG-2. Ignored unless
+    /// `isLive` and `dvrWindowSeconds` are set and the session routes to software.
+    public var liveDVRByteBudget: Int? = nil
 
     /// LL-HLS blocking-reload (`#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD`) override for live loopback sessions.
     /// nil (default) = auto: for a `LiveIngestSourceInfo` custom reader the engine derives eligibility from
@@ -1130,7 +1162,9 @@ public struct LoadOptions: Sendable, Equatable {
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         preferDualLayerDolbyVision: Bool = false,
         dualLayerRoute: DualLayerRoute = .softwareHost,
+        foldsDolbyVisionFEL: Bool = true,
         upscalesLowResolutionVideo: Bool = false,
+        upscaleScaler: UpscaleScaler = .automatic,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
@@ -1195,7 +1229,9 @@ public struct LoadOptions: Sendable, Equatable {
         self.dolbyVisionHandling = dolbyVisionHandling
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.dualLayerRoute = dualLayerRoute
+        self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
+        self.upscaleScaler = upscaleScaler
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
@@ -1294,6 +1330,18 @@ public struct SourceProbe: Sendable {
     public let isDolbyVision: Bool
     /// Dolby Vision profile number (5, 7, 8, 10) read from the dvcC/dvvC configuration record; nil when not DV.
     public let dvProfile: Int?
+    /// Base-layer signal compatibility id from the same dvcC/dvvC record as `dvProfile` (AE#1032): 1 = HDR10
+    /// base, 2 = SDR, 4 = HLG, 6 = Blu-ray HDR10 (Profile 7), 0 = no compatible base layer. nil without a
+    /// record. The same value a loaded session publishes as `sourceDVBLCompatID`.
+    public let dvBLCompatID: Int?
+    /// Container libavformat opened ("matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2", "mpegts"), read from what
+    /// the bytes are, not from the file extension (AE#1032). The same string a loaded session publishes as
+    /// `sourceContainerFormat`. nil when libavformat reports no name.
+    public let containerFormat: String?
+    /// Selectable titles of a disc image or disc folder, longest first so id 0 is the main feature
+    /// (AE#1032). Empty for a source that is no disc. The same list a loaded session publishes as
+    /// `discTitles`, so an id from here is valid for `load(..., discTitleID:)`.
+    public let discTitles: [TitleInfo]
     /// AE#658: pixel format, bit depth, colour description and profile of the video stream; nil when
     /// the source has no video.
     public let videoStreamFormat: VideoStreamFormat?
@@ -1314,6 +1362,12 @@ public struct SourceProbe: Sendable {
     /// `.hlg` / `.hdr10`. Apple platforms do not apply the dynamic metadata; the flag exists so a host can
     /// label the source.
     public internal(set) var carriesHDRVividMetadata: Bool
+    /// The enhancement layer of a single-track Dolby Vision Profile 7 source, read from its first RPU
+    /// (AE#1030). Always nil unless the probe was asked for `.dolbyVisionEnhancementLayer`, and nil also
+    /// when `dvProfile` is not 7 or no RPU turned up inside the scan budget, so nil never means "MEL" or
+    /// "no enhancement layer". An enhancement layer on its own track or PID is out of scope, as it is
+    /// for `AetherEngine.probeDolbyVisionEnhancementLayer(url:options:)`.
+    public internal(set) var dolbyVisionEnhancementLayer: DolbyVisionEnhancementLayer?
     /// Settable inside the module so `probeDetectingAtmos` can enrich one track without rebuilding the struct field by field.
     public internal(set) var audioTracks: [TrackInfo]
     /// Includes both text and bitmap (PGS / DVB) variants.
@@ -1333,8 +1387,12 @@ public struct SourceProbe: Sendable {
         videoFrameRate: Double?,
         isDolbyVision: Bool,
         dvProfile: Int? = nil,
+        dvBLCompatID: Int? = nil,
+        containerFormat: String? = nil,
+        discTitles: [TitleInfo] = [],
         carriesHDR10PlusMetadata: Bool = false,
         carriesHDRVividMetadata: Bool = false,
+        dolbyVisionEnhancementLayer: DolbyVisionEnhancementLayer? = nil,
         audioTracks: [TrackInfo],
         subtitleTracks: [TrackInfo],
         metadata: MediaMetadata = MediaMetadata(title: nil, artist: nil, album: nil, artworkData: nil),
@@ -1352,8 +1410,12 @@ public struct SourceProbe: Sendable {
         self.videoFrameRate = videoFrameRate
         self.isDolbyVision = isDolbyVision
         self.dvProfile = dvProfile
+        self.dvBLCompatID = dvBLCompatID
+        self.containerFormat = containerFormat
+        self.discTitles = discTitles
         self.carriesHDR10PlusMetadata = carriesHDR10PlusMetadata
         self.carriesHDRVividMetadata = carriesHDRVividMetadata
+        self.dolbyVisionEnhancementLayer = dolbyVisionEnhancementLayer
         self.audioTracks = audioTracks
         self.subtitleTracks = subtitleTracks
         self.metadata = metadata
@@ -1422,6 +1484,18 @@ public struct SoftwareDecodeProbeResult: Sendable {
 }
 
 /// Audio or subtitle track metadata.
+/// AE#1035: a probe's answer to "is this TrueHD track Atmos", read from the track's own major sync rather
+/// than from libavcodec's profile, which stays unknown for a track the header probe never decoded.
+public enum TrueHDAtmosVerdict: Sendable, Equatable {
+    /// The major sync declares the Atmos presentation (four substreams, the 16-channel presentation bit).
+    case atmos
+    /// A major sync was read and declares no Atmos presentation.
+    case noAtmos
+    /// No major sync of the track turned up within `AtmosDetectionOptions`, or the source could not be read
+    /// there. Says nothing either way.
+    case unsettled
+}
+
 public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// FFmpeg AVStream index.
     public let id: Int
@@ -1477,7 +1551,13 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     public let channelLayout: String?
     /// AE#658: codec profile as libavcodec names it ("LC", "DTS-HD MA + DTS:X", "Dolby TrueHD + Dolby Atmos"),
     /// nil when undeclared. This is where DTS:X and TrueHD Atmos show up; `isAtmos` covers E-AC-3 JOC only.
-    public let profile: String?
+    /// Settable inside the module so a probe's `.atmos` pass can name TrueHD Atmos it read from the major sync.
+    public internal(set) var profile: String?
+
+    /// AE#1035, TrueHD only: what a probe's `.atmos` pass read from the track's first major sync. nil when
+    /// that pass did not run for this track (not requested, not the targeted track, not TrueHD, or a session's
+    /// track list). `.atmos` also sets `profile` to "Dolby TrueHD + Dolby Atmos".
+    public internal(set) var trueHDAtmos: TrueHDAtmosVerdict?
 
     public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isVisualImpaired: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false) {
         self.sampleRate = sampleRate
@@ -1817,6 +1897,16 @@ func makeResamplerOutputLayout(_ channels: Int32, into layout: inout AVChannelLa
     av_channel_layout_default(&layout, channels)
 }
 
+/// The scaler the upscale stage runs (`LoadOptions.upscaleScaler`, AE#1039).
+public enum UpscaleScaler: Sendable, Hashable {
+    /// VideoToolbox low-latency super resolution where the device and frame size allow it, then MetalFX
+    /// spatial scaling to the target. SDR 8-bit below 1080p.
+    case automatic
+    /// A 2x line-art network for animation (Anime4K Upscale CNN S, half precision), then a bilinear
+    /// resample to the target where 2x does not land on it. SDR 8 or 10-bit 4:2:0 up to 1920x1080.
+    case lineArt
+}
+
 /// What the low-resolution upscale stage is doing for the current session (#846), published as
 /// `AetherEngine.activeUpscale` once the first upscaled frame is delivered, nil otherwise.
 public struct UpscaleStatus: Sendable, Equatable {
@@ -1832,9 +1922,12 @@ public struct UpscaleStatus: Sendable, Equatable {
     /// True once a sustained overrun made the stage drop MetalFX and deliver the VideoToolbox output at
     /// its own size (`targetSize`, carrying the source's pixel aspect). Kept when it later disables.
     public let degraded: Bool
+    /// The scaler the stage runs (`LoadOptions.upscaleScaler`).
+    public let scaler: UpscaleScaler
 
     init(plan: UpscalePlan, degraded: Bool = false, disabledReason: String? = nil) {
         sourceSize = CGSize(width: plan.sourceWidth, height: plan.sourceHeight)
+        scaler = plan.scaler
         mlScale = plan.mlScale
         targetSize = CGSize(width: plan.targetWidth, height: plan.targetHeight)
         self.degraded = degraded
@@ -1854,11 +1947,14 @@ public struct UpscaleStatus: Sendable, Equatable {
                       mlScale: current.map(\.mlScale) ?? plan.mlScale,
                       targetSize: current?.targetSize ?? CGSize(width: plan.targetWidth, height: plan.targetHeight),
                       degraded: current?.degraded ?? false,
+                      scaler: current?.scaler ?? plan.scaler,
                       disabledReason: reason)
     }
 
-    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, disabledReason: String?) {
+    private init(sourceSize: CGSize, mlScale: Float?, targetSize: CGSize, degraded: Bool, scaler: UpscaleScaler,
+                 disabledReason: String?) {
         self.sourceSize = sourceSize
+        self.scaler = scaler
         self.mlScale = mlScale
         self.targetSize = targetSize
         self.degraded = degraded
