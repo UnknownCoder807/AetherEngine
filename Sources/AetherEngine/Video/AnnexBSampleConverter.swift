@@ -119,11 +119,30 @@ enum AnnexBSampleConverter {
     /// buffer can be shared with another reference.
     static func convertToLengthPrefixed(_ packet: UnsafeMutablePointer<AVPacket>,
                                         orderHEVCParameterSets: Bool = false,
-                                        hvc1Configuration: HVC1Configuration? = nil) -> Bool {
+                                        hvc1Configuration: HVC1Configuration? = nil,
+                                        removeUHDPaddingCrop: Bool = false) -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
-        let source = UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))
-        var ranges = nalRanges(source)
-        guard !ranges.isEmpty else { return false }
+        let packetBytes = UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))
+        let packetRanges = nalRanges(packetBytes)
+        guard !packetRanges.isEmpty else { return false }
+        // An SPS that still carries the padding crop is replaced before anything compares or copies
+        // it, so the sample never reaches the decoder with the geometry the init segment dropped.
+        if removeUHDPaddingCrop,
+           let cropFree = HEVCConformanceCrop.removingUHDPaddingCrop(fromAnnexB: packetBytes, ranges: packetRanges) {
+            return cropFree.withUnsafeBytes { bytes in
+                write(packet, source: bytes, ranges: nalRanges(bytes),
+                      orderHEVCParameterSets: orderHEVCParameterSets, hvc1Configuration: hvc1Configuration)
+            }
+        }
+        return write(packet, source: packetBytes, ranges: packetRanges,
+                     orderHEVCParameterSets: orderHEVCParameterSets, hvc1Configuration: hvc1Configuration)
+    }
+
+    private static func write(_ packet: UnsafeMutablePointer<AVPacket>, source: UnsafeRawBufferPointer,
+                              ranges: [Range<Int>], orderHEVCParameterSets: Bool,
+                              hvc1Configuration: HVC1Configuration?) -> Bool {
+        guard let data = source.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+        var ranges = ranges
         hvc1Configuration?.omitRepeatedHeaders(&ranges, in: source)
         if orderHEVCParameterSets { orderHEVCHeaders(&ranges, in: source) }
         let total = ranges.reduce(0) { $0 + 4 + $1.count }
