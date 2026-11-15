@@ -724,7 +724,11 @@ final class MP4SegmentMuxer {
         // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
         // record declares. A packet with no start code is written as it came.
         if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
+            #if os(tvOS)
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet, orderHEVCParameterSets: true)
+            #else
             _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+            #endif
         }
 
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment

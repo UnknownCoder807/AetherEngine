@@ -47,16 +47,47 @@ enum AnnexBSampleConverter {
         return ranges
     }
 
+    /// Some TS encoders put timing SEI before the parameter sets it references. Move parameter sets
+    /// ahead of prefix SEI in the leading, single-layer HEVC headers. Preserve the delimiter, all
+    /// NAL payloads and the order within each group. Stop at a slice, another layer or any other NAL.
+    static func orderHEVCHeaders(_ ranges: inout [Range<Int>], in bytes: UnsafeRawBufferPointer) {
+        var firstSEI: Int?
+        var parameterSets: [Range<Int>] = []
+        var end = 0
+        for (index, range) in ranges.enumerated() {
+            guard range.count >= 2 else { break }
+            let first = bytes[range.lowerBound]
+            let second = bytes[range.lowerBound + 1]
+            // Base layer, valid temporal_id_plus1, forbidden_zero_bit clear.
+            guard first & 0x81 == 0, second & 0xf8 == 0, second & 7 != 0 else { break }
+            let type = first >> 1
+            if type == 35 && index == 0 { continue }
+            if type == 39 {
+                if firstSEI == nil { firstSEI = index }
+            } else if (32...34).contains(type) {
+                if firstSEI != nil { parameterSets.append(range) }
+            } else {
+                break
+            }
+            end = index + 1
+        }
+        guard let start = firstSEI, !parameterSets.isEmpty else { return }
+        let metadata = ranges[start..<end].filter { bytes[$0.lowerBound] >> 1 == 39 }
+        ranges.replaceSubrange(start..<end, with: parameterSets + metadata)
+    }
+
     /// Replace the packet's payload with its length-prefixed form. False when the payload holds no
     /// start code (the packet is left untouched) or the new buffer could not be allocated.
     ///
     /// The payload goes into a new buffer rather than being rewritten in place: a demuxed packet's
     /// buffer can be shared with another reference.
-    static func convertToLengthPrefixed(_ packet: UnsafeMutablePointer<AVPacket>) -> Bool {
+    static func convertToLengthPrefixed(_ packet: UnsafeMutablePointer<AVPacket>,
+                                        orderHEVCParameterSets: Bool = false) -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
         let source = UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))
-        let ranges = nalRanges(source)
+        var ranges = nalRanges(source)
         guard !ranges.isEmpty else { return false }
+        if orderHEVCParameterSets { orderHEVCHeaders(&ranges, in: source) }
         let total = ranges.reduce(0) { $0 + 4 + $1.count }
         guard total <= Int(Int32.max) else { return false }
 

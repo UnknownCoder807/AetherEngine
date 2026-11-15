@@ -24,13 +24,35 @@ struct AnnexBSampleConverterTests {
     }
 
     /// Run the packet-level conversion on a fresh packet holding `bytes`; nil when it declined.
-    private func convert(_ bytes: [UInt8]) -> [UInt8]? {
+    private func convert(_ bytes: [UInt8], orderHEVCParameterSets: Bool = false) -> [UInt8]? {
         var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
         defer { av_packet_free(&packet) }
         guard let pkt = packet, av_new_packet(pkt, Int32(bytes.count)) == 0 else { return nil }
         bytes.withUnsafeBytes { _ = memcpy(pkt.pointee.data, $0.baseAddress, bytes.count) }
-        guard AnnexBSampleConverter.convertToLengthPrefixed(pkt) else { return nil }
+        guard AnnexBSampleConverter.convertToLengthPrefixed(pkt, orderHEVCParameterSets: orderHEVCParameterSets) else { return nil }
         return Array(UnsafeBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
+    }
+
+    @Test("tvOS native remux keeps header payloads and preserves order within each group")
+    func ordersLeadingHeaders() {
+        let metadata: [UInt8] = [0x4e, 1, 5, 1, 0x55, 0x80]
+        let secondMetadata: [UInt8] = [0x4e, 1, 5, 1, 0x66, 0x80]
+        let input = [aud, vps, metadata, pps, secondMetadata, idr]
+        let expected = [aud, vps, pps, metadata, secondMetadata, idr]
+        let annexB: [UInt8] = input.flatMap { [0, 0, 1] + $0 }
+        #expect(convert(annexB, orderHEVCParameterSets: true) == lengthPrefixed(expected))
+        #expect(convert(annexB) == lengthPrefixed(input))
+    }
+
+    @Test("Parameter sets never move across a slice or another layer")
+    func respectsHeaderBoundaries() {
+        let metadata: [UInt8] = [0x4e, 1, 5, 1, 0x55, 0x80]
+        let otherLayer: [UInt8] = [0x4e, 9, 0x80]
+        for boundary in [idr, otherLayer, aud] {
+            let input = [metadata, boundary, pps]
+            let annexB: [UInt8] = input.flatMap { [0, 0, 1] + $0 }
+            #expect(convert(annexB, orderHEVCParameterSets: true) == lengthPrefixed(input))
+        }
     }
 
     @Test("Every NAL survives, parameter sets included, and start-code zero padding is dropped")
