@@ -34,12 +34,15 @@ AetherEngine is a video and audio player engine for iOS, tvOS, macOS and visionO
 
 ## Highlights
 
-- **Plays nearly everything:** MKV, MP4, WebM, MPEG-TS, AVI, WMV, DVD and Blu-ray ISOs, on-demand MPEG-DASH, and every codec FFmpeg knows. [Full list](docs/features.md)
-- **HDR done right:** HDR10, HDR10+, HLG, and Dolby Vision Profiles 5, 7, 8 and AV1 Profile 10, with the real display switch on Apple TV.
+- **Plays nearly everything:** MKV, MP4, WebM, MPEG-TS, AVI, WMV, DVD and Blu-ray ISOs and folders, on-demand MPEG-DASH, and every codec FFmpeg knows. [Full list](docs/features.md)
+- **HDR done right:** HDR10, HDR10+, HLG, and Dolby Vision Profiles 5, 7, 8, 20 (3D) and AV1 Profile 10. On Apple TV the TV really switches into the matching HDR mode.
 - **Dolby Atmos:** E-AC-3 Atmos is passed through untouched, to HDMI receivers and to AirPods with spatial audio.
-- **Lossless height channels from TrueHD and DTS:X** as an optional component.
+- **Lossless height channels from TrueHD and DTS:X** (the overhead speakers of a Blu-ray Atmos or DTS:X mix), as an optional component.
+- **Audio shaping:** dialogue lift, night mode and a loudness target for quiet films, all opt-in.
+- **Upscaling:** low-resolution SDR video scaled up to the display, with a line-art scaler for animation, opt-in.
+- **Tone mapping:** HDR10 titles brighter than the display mapped down to its peak by the engine instead of the TV, opt-in.
 - **Subtitles of every kind:** text, ASS, PGS, DVB, DVD, teletext, closed captions, external files, and subtitles that survive Picture in Picture and AirPlay.
-- **Live TV:** HLS ingest, DVR timeshift, recording over the same connection, and recovery when a channel breaks.
+- **Live TV:** the engine reads live HLS itself, with DVR timeshift (pause and rewind live TV), recording over the same connection, and recovery when a channel breaks.
 - **Any source:** URLs, your own byte reader (`IOReader`), and SMB shares.
 - **No UI, no analytics, no surprises.** Nothing leaves the device.
 
@@ -48,7 +51,7 @@ AetherEngine is a video and audio player engine for iOS, tvOS, macOS and visionO
 Add the package:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.64.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.68.0")
 ```
 
 Play a video:
@@ -57,17 +60,25 @@ Play a video:
 import AetherEngine
 import SwiftUI
 
-let player = try AetherEngine()
-
 struct PlayerView: View {
-    var body: some View { AetherPlayerSurface(engine: player) }
-}
+    // Create the engine once with `try AetherEngine()` and keep it for the app's lifetime.
+    let engine: AetherEngine
+    let url: URL
 
-try await player.load(url: videoURL)
-player.play()
+    var body: some View {
+        AetherPlayerSurface(engine: engine)
+            .task {
+                do {
+                    try await engine.load(url: url)   // starts playing on its own
+                } catch {
+                    print("Load failed: \(error)")
+                }
+            }
+    }
+}
 ```
 
-Read the state from the published properties (`player.$state`, `player.clock.$currentTime`, `player.audioTracks`, `player.$subtitleCues`, ...). The [host guide](docs/guide.md) walks through everything a real player needs, and [`Examples/MinimalPlayer`](Examples/MinimalPlayer/MinimalPlayerApp.swift) is a complete single-file player to copy.
+Read the state from the published properties (`engine.$state`, `engine.clock.$currentTime`, `engine.audioTracks`, `engine.$subtitleCues`, ...). The [host guide](docs/guide.md) walks through everything a real player needs, and [`Examples/MinimalPlayer`](Examples/MinimalPlayer/MinimalPlayerApp.swift) is a complete single-file player to copy.
 
 **On tvOS**, read [tvOS host setup](docs/guide.md#tvos-host-setup) before you ship HDR content.
 
@@ -77,12 +88,16 @@ Also available as a searchable site: **[aetherengine.superuser404.de](https://ae
 
 | Document | What is in it |
 | --- | --- |
-| [Installation](docs/installation.md) | Adding the package, requirements, optional components, versioning |
+| [Installation](docs/installation.md) | Adding the package, requirements, optional components, FFmpeg next to other players, versioning |
 | [Host guide](docs/guide.md) | Building a player: loading, state, tracks, subtitles, live TV, tvOS setup, logging |
 | [Features](docs/features.md) | What the engine plays and does, area by area |
 | [API reference](docs/api.md) | Every public API, and the contracts your app has to answer |
 | [Formats](docs/formats.md) | Codecs, containers, HDR, audio, subtitles, discs, known limits, in depth |
-| [Architecture](docs/architecture.md) | How the playback pipelines work, and which file does what |
+| [Architecture](docs/architecture.md) | How the playback pipelines fit together |
+| [Native path](docs/architecture-native.md) | The native (AVPlayer) path in depth |
+| [Software path](docs/architecture-software.md) | The software path in depth |
+| [Source map](docs/source-map.md) | Which source file does what |
+| [Measurements](docs/measurements.md) | Measurements and the evidence behind design decisions |
 | [Dolby Vision FEL](docs/dolby-vision-fel.md) | How Profile 7 FEL is played |
 | [aetherctl](docs/cli.md) | The command-line tool that runs the real engine on a Mac |
 | [How it compares](docs/comparison.md) | AetherEngine next to AVPlayer, KSPlayer, VLCKit and libmpv, with measurements |
@@ -91,24 +106,29 @@ Also available as a searchable site: **[aetherengine.superuser404.de](https://ae
 
 ## Requirements
 
-| | Min |
-| --- | --- |
-| iOS | 18.0 |
-| tvOS | 18.0 |
-| macOS | 15.0 |
-| visionOS | 1.0 |
-| Swift | 6.4 |
-| Xcode | 27.0 |
-
-Details on toolchains, CI and older OS versions: [Installation › Requirements](docs/installation.md#requirements).
+iOS 18, tvOS 18, macOS 15 and visionOS 1, built with Xcode 27 (Swift 6.4). Toolchains, CI and older OS versions: [Installation › Requirements](docs/installation.md#requirements).
 
 ## Optional components
 
-Five components are only built when you turn on their package trait: height channels from TrueHD (`TrueHDObjectAudio`) and DTS:X (`DTSXObjectAudio`), the Dolby Vision FEL curve fold (`DolbyVisionFelCurves`), the FEL dual-layer composer (`DualLayerDolbyVision`), and Dolby Vision stills (`DolbyVisionStillReshaping`). They may need third-party patent licences. How to turn them on and which FEL option to choose: [Installation › Optional components](docs/installation.md#optional-components).
+Five components are only built when you turn on their package trait (a build switch you set on the package dependency):
+
+- height channels from TrueHD (`TrueHDObjectAudio`) and DTS:X (`DTSXObjectAudio`)
+- the Dolby Vision FEL curve fold (`DolbyVisionFelCurves`) and the FEL dual-layer composer (`DualLayerDolbyVision`), two ways to play Profile 7 Blu-ray sources
+- Dolby Vision stills (`DolbyVisionStillReshaping`)
+
+They may need third-party patent licences. How to turn them on and which FEL option to choose: [Installation › Optional components](docs/installation.md#optional-components).
 
 ## How it compares
 
-AVPlayer has the best OS integration but plays only Apple's formats. VLCKit and libmpv play everything but bypass Apple's Dolby Vision, Atmos and HDR handling. AetherEngine combines both. Feature table and power, CPU and memory measurements: [How it compares](docs/comparison.md).
+AetherEngine combines the strengths of both usual choices. AVPlayer has the best OS integration but plays only Apple's formats. VLCKit and libmpv play everything but bypass Apple's Dolby Vision, Atmos and HDR handling. Feature table and power, CPU and memory measurements: [How it compares](docs/comparison.md).
+
+## Stability and versioning
+
+AetherEngine follows [Semantic Versioning](https://semver.org). Every `public` declaration in `Sources/AetherEngine/` is part of the contract: a major version breaks it, a minor version adds to it, a patch fixes bugs. Details: [Installation › Stability and versioning](docs/installation.md#stability-and-versioning).
+
+## License
+
+[LGPL-3.0 with an App Store exception](LICENSE): you can ship the engine in App Store apps, and changes to the engine itself stay LGPL. FFmpeg and the other dependencies keep their own licences. What you need to do: [Licensing](docs/licensing.md).
 
 ## Used by
 
@@ -126,7 +146,7 @@ AVPlayer has the best OS integration but plays only Apple's formats. VLCKit and 
 - [stashy](https://stashy.shelf.am/): iOS/tvOS native player for stash.
 - [Gflix](https://gflixhub.app/): A flawless media app for your media.
 - [Melon Video](https://apps.apple.com/ca/app/melon-video/id6811750997): Video Player for Vision Pro.
-- [WUW IPTV Player](https://apps.apple.com/tr/app/wuw-iptv-player-smart-m3u-tv/id6759220800): Watch U Want — or simply WUW — your IPTV player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro.
+- [WUW IPTV Player](https://apps.apple.com/tr/app/wuw-iptv-player-smart-m3u-tv/id6759220800): Watch U Want (WUW), an IPTV player for iPhone, iPad, Mac, Apple TV and Apple Vision Pro.
 - [GiVo Stream](https://givostreamapp.com): media player for iPhone, iPad and Apple TV with bring-your-own playlists, live timeshift, DVR and VOD.
 - [LillyPlayer](https://lillyplayer.com): The all-in-one IPTV and media player for Apple TV, iPhone and iPad (live TV, EPG, replay, Jellyfin, Plex, SMB...).
 - [Plozz](https://plozz.app): Free forever open source native app for iPhone, iPad, and Apple TV. Supports Jellyfin, Plex, Emby, Silo, IPTV, SMB, WebDAV and more.
@@ -140,14 +160,6 @@ AVPlayer has the best OS integration but plays only Apple's formats. VLCKit and 
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
-
-## Stability and versioning
-
-AetherEngine follows [Semantic Versioning](https://semver.org). Every `public` declaration in `Sources/AetherEngine/` is part of the contract: a major version breaks it, a minor version adds to it, a patch fixes bugs. Details: [Installation › Stability and versioning](docs/installation.md#stability-and-versioning).
-
-## License
-
-[LGPL-3.0 with an App Store exception](LICENSE): you can ship the engine in App Store apps, and changes to the engine itself stay LGPL. FFmpeg and the other dependencies keep their own licences. What you need to do: [Licensing](docs/licensing.md).
 
 ## Support
 

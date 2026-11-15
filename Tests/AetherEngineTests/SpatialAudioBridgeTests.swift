@@ -177,9 +177,9 @@ struct SpatialAudioBridgeTests {
             #expect(HLSVideoEngine.spatialRenderingLayout(rendering: on, codecID: AV_CODEC_ID_DTS, profile: profile, sampleRate: 48_000) == .l714)
             #expect(HLSVideoEngine.objectAudioSource(codecID: AV_CODEC_ID_DTS, profile: profile) == .dtsHDMasterAudio)
         }
-        // Only layouts that carry the 7.1 bed and the four heights one to one.
+        // Only into layouts that carry the 7.1 bed and the four heights one to one; a smaller one gets 7.1.4.
         for layout in SpatialSpeakerLayout.allCases {
-            let expected: SpatialSpeakerLayout? = layout == .l714 || layout == .l916 ? layout : nil
+            let expected: SpatialSpeakerLayout = layout == .l916 ? .l916 : .l714
             #expect(HLSVideoEngine.spatialRenderingLayout(
                 rendering: .apac(layout), codecID: AV_CODEC_ID_DTS, profile: AV_PROFILE_DTS_HD_MA_X,
                 sampleRate: 48_000) == expected, "\(layout.rawValue)")
@@ -518,7 +518,11 @@ struct SpatialAudioBridgeTests {
             Issue.record("the stand-in needs no parsed packet, so the cut completes")
             return nil
         }
-        return (try #require(initBytes), segment, sessionDir)
+        // Completed staging still belongs to the muxer until adopted. The fixture owns
+        // the moved file, just as SegmentCache.adopt does in a playback session.
+        let adopted = sessionDir.appendingPathComponent("probe.m4s")
+        try FileManager.default.moveItem(at: segment, to: adopted)
+        return (try #require(initBytes), adopted, sessionDir)
     }
 
     #endif

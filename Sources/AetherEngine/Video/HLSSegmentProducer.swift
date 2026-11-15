@@ -396,6 +396,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// #133 follow-up diag: count of same-PID in-band parameter-set changes rotated in place, surfaced in the log.
     private var samePIDReinitCount = 0
 
+    /// The AC-3 / E-AC-3 layout the current muxer's `dac3` / `dec3` describes: its prime frame, else the
+    /// first frame it accepted. Nil until known, and for every other codec.
+    private var muxerAudioLayout: AC3FrameLayout?
+    /// A live source changed its stream-copied AC-3 / E-AC-3 layout on the same PID (2.0 ads, 5.1
+    /// programme). movenc builds `dac3` / `dec3` once per init, so the next cut rotates to a versioned init
+    /// primed with a frame in the new layout; without it the session keeps the layout it started on.
+    private var pendingAudioLayoutReinit = false
+    private var audioLayoutReinitCount = 0
+    /// What the current muxer's video track was built from, so a rotation for audio alone rebuilds the
+    /// same video track.
+    private var currentMuxerVideoSource: (reconstructed: (width: Int32, height: Int32, extradata: [UInt8])?,
+                                          isAdCreative: Bool) = (nil, false)
+
     /// #133: initial live-join video config reconstructed from the gating IDR's in-band SPS/PPS. Set when a
     /// mid-stream MPEG-TS join left the probed codecpar at 0x0 (probe joined before any SPS); consumed by the
     /// FIRST allocateMuxer so avformat_write_header gets real dimensions instead of failing -22 (dead channel).
@@ -580,6 +593,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var felLookaheadDecided = false
     #endif
     private var loggedFirstDtsBump = false
+    /// AE#1070: joins the two fields of a PAFF frame into one packet. Created on the first read of an
+    /// H.264 stream whose SPS allows field pictures.
+    private var fieldJoiner: H264FieldPairJoiner?
+    private var fieldJoinerDecided = false
     private var loggedFirstDtsDrop = false
     private var loggedFirstAudioDtsBump = false
 
@@ -1291,6 +1308,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return false
         }
         discardPregateScanState()
+        fieldJoiner?.reset()
         #if DolbyVisionFelCurves
         felLookahead?.reset()
         #endif
@@ -1914,7 +1932,48 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if pendingVideoProgramSwitch, effectiveIdx > currentMuxerSegmentIndex {
             return rotateMuxerForProgramSwitch(to: effectiveIdx)
         }
+        if pendingAudioLayoutReinit, effectiveIdx > currentMuxerSegmentIndex {
+            return rotateMuxerForAudioLayoutChange(to: effectiveIdx)
+        }
         return advanceMuxer(to: effectiveIdx)
+    }
+
+    private func rotateMuxerForAudioLayoutChange(to newIdx: Int) -> MP4SegmentMuxer? {
+        if checkShouldStop() { return nil }
+        let finishedIdx = currentMuxerSegmentIndex
+        finalizeSessionMuxerAndAdopt()
+        let video = currentMuxerVideoSource
+        EngineLog.emit(
+            "[HLSSegmentProducer] muxer rotation (audio layout change): seg-\(finishedIdx) finalized on old init, "
+            + "fresh versioned init for seg-\(newIdx)",
+            category: .session
+        )
+        return allocateMuxer(initialSegmentIndex: newIdx,
+                             reconstructedVideoConfig: video.reconstructed,
+                             versionedInit: true,
+                             isAdCreative: video.isAdCreative,
+                             reason: "audio layout change")
+    }
+
+    /// Pump thread, after a stream-copied audio frame was muxed. Live only: a VOD restart builds its
+    /// init from the frames at its own start.
+    private func noteMuxedAudioLayout(_ frame: [UInt8]) {
+        guard isLive, let layout = AC3FrameLayout(packet: frame) else { return }
+        guard let current = muxerAudioLayout else {
+            muxerAudioLayout = layout
+            return
+        }
+        guard layout != current, !pendingAudioLayoutReinit else { return }
+        audioLayoutReinitCount += 1
+        EngineLog.emit(
+            "[HLSSegmentProducer] audio layout change #\(audioLayoutReinitCount) on the same stream "
+            + "(\(current.channelLayoutLabel) -> \(layout.channelLayoutLabel)); "
+            + "forcing a discontinuity cut + versioned init so dac3/dec3 matches the frames",
+            category: .session
+        )
+        pendingAudioLayoutReinit = true
+        pendingDiscontinuityFlag = true
+        pendingForceCutFlag = true
     }
 
     private func rotateMuxerForProgramSwitch(to newIdx: Int) -> MP4SegmentMuxer? {
@@ -1933,6 +1992,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         }
         pendingAdVideoConfig = nil
+        // AE#1070: the joiner's slice context came from the old SPS and cannot read the new stream.
+        fieldJoiner?.disarm()
         // #133 follow-up: same trigger and versioned-init path, two origins. SSAI = new video PID (ad creative,
         // its own signaling). Same-PID = in-band SPS/PPS change on the running program (encoder restart / splice),
         // whose DV/color overrides must be kept, so only versionedInit is set, not isAdCreative.
@@ -1945,7 +2006,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return allocateMuxer(initialSegmentIndex: newIdx,
                              reconstructedVideoConfig: adConfig,
                              versionedInit: true,
-                             isAdCreative: isAdCreative)
+                             isAdCreative: isAdCreative,
+                             reason: isAdCreative ? "SSAI program switch" : "same-PID parameter-set change")
     }
 
     /// Extract H.264 ad video config from in-band Annex-B SPS/PPS. nil on mid-GOP join (no parameter sets).
@@ -2359,7 +2421,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func allocateMuxer(initialSegmentIndex: Int,
                                reconstructedVideoConfig: (width: Int32, height: Int32, extradata: [UInt8])? = nil,
                                versionedInit: Bool = false,
-                               isAdCreative: Bool = false) -> MP4SegmentMuxer? {
+                               isAdCreative: Bool = false,
+                               reason: String = "") -> MP4SegmentMuxer? {
         // #93 residual: the FIRST alloc of a producer (its base segment) must not gate on the
         // consumer's fetch high water. An anchored initial producer (resume start) runs before ANY
         // segment fetch exists, because AVPlayer is still waiting on init.mp4, which is captured by
@@ -2437,13 +2500,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 audioDelaySeconds: audioDelaySeconds,
                 onStorageExhausted: { [cache] in cache.noteStorageExhausted() },
+                admitStagingBytes: { [weak self, cache] path, bytes in
+                    cache.stagingWriteAdmission(path: path, bytes: bytes, waitForConsumer: true,
+                        shouldStop: { [weak self] in self?.checkShouldStop() ?? true })
+                },
+                discardStaging: { [cache] path in cache.discardStagingReservation(path: path) },
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
                         self.cache.addInitVersion(initBytes, fromSegment: initialSegmentIndex)
                         EngineLog.emit(
                             "[HLSSegmentProducer] versioned init captured for seg-\(initialSegmentIndex) "
-                            + "(\(initBytes.count) B, \(isAdCreative ? "SSAI program switch" : "same-PID parameter-set change"))",
+                            + "(\(initBytes.count) B, \(reason))",
                             category: .session
                         )
                     } else if !self.initCaptured {
@@ -2461,6 +2529,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             self.installMuxer(muxer)
             self.currentMuxerSegmentIndex = initialSegmentIndex
             self.noteSegmentInProgress(initialSegmentIndex, muxer: muxer)
+            // Every allocation is primed with the last accepted frame, so its sample entry already
+            // carries the newest layout.
+            self.currentMuxerVideoSource = (reconstructedVideoConfig, isAdCreative)
+            self.muxerAudioLayout = audioMoovPrimeFrame.flatMap { AC3FrameLayout(packet: $0) }
+            self.pendingAudioLayoutReinit = false
             return muxer
         } catch {
             EngineLog.emit(
@@ -2557,6 +2630,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let positions = Self.moovPrimeHuntPositions(durationSeconds: demuxer.duration)
         guard !positions.isEmpty else { return nil }
         let deadline = Date().addingTimeInterval(Self.moovPrimeHuntTimeoutSeconds)
+        fieldJoiner?.reset()
 
         for target in positions {
             if checkShouldStop() || Date() > deadline { break }
@@ -3517,12 +3591,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 return packet.map { ($0, .main) }
             }
             #endif
-            guard let packet = try demuxer.readPacket() else { return nil }
+            guard let packet = try readMainSourcePacket() else { return nil }
             boundSourceTimestamps(packet)
             return (packet, .main)
         }
         if mergeMainLookahead == nil, !mergeMainEOF {
-            mergeMainLookahead = try demuxer.readPacket()
+            mergeMainLookahead = try readMainSourcePacket()
             if let pkt = mergeMainLookahead {
                 boundSourceTimestamps(pkt)
                 // Only video moves the main clock run: the variant's other streams (muxed audio the
@@ -3570,6 +3644,23 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         mergeMainLookahead = nil
         return (main, .main)
+    }
+
+    /// AE#1070: the main demuxer's packets with PAFF field pairs joined, see `H264FieldPairJoiner`.
+    private func readMainSourcePacket() throws -> UnsafeMutablePointer<AVPacket>? {
+        if !fieldJoinerDecided {
+            fieldJoinerDecided = true
+            if let stream = demuxer.stream(at: videoStreamIndex), let codecpar = stream.pointee.codecpar {
+                fieldJoiner = H264FieldPairJoiner.make(
+                    videoStreamIndex: videoStreamIndex, codecpar: codecpar, framing: a53NALFraming)
+            }
+            if fieldJoiner != nil {
+                EngineLog.emit("[HLSSegmentProducer] AE#1070 H.264 SPS allows field pictures: joining "
+                               + "field pairs into one sample each", category: .session)
+            }
+        }
+        guard let joiner = fieldJoiner else { return try demuxer.readPacket() }
+        return try joiner.next { try demuxer.readPacket() }
     }
 
     #if DolbyVisionFelCurves
@@ -5123,6 +5214,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         freeReplayPackets()
         freeMergeLookaheads()
+        if let joiner = fieldJoiner {
+            if joiner.pairsJoined > 0 || joiner.unpairedFields > 0 {
+                EngineLog.emit("[HLSSegmentProducer] AE#1070 field pairs joined=\(joiner.pairsJoined) "
+                               + "unpaired=\(joiner.unpairedFields)", category: .session)
+            }
+            joiner.reset()
+        }
         #if DolbyVisionFelCurves
         felLookahead?.reset()
         #endif
@@ -5497,6 +5595,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let prime = copyAudioPrimeCandidate(packet)
         if muxer.writePacket(packet).rc >= 0, let prime {
             audioMoovPrimeFrame = prime
+            noteMuxedAudioLayout(prime)
         }
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet

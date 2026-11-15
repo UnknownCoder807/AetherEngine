@@ -356,6 +356,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// language repeats. Built by `AetherEngine.nativeSubtitleRenditionInfos(for:)` at load.
     var nativeSubtitleRenditionInfosForSession: [NativeSubtitleRenditionInfo] = []
 
+    /// AE#1049: every source audio track for the master's audio group, already uniquely named. The
+    /// provider makes the served one the group's primary entry. Empty = opt-out.
+    var audioTrackChoicesForSession: [AudioRenditionChoice] = []
+
     /// #77: in-band CC stream index + observer, re-threaded onto every producer so the tap survives
     /// seek/reload/wedge. Set before start(). -1 / nil = no CC tap.
     var closedCaptionStreamIndexForSession: Int32 = -1
@@ -1165,6 +1169,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        rendersDTSXObjectAudio: Bool = true,
         foldsDolbyVisionFEL: Bool = true,
         panelPresentsHDR: Bool = false,
         stereoPresentation: StereoPresentation = .automatic,
@@ -1196,7 +1201,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil,
-        sessionCacheByteBudget: Int? = nil
+        sessionCacheByteBudget: Int? = nil,
+        sessionCacheHardLimitBytes: Int? = nil,
+        sessionCacheFreeReserveBytes: Int = 0
     ) {
         self.sourceURL = url
         self.requestHeaders = RequestHeaderStore(sourceHTTPHeaders)
@@ -1228,6 +1235,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.rendersDTSXObjectAudio = rendersDTSXObjectAudio
         self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.panelPresentsHDRFlag = OSAllocatedUnfairLock(initialState: panelPresentsHDR)
         self.stereoPresentation = stereoPresentation
@@ -1270,6 +1278,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.liveSourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
         self.requestedSessionCacheBudgetBytes = sessionCacheByteBudget.map { max(0, $0) }
+        self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
+        self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)
     }
 
     /// Session forward-buffer window in segments. Drives BOTH the producer's race-ahead
@@ -1284,6 +1294,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// VOD-only (`advanceMuxer`), so live cannot park on it.
     private var retentionBudgetBytes: Int = 0
     private let requestedSessionCacheBudgetBytes: Int?
+    private let sessionCacheHardLimitBytes: Int?
+    private let sessionCacheFreeReserveBytes: Int
     private var sessionCacheVolumeSafetyLimitBytes: Int?
     /// The clamped request the status reports; `retentionBudgetBytes` is what is enforced.
     private var sessionCacheBaseEffectiveBytes: Int = 0
@@ -1411,6 +1423,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
+
+    /// From `LoadOptions.rendersDTSXObjectAudio`: false keeps DTS on the channel bridge (AE#1060).
+    let rendersDTSXObjectAudio: Bool
 
     /// From `LoadOptions.foldsDolbyVisionFEL`; handed to every producer this session builds.
     let foldsDolbyVisionFEL: Bool
@@ -1801,8 +1816,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
+        // Resolved before the route (a Dolby Vision Profile 20 source is packaged by it) and before the
+        // config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187 canonicalization would
+        // drop (`canonicalizeHEVCConfigRecord`).
+        let stereo = StereoVideoSignal.resolve(
+            presentation: stereoPresentation,
+            codecID: codecpar.pointee.codec_id,
+            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
+            containerStereo: StereoVideoSignal.containerStereo(codecpar),
+            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
+        )
+
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
-        let route = try resolveCodecRoute(codecpar: codecpar)
+        let route = try resolveCodecRoute(codecpar: codecpar, stereoMultiview: stereo.signal == .multiview)
         let codecTagOverride = route.codecTagOverride
         let videoRange = route.videoRange
         let primaryCodecs = route.primaryCodecs
@@ -1843,15 +1869,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         let measuredVideoNALFraming = framingNormalization.measuredFraming
 
-        // Resolved here, before the config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187
-        // canonicalization would drop (`canonicalizeHEVCConfigRecord`).
-        let stereo = StereoVideoSignal.resolve(
-            presentation: stereoPresentation,
-            codecID: codecpar.pointee.codec_id,
-            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
-            containerStereo: StereoVideoSignal.containerStereo(codecpar),
-            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
-        )
         let videoExtradataOverride: [UInt8]?
         if let normalized = framingNormalization.extradataOverride {
             videoExtradataOverride = normalized
@@ -1939,6 +1956,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let segmentCache = SegmentCache(
             forwardWindow: forwardWindowSegments,
             retentionBudgetBytes: retentionBudget,
+            hardDiskLimitBytes: isLiveSession ? nil : sessionCacheHardLimitBytes,
+            freeDiskReserveBytes: sessionCacheFreeReserveBytes,
             nativeLiveDVRPolicy: isLiveSession ? nativeLiveDVRPolicy : nil,
             onResidentSetChanged: { [weak self] in self?.noteResidentSetChanged() }
         )
@@ -2250,6 +2269,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     + "\(FLACStreamInfo.coreMediaMinimumBlockSize), bridging instead of stream-copy",
                     category: .session
                 )
+            } else if AACAudioSpecificConfig.coreMediaRejects(UnsafePointer(audioStream.pointee.codecpar)) {
+                // AE#1047: CoreMedia refuses an esds whose layout lives in a PCE.
+                bridgePreferred = true
+                EngineLog.emit(
+                    "[HLSVideoEngine] audio: AAC config declares channelConfiguration=0 (layout in a PCE), "
+                    + "which CoreMedia refuses; bridging \(acpForHE.ch_layout.nb_channels) ch instead of stream-copy",
+                    category: .session
+                )
             } else if compat.requiresBridge || isHEAAC {
                 bridgePreferred = true
                 EngineLog.emit(
@@ -2257,7 +2284,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
                         : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
                           + (Self.spatialRenderingLayout(
-                                rendering: objectAudioRendering, codecID: acpForHE.codec_id,
+                                rendering: objectAudioRendering(for: acpForHE.codec_id), codecID: acpForHE.codec_id,
                                 profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
                              .map { layout in
                                  Self.objectAudioSource(codecID: acpForHE.codec_id, profile: acpForHE.profile) == .trueHDAtmos
@@ -2447,6 +2474,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioLanguage: servedAudioLanguage,
             audioChannelCount: servedAudioChannels,
             audioIsAtmosStreamCopy: servedAudioIsAtmosStreamCopy,
+            audioMenuChoices: savedAudioConfig == nil ? [] : audioTrackChoicesForSession,
+            servedAudioTrackID: Int(audioStreamIndex),
             videoLayout: stereoSignal != nil ? StereoVideoSignal.videoLayout : nil,
             isLive: isLiveSession,
             servesSegmentsProgressively: servesSegmentsProgressively,

@@ -653,6 +653,9 @@ extension AetherEngine {
                       // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                       surfaceEndFailures: true,
                       httpHeaders: options.httpHeaders,
+                      // AE#154 follow-up: only where the engine read the body itself. A host-declared bypass
+                      // keeps AVFoundation's own typing of the URL.
+                      declaresHLSPlaylistMIMEType: options.hlsPlaylistProvenByBody,
                       // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
                       // it back would ping-pong), and hosts can opt out via LoadOptions.
                       armIngestFallback: RemoteHLSIngestFallback.shouldArm(
@@ -931,6 +934,7 @@ extension AetherEngine {
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            rendersDTSXObjectAudio: loadedOptions.rendersDTSXObjectAudio,
             foldsDolbyVisionFEL: loadedOptions.foldsDolbyVisionFEL,
             panelPresentsHDR: panelPresentsHDR,
             stereoPresentation: loadedOptions.stereoPresentation,
@@ -965,7 +969,9 @@ extension AetherEngine {
             heldSourceConnection: loadedOptions.heldSourceConnection,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: forwardBufferSegmentsForSession(loadedOptions.forwardBufferSegments),
-            sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget
+            sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget,
+            sessionCacheHardLimitBytes: loadedOptions.sessionCacheHardLimitBytes,
+            sessionCacheFreeReserveBytes: loadedOptions.sessionCacheFreeReserveBytes
         )
         sessionCacheStatusToken &+= 1
         let cacheStatusToken = sessionCacheStatusToken
@@ -981,6 +987,8 @@ extension AetherEngine {
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.audioShaping = loadedOptions.audioShaping
+        // AE#1049: no companion-demuxed audio here; its tracks are not the source's streams.
+        session.audioTrackChoicesForSession = companionAudioReader == nil ? audioMenuChoicesForSession() : []
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
@@ -1000,9 +1008,9 @@ extension AetherEngine {
         prepareDualLayerOutputRoute(session: session)
         // A load that fails or is superseded before the session is handed over stops only its own route: a
         // newer load may already have prepared the next one.
-        weak var preparedOutputRoute = dualLayerOutputRouteObject
+        let preparedOutputRoute = { [weak route = dualLayerOutputRouteObject] in route }
         var outputRouteHandedOver = false
-        defer { if !outputRouteHandedOver { stopDualLayerOutputRoute(ifStill: preparedOutputRoute) } }
+        defer { if !outputRouteHandedOver { stopDualLayerOutputRoute(ifStill: preparedOutputRoute()) } }
         // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).
         session.onFirstHDR10PlusDetected = { [weak self] in
             self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
@@ -1239,7 +1247,9 @@ extension AetherEngine {
             NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
-                                     isForced: track.isForced)
+                                     isForced: track.isForced,
+                                     title: track.sourceTitle,
+                                     isHearingImpaired: track.isHearingImpaired)
         }
         // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
         // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
@@ -1880,6 +1890,18 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
 
+        // A 3D session refused at startup is rebuilt once in 2D (`fallBackToTwoDimensional`). Assigned on
+        // every mount, since a kept host still carries the previous session's flag.
+        host.armStereoRefusalFallback(session.stereoSignal != nil)
+        host.$pendingStereoRefusal
+            .compactMap { $0 }
+            .sink { [weak self] message in
+                self?.hop(for: generation) { [weak self] in
+                    await self?.fallBackToTwoDimensional(message, expectedGeneration: generation)
+                }
+            }
+            .store(in: &nativeCancellables)
+
         // #98: a display rejecting the served master fails the item at startup; reload the media
         // playlist in place instead of hard-failing. Gated + single-shot in fallBackToMediaPlaylist.
         host.$pendingDisplayRejection
@@ -1971,6 +1993,7 @@ extension AetherEngine {
         // AE#458: what AVFoundation makes of the audio rendition this load just served, which is the
         // half of the exchange no log has ever carried.
         logAudibleReadback(host: host)
+        armAudioMenuPicks(host: host)
     }
 
     /// The active audio track's channel count from the published track list, nil when unknown.
@@ -2086,8 +2109,13 @@ extension AetherEngine {
         host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
+        let processingRebuild = VideoProcessingRouteDecision.forRebuild(
+            sessionPlan: sourceVideoProcessingPlan, optionOn: loadedOptions.videoProcessing != nil,
+            disabled: sourceVideoProcessingDisabled)
+        host.videoProcessingPlan = processingRebuild.plan
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
+        host.rendersDTSXObjectAudio = loadedOptions.rendersDTSXObjectAudio
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.audioShaping = loadedOptions.audioShaping        // AE#923: likewise
         if isLive { host.liveEdgeCushionSeconds = loadedOptions.liveEdgeCushionSeconds }
@@ -2304,6 +2332,8 @@ extension AetherEngine {
         #endif
         if let status = upscaleRebuild.status { activeUpscale = status }
         wireUpscaleStatus(from: host)
+        if let status = processingRebuild.status { activeVideoProcessing = status }
+        wireVideoProcessingStatus(from: host)
         // The audio route is settled by `load`: an object-audio one keeps the HDMI link in Atmos.
         followAtmosOutput()
     }
@@ -2549,6 +2579,7 @@ extension AetherEngine {
         let activeTrackToResume = activeSubtitleTrackIndex
         let reapplyOrdinalToRestore = nativeSubtitleReapplyOrdinal
         let reapplyMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
+        let markerOrdinalToRestore = nativeSubtitleMarkerOrdinal
         // #112 full umbau: an audio-track switch does not move the playhead, so the PGS line already on screen is
         // still valid. Snapshot the visible bitmap cues before stopInternal wipes them; they are restored after the
         // subtitle re-arm so the line stays up while the re-armed reader re-primes forward (old path reconstructed
@@ -2837,6 +2868,14 @@ extension AetherEngine {
                     attemptWhenUnproven: loadedOptions.attemptsHDRMasterOnUnprovenPanel,
                     displayEligibleForHDR: sessionDisplayEligibleForHDR,
                     panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+                // AE#1061: a rebuild that superseded its load before the handshake settled has no load-time
+                // answer, and without this line the media route it then takes reads like any other.
+                if sessionObservedDisplayCaps == nil, sourceVideoFormat != .sdr {
+                    EngineLog.emit(
+                        "[DisplayCriteria] reload found no load-time panel answer (the load it replaced never "
+                        + "settled its route): an HDR source routes as on an SDR panel (#1061)",
+                        category: .session)
+                }
                 if reloadRoutingPanelHDR != loadedOptions.panelIsInHDRMode {
                     EngineLog.emit(
                         "[DisplayCriteria] AE#541 reload routes on the load's panel answer: panelIsHDR="
@@ -3003,6 +3042,7 @@ extension AetherEngine {
         restoreSecondarySubtitleAfterRebuild(
             externalID: secondaryToResume.externalID, sidecarURL: secondaryToResume.sidecarURL,
             embeddedIndex: secondaryToResume.embeddedIndex, startAt: preSwitchSourceTime)
+        nativeSubtitleMarkerOrdinal = markerOrdinalToRestore   // AE#1052: before the replay reads it
         // #170: replay the native-rendition pick onto the rebuilt item, the way the #65 recovery
         // does; the table was rebuilt from the preserved track list, so a rendering-derived
         // ordinal recomputes to the same rendition and a host-positional one replays as-is.
@@ -3017,7 +3057,7 @@ extension AetherEngine {
                 "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after audio-switch reload",
                 category: .engine
             )
-            setNativeSubtitleSelected(track: ordinal)
+            applyNativeSubtitleSelection(track: ordinal)
         }
         return nil
     }

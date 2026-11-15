@@ -705,17 +705,19 @@ extension AetherEngine {
     /// (`AudioPlaybackHost`). AVPlayer needs a URL it can read and a codec on the whitelist, and
     /// takes neither a FLAC whose blocks are under CoreMedia's floor (AE#764), nor a FLAC whose frames
     /// are smaller than `STREAMINFO`'s `max_blocksize` (AE#946, AVPlayer mistimes it), nor a raw FLAC
-    /// file (AE#946, AVPlayer seeks it to the wrong place), nor a session the host asked onto `.software`.
+    /// file (AE#946, AVPlayer seeks it to the wrong place), nor an AAC whose layout lives in a PCE
+    /// (AE#1047, the item ends at 0 s), nor a session the host asked onto `.software`.
     nonisolated static func audioOnlyUsesAVPlayer(
         codecID: AVCodecID,
         isCustomSource: Bool,
         flacBlocksTooSmall: Bool,
         flacFramesMistimed: Bool,
         flacSeeksMisplaced: Bool,
+        aacLayoutInPCE: Bool = false,
         preferred: DecodePath
     ) -> Bool {
         !isCustomSource && avPlayerCanDecodeAudio(codecID) && !flacBlocksTooSmall && !flacFramesMistimed
-            && !flacSeeksMisplaced && preferred != .software
+            && !flacSeeksMisplaced && !aacLayoutInPCE && preferred != .software
     }
 
     /// AE#946: CoreMedia's parser for the raw FLAC container ignores `SEEKTABLE` and places a seek by
@@ -759,11 +761,16 @@ extension AetherEngine {
         override: Int32?,
         preferredLanguages: [String],
         prefersObjectAudio: Bool = false,
+        rendersDTSX: Bool = true,
         defaultIndex: Int32 = -1
     ) -> Int32? {
         // Explicit host override wins, but only when it names a real audio track (else fall through).
         if let override, tracks.contains(where: { $0.id == Int(override) }) {
             return override
+        }
+        // AE#1060: a load that keeps DTS:X on the channel bridge has no heights to prefer it for.
+        let isRenderableObjectAudio = { (track: TrackInfo) in
+            Self.isRenderableObjectAudio(track, includesDTSX: rendersDTSX)
         }
         // AE#919: within a language the programme mix wins over audio description and commentary, which a
         // file may list first. #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights,
@@ -845,8 +852,8 @@ extension AetherEngine {
     nonisolated static let linksDTSXObjectDecoder = OptionalComponent.dtsxObjectAudio.isBuiltIn
 
     /// The tracks object rendering keeps the heights of.
-    nonisolated static func isRenderableObjectAudio(_ track: TrackInfo) -> Bool {
-        isRenderableTrueHDAtmos(track) || isRenderableDTSX(track)
+    nonisolated static func isRenderableObjectAudio(_ track: TrackInfo, includesDTSX: Bool = true) -> Bool {
+        isRenderableTrueHDAtmos(track) || (includesDTSX && isRenderableDTSX(track))
     }
 
     /// Resolve the subtitle track to auto-activate from `LoadOptions.preferredSubtitleLanguages`: within the

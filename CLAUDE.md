@@ -13,7 +13,10 @@ Two first-party hosts consume it, [Sodalite](https://github.com/superuser404notf
 Read before changing anything non-trivial:
 
 - `docs/guide.md` and `docs/installation.md`: how a host uses the engine (the README is only an overview).
-- `docs/architecture.md`: the playback pipelines and the **Source map** section (which file owns what).
+- `docs/architecture.md`: the playback pipelines in overview; `docs/architecture-native.md` and
+  `docs/architecture-software.md` go deep on each path.
+- `docs/source-map.md`: which source file owns what.
+- `docs/measurements.md`: the dated measurements and history behind the rules in the other docs.
 - `docs/api.md`: the public surface and the host contracts.
 - `docs/formats.md`: per-format behaviour, Dolby Vision / HDR, audio routes.
 - `docs/cli.md`: `aetherctl`, the headless harness that runs the real engine on macOS.
@@ -55,10 +58,16 @@ draws them. The engine draws no UI.
 
 - **Playback bugs are fixed in the engine, never by asking hosts to compensate.** A change that adds
   host-side compensation is the wrong direction.
+- **Every change updates the docs in the same commit, and every merge checks it.** Behaviour, API,
+  format, CLI and file changes each go to the page that owns the topic (see the list at the top); a
+  topic nobody describes yet gets a section where a reader would look. The CHANGELOG entry is not the
+  documentation. An external PR's doc text is checked at merge time for the right file (the docs may
+  have been restructured since the branch started) and for the house style below.
 - **Public API needs documentation in the same commit.** `PublicAPIDocumentationTests` fails for any
   public member not named in `README.md` or `docs/`; a symbol public only for the CLI or tests goes
   in its `notHostAPI` list with a reason. Numbers quoted in docs are pinned by
-  `DocumentedConstantsTests`. Relative links are checked by `Scripts/check-doc-links.py`.
+  `DocumentedConstantsTests`. Relative links are checked by `Scripts/check-doc-links.py`, and
+  `Scripts/check-source-map.py` fails for a source file `docs/source-map.md` does not name.
 - **`CHANGELOG.md` gets an entry under `[Unreleased]`** for every user-visible change, in the style
   of the existing entries (bold one-line summary, then what was broken and what happens now).
 - **Codec routing is "software unless native really carries it".** Two lists that do not cover each

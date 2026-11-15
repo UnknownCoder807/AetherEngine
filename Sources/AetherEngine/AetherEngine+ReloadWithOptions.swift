@@ -46,9 +46,10 @@ extension AetherEngine {
     /// rebuild, so the internal reopens that follow (audio switch, background reload) replay the
     /// correction rather than reverting to the load-time value.
     ///
-    /// Unlike `reloadAtCurrentPosition()`, which returns silently when there is nothing to rebuild,
-    /// this one throws `AetherEngineError.sessionNotReloadable`: a host correcting a session needs
-    /// to tell "corrected" from "did nothing" to decide whether to fall through to a fresh load.
+    /// Unlike `reloadAtCurrentPosition()`, which returns silently when a URL source has no session
+    /// to rebuild (it throws only for a custom source, AE#526), this one always throws
+    /// `AetherEngineError.sessionNotReloadable`: a host correcting a session needs to tell
+    /// "corrected" from "did nothing" to decide whether to fall through to a fresh load.
     ///
     /// A correction whose every changed field is the session's own (`autoplay`) is answered without
     /// a rebuild: there is nothing for one to carry, and the teardown it used to spend was a visible
@@ -147,6 +148,18 @@ extension AetherEngine {
             throw AetherEngineError.sessionNotReloadable(refusal)
         }
 
+        // #957: the same shape for the picture processing.
+        if let refusal = SessionOptionCorrection.videoProcessingRouteRefusal(
+            isCustomSource: isCustomSource, current: loadedOptions, proposed: proposed
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] videoProcessing correction refused, \(refusal.rawValue): a custom source keeps "
+                + "the route it was loaded with; load() it again with the new option",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
         // Stating the no-op matters for the same reason #364's teletext switch states it: a host
         // that corrected an option and saw a plain reload cannot otherwise tell "the correction was
         // already in force" from "the correction did not arrive".
@@ -221,8 +234,9 @@ extension AetherEngine {
     /// Why `reloadAtCurrentPosition` would rebuild nothing for this session, or nil when it can
     /// rebuild it (#460).
     ///
-    /// `reloadAtCurrentPosition()` returns silently in both of these cases. Read this to tell that
-    /// silence apart from a rebuild that ran, without having to time one out.
+    /// `reloadAtCurrentPosition()` returns silently for `.noActiveSession` on a URL source and throws
+    /// `sessionNotReloadable` on a custom source (AE#526). Read this to know beforehand, without
+    /// having to time a rebuild out.
     public var sessionReloadRefusal: SessionReloadRefusal? {
         guard loadedURL != nil else { return .noActiveSession }
         if isCustomSource, !customSourceIsSeekable { return .customSourceNotSeekable }
@@ -289,6 +303,12 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// effect. Call `load()` again with the new option. Turning it off is honoured in place, and URL
     /// sources are not affected: their correction re-runs `load()`.
     case upscaleRouteNeedsFreshLoad
+    /// #957: a correction that turns `videoProcessing` on, or changes its target while it is on, for a
+    /// session that plays from a custom `IOReader` source. The route and the curve are decided by
+    /// `load()`, which a custom source's in-place rebuild does not re-run. Call `load()` again with the new
+    /// option. Turning it off is honoured in place, and URL sources are not affected: their correction
+    /// re-runs `load()`.
+    case videoProcessingRouteNeedsFreshLoad
 
     public var description: String {
         switch self {
@@ -302,6 +322,8 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
             return "the dual-layer Dolby Vision route of a custom source is decided by load(), not by a rebuild"
         case .upscaleRouteNeedsFreshLoad:
             return "the low-resolution upscale route of a custom source is decided by load(), not by a rebuild"
+        case .videoProcessingRouteNeedsFreshLoad:
+            return "the picture processing route of a custom source is decided by load(), not by a rebuild"
         }
     }
 }
@@ -365,6 +387,11 @@ enum SessionOptionCorrection {
         // accepted and then not happen until something else reopened the source.
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
+        }
+        // The role decides which process-wide outputs the session claimed at load (panel, Now
+        // Playing); a rebuild cannot hand them over or give them back.
+        if proposed.sharedOutputRole != current.sharedOutputRole {
+            refused.append("sharedOutputRole")
         }
         return refused
     }
@@ -458,6 +485,16 @@ enum SessionOptionCorrection {
         return .upscaleRouteNeedsFreshLoad
     }
 
+    /// Why a correction of `videoProcessing` cannot be honoured, or nil when it can (#957). Same rule as
+    /// `upscaleRouteRefusal`: on a custom source turning it on, or changing the target while it stays on,
+    /// is refused; turning it off is honoured, because the next host simply gets no plan.
+    static func videoProcessingRouteRefusal(
+        isCustomSource: Bool, current: LoadOptions, proposed: LoadOptions
+    ) -> SessionReloadRefusal? {
+        guard isCustomSource, let next = proposed.videoProcessing, next != current.videoProcessing else { return nil }
+        return .videoProcessingRouteNeedsFreshLoad
+    }
+
     /// Every field the proposal changed, for the log line. Reflection is right here and wrong
     /// above: a diagnostic that names a new field the day it is added is worth more than one that
     /// cannot be wrong, and being wrong here costs a log line.
@@ -489,18 +526,18 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "dualLayerRoute", "foldsDolbyVisionFEL", "upscalesLowResolutionVideo", "upscaleScaler", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "dualLayerRoute", "foldsDolbyVisionFEL", "upscalesLowResolutionVideo", "upscaleScaler", "videoProcessing", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "rendersDTSXObjectAudio", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
         "softwareDVRRetention", "liveDVRByteBudget",
         "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
-        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
+        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "nativeAudioTrackMenu", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
+        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "sessionCacheHardLimitBytes", "sessionCacheFreeReserveBytes", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
         "audioDelaySeconds", "audioShaping", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
+        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover", "hlsPlaylistProvenByBody",
     ]
 }

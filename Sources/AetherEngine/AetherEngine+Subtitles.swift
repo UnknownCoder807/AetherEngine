@@ -419,6 +419,9 @@ extension AetherEngine {
     /// decode nothing (idle, no decoder), and hands back what the decode needs.
     func prepareSubtitleDrainTick() -> SubtitleDrainTickWork? {
         guard !subtitleDrainTargets.isEmpty else { return nil }
+        // AE#1022 round 3: nothing is planned between a software seek's closing and its landing.
+        // The loop's next tick after the landing is the reset that reconstructs it.
+        if isSeeking, subtitleDepartureClosedSeekGeneration == currentSeekGeneration { return nil }
         let sessionStore = activeSubtitlePacketStore
         sessionStore?.setProtectedStreams(Set(embeddedSubtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
@@ -436,7 +439,7 @@ extension AetherEngine {
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
         let elapsed = subtitleDrainLastTickUptime.map { tickUptime - $0 } ?? 0
         subtitleDrainLastTickUptime = tickUptime
-        var work = SubtitleDrainTickWork(playhead: playhead)
+        var work = SubtitleDrainTickWork(playhead: playhead, seekGeneration: currentSeekGeneration)
         for (channel, streamIndex) in subtitleDrainTargets {
             // #921: a sidecar channel drains its own store, which needs no session at all.
             guard let store = subtitlePacketStore(for: channel) else { continue }
@@ -560,6 +563,15 @@ extension AetherEngine {
     /// while its batch decoded is skipped: its cursor did not move, so the next tick redoes it.
     func finishSubtitleDrainTick(_ work: SubtitleDrainTickWork,
                                  events decodedByChannel: [[EmbeddedSubtitleDecoder.SubtitleEvent?]]) {
+        // AE#1022 round 3: a batch planned before a seek was decoded around the departure. Applied
+        // after it, it republished a set whose clear was unread as open, after the seek had closed
+        // it, and that set was drawn at the landing until the landing's reset closed it again
+        // (retest: the set of 22 s on screen for 0.37 s at a 63 s landing over a slow reader). The
+        // cursors did not move, so the tick after the landing decodes what still matters.
+        guard work.seekGeneration == currentSeekGeneration else {
+            subtitleDrainTickRequested = true
+            return
+        }
         let playhead = work.playhead
         for (job, events) in zip(work.channels, decodedByChannel) {
             let channel = job.channel
@@ -994,17 +1006,54 @@ extension AetherEngine {
 
     /// AE#1022: a bitmap set still carrying its open placeholder end covers every position after
     /// it, so from the moment the clock jumps it is drawn over the landing until the first reset
-    /// tick closes it (#357), and that tick comes only after the landed frame prerolled. Closed at
-    /// the landing here instead, which is less than the tick does (it closes at the start of its
-    /// backscan): a set that really is the landing line comes back through the reconstruction.
-    func closeOpenEndedSubtitleCues(atSeekLanding landing: Double) {
+    /// tick closes it (#357), and that tick comes only after the landed frame prerolled.
+    ///
+    /// Round 2: the end is set from the DEPARTURE, not the landing. A set open at the departure
+    /// has its clear still unread, and the harvest runs ahead of the playhead, so the set really
+    /// lasted at least to the departure and nothing beyond it is known. Closed at the landing
+    /// instead, it claimed the whole jumped-over stretch, and a later seek back into that stretch
+    /// drew it (retest: a set from 0 s drawn from 54 s to 58 s after a seek to 58 s and back).
+    /// A set that starts after the departure was never seen; if it starts before a forward landing
+    /// it is closed at its own start. That does not lose it: a re-decode of the same set replaces
+    /// it (`insertCueSorted`), and one that really is the landing line comes back through the
+    /// reconstruction. An open set after the landing is left alone, as is one ahead of a backward
+    /// landing, which is an ordinary not-yet-closed set.
+    ///
+    /// Round 3: from here to the landing no drain tick may publish (see
+    /// `subtitleDepartureClosedSeekGeneration`), or it puts the closed sets back.
+    func closeOpenEndedSubtitleCues(atSeekFrom departure: Double, to landing: Double) {
+        subtitleDepartureClosedSeekGeneration = currentSeekGeneration
         guard landing.isFinite else { return }
         for channel in [SubtitleChannel.primary, .secondary] {
             var cues = retainedSubtitleCues(for: channel)
-            if Self.closeOpenEndedCues(&cues, startingBefore: landing) {
+            if Self.closeOpenEndedCues(&cues, seekFrom: departure, to: landing) {
                 publishRetainedSubtitleCues(cues, for: channel)
             }
         }
+    }
+
+    /// AE#1022 round 2: the per-cue rule of `closeOpenEndedSubtitleCues(atSeekFrom:to:)`. A
+    /// departure that is not finite (no frame yet) falls back to the landing, the round 1 rule.
+    nonisolated static func closeOpenEndedCues(_ cues: inout [SubtitleCue],
+                                               seekFrom departure: Double, to landing: Double) -> Bool {
+        let from = departure.isFinite ? departure : landing
+        var changed = false
+        for i in 0..<cues.count {
+            let cue = cues[i]
+            guard cue.endTime - cue.startTime > subtitleOpenEndedWindowSeconds else { continue }
+            let end: Double
+            if cue.startTime < from {
+                end = from
+            } else if cue.startTime < landing {
+                end = cue.startTime
+            } else {
+                continue
+            }
+            guard end < cue.endTime else { continue }
+            cues[i] = cue.with(endTime: end)
+            changed = true
+        }
+        return changed
     }
 
     /// AE#1022: send a running prefetch session to a seek's landing, on the source axis, as the
@@ -2500,6 +2549,7 @@ extension AetherEngine {
     /// whole-program eager reader is left alone: it converges on full coverage by itself.
     func scheduleNativeSubtitleReanchor() {
         guard nativeSubtitleReapplyOrdinal != nil,
+              !nativeSubtitleSelectionIsMarker,   // AE#1052: a marker has no coverage to keep
               !nativeSubtitleReadersRunToEOF,
               nativeVideoSession != nil else { return }
         nativeSubtitleReanchorTask?.cancel()
@@ -2525,26 +2575,65 @@ extension AetherEngine {
                 + "readMax=\(String(format: "%.2f", readMax))); replaying selection ordinal=\(ordinal)",
                 category: .engine
             )
+            guard !self.nativeSubtitleSelectionIsMarker else { return }
             self.cancelNativeSubtitleReaders()
-            self.setNativeSubtitleSelected(track: ordinal)
+            self.applyNativeSubtitleSelection(track: ordinal)
         }
     }
 
 
     /// Select or deselect the native mov_text track by ordinal (#55). nil deselects all. Matches by `extendedLanguageTag` first (language-rank-aware for same-language duplicates), falls back to positional index. No-op when no legible group or ordinal out of range.
-    public func setNativeSubtitleSelected(track ordinal: Int?) {
+    ///
+    /// AE#1052: `markerOnly: true` selects the rendition as a marker for AVKit's subtitle menu and
+    /// nothing else. The menu shows the track as selected and offers Off, the Sodalite#65 pin stands
+    /// down, no reader or OCR worker fills the rendition, and AVKit's text is styled invisible, so a
+    /// host drawing the track in its own overlay (bitmap cues keep their position that way) gets no
+    /// second copy. The marker stands until the host's next call here. While the picture is off the
+    /// app (`setNativeSubtitleRendering(true)`) the rendition is the display and fills as usual;
+    /// `setNativeSubtitleRendering(false)` returns to the marker instead of deselecting.
+    public func setNativeSubtitleSelected(track ordinal: Int?, markerOnly: Bool = false) {
+        nativeSubtitleMarkerOrdinal = markerOnly ? ordinal : nil
+        applyNativeSubtitleSelection(track: ordinal)
+    }
+
+    /// AE#1052: whether the standing selection is a menu marker rather than a rendition AVKit draws.
+    /// A marker only holds while the picture is in the app; off it, the rendition is the display.
+    nonisolated static func nativeSelectionIsMarker(
+        markerOrdinal: Int?, reapplyOrdinal: Int?, renderingRequested: Bool
+    ) -> Bool {
+        guard let markerOrdinal, !renderingRequested else { return false }
+        return reapplyOrdinal == markerOrdinal
+    }
+
+    var nativeSubtitleSelectionIsMarker: Bool {
+        Self.nativeSelectionIsMarker(markerOrdinal: nativeSubtitleMarkerOrdinal,
+                                     reapplyOrdinal: nativeSubtitleReapplyOrdinal,
+                                     renderingRequested: nativeSubtitleRenderingRequested)
+    }
+
+    /// The selection itself, shared by the host's call and the engine's own replays (#65 recovery,
+    /// #93 re-anchor, #170 reloads, rendering requests), which must not touch the host's marker.
+    func applyNativeSubtitleSelection(track ordinal: Int?) {
         // Remembered before any guard: the #93 recovery reload replays the host's last request
         // onto the fresh item even when this call raced a not-yet-current player.
         nativeSubtitleReapplyOrdinal = ordinal
-        syncSubtitleOCRWithNativeSelection(ordinal: ordinal)
+        nativeSubtitleSelectGeneration &+= 1
+        let generation = nativeSubtitleSelectGeneration
+        let marker = nativeSubtitleSelectionIsMarker
+        // AE#1052: a marker is never filled, so it arms nothing, and it disarms an OCR worker a
+        // PiP round trip left running.
+        syncSubtitleOCRWithNativeSelection(ordinal: marker ? nil : ordinal)
         // #15: lazy readers, run the side-demuxer only while a native track is selected (PiP), idle otherwise.
         // Sodalite#32: an eager read-to-EOF reader survives deselect (it is building whole-session coverage;
         // cancelling it on PiP exit left the store frozen at ~48s and every later .vtt served empty).
-        if ordinal != nil {
+        if ordinal != nil, !marker {
             startLazyNativeSubtitleReadersWhenIdle()
         } else if !nativeSubtitleReadersRunToEOF {
             cancelNativeSubtitleReaders()
         }
+        // AE#1052: set before the select, so the first fetch of a marker is already empty and the
+        // first fetch after it (PiP entry) already has cues.
+        silenceNativeRendition(ordinal: marker ? ordinal : nil)
         guard let item = currentAVPlayer?.currentItem else { return }
         // Capture track list; avoid capturing self to keep MainActor re-entrancy to one hop.
         let tracks = nativeSubtitleTracks
@@ -2555,6 +2644,7 @@ extension AetherEngine {
             currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
             guard !group.options.isEmpty else { return }
+            guard generation == nativeSubtitleSelectGeneration else { return }
             guard let ordinal else {
                 item.select(nil, in: group)
                 return
@@ -2587,6 +2677,22 @@ extension AetherEngine {
             // left ~45/46 segments empty (device-confirmed). Pre-fill far enough ahead to cover that burst; break
             // early when the reader stops making progress (EOF / read-ahead parked) so we never wait the full
             // deadline for content with little remaining.
+            if marker {
+                // AE#1052: nothing to wait for and nothing to refuse. The deselect-reselect makes AVKit
+                // fetch the segment under the playhead again, now empty, and drop the text an earlier
+                // PiP fill left on screen (device: it refetched the current segment on every reselect).
+                // Styling the text away does not do it: the transparent rule still left a dark box.
+                if item.currentMediaSelection.selectedMediaOption(in: group) != nil {
+                    item.select(nil, in: group)
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    guard generation == nativeSubtitleSelectGeneration else { return }
+                }
+                item.select(option, in: group)
+                let after = item.currentMediaSelection.selectedMediaOption(in: group)?.displayName ?? "nil"
+                EngineLog.emit("[AetherEngine] AE#1052 native subtitle marker: ordinal=\(ordinal) "
+                               + "selected=\(after), served empty", category: .engine)
+                return
+            }
             var prefilledCues: Int?
             if ordinal < nativeSubtitleTrackTable.count, nativeSubtitleTrackTable[ordinal].needsOCR,
                let store = nativeStore(atOrdinal: ordinal) {
@@ -2594,7 +2700,8 @@ extension AetherEngine {
                 // just armed. Its window is known exactly, so wait for that rather than for cue ends:
                 // a forced track's cues are sparse and would never reach the heuristic's target.
                 let began = Date()
-                let exit = await awaitSubtitleOCRCoverage(ordinal: ordinal, store: store, item: item)
+                let exit = await awaitSubtitleOCRCoverage(ordinal: ordinal, store: store, item: item,
+                                                          generation: generation)
                 let waited = Int(Date().timeIntervalSince(began) * 1000)
                 EngineLog.emit("[AetherEngine] native subtitle OCR pre-fill done: ordinal=\(ordinal) "
                                + "cues=\(store.cueCount) exit=\(exit) waited=\(waited)ms", category: .engine)
@@ -2648,6 +2755,8 @@ extension AetherEngine {
             // Refusing costs nothing that selecting would have bought: nothing is drawn either way,
             // and only the refusal can be retried. `nativeSubtitleReapplyOrdinal` is set before this
             // runs, so the readers' own re-anchor re-selects once coverage reaches the playhead.
+            // AE#1052: the pre-fill can take seconds; a marker or another pick may have replaced this one.
+            guard generation == nativeSubtitleSelectGeneration else { return }
             if prefilledCues == 0 {
                 EngineLog.emit("[AetherEngine] native subtitle select refused: rendition ordinal=\(ordinal) "
                                + "is empty at the playhead, and AVKit caches what it is handed. "
@@ -2737,7 +2846,9 @@ extension AetherEngine {
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
                                      isForced: track.isForced,
-                                     needsOCR: true)
+                                     needsOCR: true,
+                                     title: track.sourceTitle,
+                                     isHearingImpaired: track.isHearingImpaired)
         }
     }
 
@@ -2746,20 +2857,54 @@ extension AetherEngine {
     /// legible option (device: three declared, groupOpts=2, and the second German track ended up
     /// selecting the English option through the old positional fallback). Same-language duplicates
     /// get a numbered suffix; the forced disposition is carried for FORCED=YES.
+    /// AE#1050: a track with its own title is named after it, so an SDH and a CC track in one
+    /// language read "English (SDH)" and "English (CC)" instead of "English" and "English 2".
     nonisolated static func nativeSubtitleRenditionInfos(
         for entries: [NativeSubtitleTrackEntry]
     ) -> [NativeSubtitleRenditionInfo] {
         var counts: [String: Int] = [:]
         return entries.enumerated().map { i, entry in
-            let base = entry.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+            let base = nativeSubtitleRenditionBaseName(language: entry.language, title: entry.title,
+                                                       isHearingImpaired: entry.isHearingImpaired)
                 ?? "Subtitle \(i + 1)"
             let n = (counts[base] ?? 0) + 1
             counts[base] = n
             return NativeSubtitleRenditionInfo(
                 language: entry.language,
                 name: n == 1 ? base : "\(base) \(n)",
-                isForced: entry.isForced
+                isForced: entry.isForced,
+                isHearingImpaired: entry.isHearingImpaired
             )
+        }
+    }
+
+    /// The language name, the track title, or both. A title that already names the language
+    /// ("English SDH") stands alone; one that does not ("SDH") goes in brackets after it. A title
+    /// that is only the language code ("eng") adds nothing and is dropped.
+    ///
+    /// An SDH track drops "SDH" from its title: it carries CHARACTERISTICS, and AVFoundation then
+    /// appends "SDH" to the name by itself. Measured on tvOS 26: NAME="English (SDH)" read
+    /// "English (SDH) SDH" in AVKit's menu.
+    nonisolated static func nativeSubtitleRenditionBaseName(language: String?, title: String?,
+                                                            isHearingImpaired: Bool = false) -> String? {
+        let languageName = language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
+        var cleanTitle = title?
+            // NAME is a quoted-string in the master; a quote or a line break would end the tag.
+            .replacingOccurrences(of: "\"", with: "'")
+            .components(separatedBy: .newlines).joined(separator: " ")
+        if isHearingImpaired, let t = cleanTitle {
+            cleanTitle = t.replacingOccurrences(of: #"\bSDH\b"#, with: "", options: [.regularExpression, .caseInsensitive])
+                .replacingOccurrences(of: #"\(\s*\)|\[\s*\]"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+        }
+        cleanTitle = cleanTitle?.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(.init(charactersIn: "-,/|")))
+        if let t = cleanTitle, t.isEmpty || (language.map { languageMatches(t, $0) } ?? false) { cleanTitle = nil }
+        switch (languageName, cleanTitle) {
+        case let (name?, title?):
+            return title.localizedCaseInsensitiveContains(name) ? title : "\(name) (\(title))"
+        case let (name?, nil): return name
+        case let (nil, title?): return title
+        case (nil, nil): return nil
         }
     }
 
@@ -2801,13 +2946,18 @@ extension AetherEngine {
             pendingNativeRenderingRequest = active
             return
         }
-        guard active, let activeIdx = activeSubtitleTrackIndex,
-              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
-        else {
-            setNativeSubtitleSelected(track: nil)
+        // AE#1052: back in the app, a host's menu marker stands again instead of a deselect.
+        guard active else {
+            applyNativeSubtitleSelection(track: nativeSubtitleMarkerOrdinal)
             return
         }
-        setNativeSubtitleSelected(track: ordinal)
+        guard let activeIdx = activeSubtitleTrackIndex,
+              let ordinal = Self.nativeSubtitleOrdinal(forActiveTrack: activeIdx, in: nativeSubtitleTrackTable)
+        else {
+            applyNativeSubtitleSelection(track: nil)
+            return
+        }
+        applyNativeSubtitleSelection(track: ordinal)
     }
 
     // MARK: - Session-preserving reload carryover (#170)
@@ -2840,6 +2990,7 @@ extension AetherEngine {
         carryover.secondarySidecarURL = carryover.secondaryTrackIndex == nil ? secondary.sidecarURL : nil
         carryover.nativeReapplyOrdinal = nativeSubtitleReapplyOrdinal
         carryover.reapplyOrdinalMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
+        carryover.nativeMarkerOrdinal = nativeSubtitleMarkerOrdinal
         return carryover
     }
 
@@ -2891,6 +3042,7 @@ extension AetherEngine {
         } else if let url = carryover.secondarySidecarURL {
             selectSecondarySidecarSubtitle(url: url)
         }
+        nativeSubtitleMarkerOrdinal = carryover.nativeMarkerOrdinal
         if let pending = pendingNativeRenderingRequest {
             pendingNativeRenderingRequest = nil
             setNativeSubtitleRendering(pending)
@@ -2905,7 +3057,7 @@ extension AetherEngine {
                 "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after session-preserving reload",
                 category: .engine
             )
-            setNativeSubtitleSelected(track: ordinal)
+            applyNativeSubtitleSelection(track: ordinal)
         }
     }
 
@@ -3016,6 +3168,14 @@ extension AetherEngine {
         nativeLegibleDeselectPinItem = nil
         nativeLegibleDeselectPinGroup = nil
         nativeLegibleDeselectPinBurst.reset()
+    }
+
+    // MARK: - Menu marker (AE#1052)
+
+    /// Only the marker's store answers empty; every other rendition serves as usual.
+    func silenceNativeRendition(ordinal: Int?) {
+        guard let stores = nativeVideoSession?.nativeSubtitleCueStoresForSession else { return }
+        for (index, store) in stores.enumerated() { store.servesSilently = index == ordinal }
     }
 
     // MARK: - Remote-HLS bypass legible selection (AE#154)
@@ -3175,6 +3335,9 @@ struct SubtitleDrainChannelWork {
 
 struct SubtitleDrainTickWork {
     let playhead: Double
+    /// AE#1022 round 3: the seek generation the tick was planned under. A seek in between moved
+    /// the playhead and closed the open sets the batch is about to publish again.
+    var seekGeneration: UInt64 = 0
     var channels: [SubtitleDrainChannelWork] = []
     var prefetchNeedsReanchor = false
 

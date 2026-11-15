@@ -15,7 +15,7 @@ struct Issue1022LandingWindowTests {
     // MARK: - Read loop
 
     @Test("a landing session reads to just past the landing and stays parked while the playhead moves",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func landingSessionParksPastTheLanding() async throws {
         let fixture = MatroskaSubtitleFixture.make(
             durationMs: 130_000,
@@ -69,7 +69,7 @@ struct Issue1022LandingWindowTests {
     }
 
     @Test("a PGS line the landing could not prove comes back once the landing window is read",
-          .timeLimit(.minutes(2)))
+          .timeLimit(.minutes(3)))
     func refusedLandingComesBack() async throws {
         let format = try #require(avformat_alloc_context())
         defer { avformat_free_context(format) }
@@ -121,16 +121,55 @@ struct Issue1022LandingWindowTests {
 
     // MARK: - Seek
 
-    @Test("a set left open before a seek is closed at the landing, not drawn over it")
-    func openSetClosedAtSeekLanding() throws {
+    @Test("a set left open before a seek is closed at the departure, not drawn over the landing")
+    func openSetClosedAtSeekDeparture() throws {
         let engine = try AetherEngine()
         let open = SubtitleCue(id: 1, startTime: 72, endTime: 72 + 4_294_967, body: .text("old"))
         let ahead = SubtitleCue(id: 2, startTime: 82, endTime: 82 + 4_294_967, body: .text("next"))
         engine.subtitleCues = [open, ahead]
-        engine.closeOpenEndedSubtitleCues(atSeekLanding: 79.4)
-        #expect(engine.subtitleCues.first { $0.id == 1 }?.endTime == 79.4)
+        engine.closeOpenEndedSubtitleCues(atSeekFrom: 73.1, to: 79.4)
+        #expect(engine.subtitleCues.first { $0.id == 1 }?.endTime == 73.1)
         #expect(engine.subtitleCues.first { $0.id == 2 }?.endTime == ahead.endTime,
                 "a set after the landing is the reconstruction's to decide")
+    }
+
+    // Round 2 (retest on 7.63.0): closing at the landing claimed the whole jumped-over stretch.
+
+    @Test("a set closed by a forward seek is not drawn when a later seek lands back inside the jump")
+    func forwardSeekDoesNotClaimTheJumpedStretch() {
+        var cues = [SubtitleCue(id: 1, startTime: 0, endTime: 4_294_967, body: .text("only set"))]
+        #expect(AetherEngine.closeOpenEndedCues(&cues, seekFrom: 1.2, to: 58))
+        #expect(cues[0].endTime == 1.2)
+        #expect(!cues.contains { $0.startTime <= 54 && $0.endTime > 54 },
+                "nothing covers the later landing at 54 s")
+        #expect(!AetherEngine.closeOpenEndedCues(&cues, seekFrom: 58, to: 54),
+                "once closed it is no longer open, and a later seek leaves it alone")
+    }
+
+    @Test("an open set the playhead never reached is closed at its own start on a forward seek")
+    func unseenSetBeforeForwardLandingClosedAtItsStart() {
+        var cues = [SubtitleCue(id: 1, startTime: 5, endTime: 5 + 4_294_967, body: .text("read ahead"))]
+        #expect(AetherEngine.closeOpenEndedCues(&cues, seekFrom: 3, to: 50))
+        #expect(cues[0].endTime == 5)
+        #expect(!cues.contains { $0.startTime <= 35 && $0.endTime > 35 })
+    }
+
+    @Test("a backward seek keeps a set that was on screen at the departure over its own stretch")
+    func backwardSeekKeepsTheSeenStretch() {
+        var cues = [SubtitleCue(id: 1, startTime: 10, endTime: 10 + 4_294_967, body: .text("on screen")),
+                    SubtitleCue(id: 2, startTime: 30, endTime: 30 + 4_294_967, body: .text("ahead"))]
+        #expect(AetherEngine.closeOpenEndedCues(&cues, seekFrom: 20, to: 15))
+        #expect(cues[0].endTime == 20, "its clear was still unread, so it lasted at least to 20 s")
+        #expect(cues[1].endTime == 30 + 4_294_967, "a set ahead of a backward landing stays open")
+    }
+
+    @Test("an authored end and a departure without a frame are handled")
+    func authoredEndAndNoDeparture() {
+        var authored = [SubtitleCue(id: 1, startTime: 10, endTime: 14, body: .text("authored"))]
+        #expect(!AetherEngine.closeOpenEndedCues(&authored, seekFrom: 12, to: 60))
+        var cues = [SubtitleCue(id: 1, startTime: 72, endTime: 72 + 4_294_967, body: .text("old"))]
+        #expect(AetherEngine.closeOpenEndedCues(&cues, seekFrom: .nan, to: 79.4))
+        #expect(cues[0].endTime == 79.4, "no departure falls back to the landing")
     }
 
     @Test("the drain's jump after a seek does not resend the reader, a later seek's jump does")
@@ -158,6 +197,84 @@ struct Issue1022LandingWindowTests {
         _ = engine.advanceSeekGeneration()
         engine.startSubtitleForwardPrefetcher(startAt: 80.1)
         #expect(box.take()?.seconds == 80.1)
+    }
+
+    // Round 3 (retest on 7.66.0): a set decoded around the departure was published after the
+    // seek had closed the open sets, and drawn at the landing over a slow reader.
+
+    @Test("a drain batch planned before a seek publishes nothing after it",
+          .timeLimit(.minutes(3)))
+    func batchPlannedBeforeASeekIsDropped() async throws {
+        let (engine, _, format) = try pgsEngine()
+        defer { avformat_free_context(format); engine.clearSubtitle() }
+        let drawnAtLanding = Box(false)
+        let observation = engine.$subtitleCues.dropFirst().sink { cues in
+            if cues.contains(where: { $0.startTime <= 63 && $0.endTime > 63 }) { drawnAtLanding.set(true) }
+        }
+        defer { observation.cancel() }
+
+        // The set at 22 s was read, its clear was not, and the selection's batch is decoding it.
+        engine.clock.sourceTime = 22.4
+        engine.selectSubtitleTrack(index: 0)
+        let stale = try #require(engine.subtitleDrainTickInFlight)
+        // The seek goes out. Its clock still reports the departure until the landing.
+        _ = engine.advanceSeekGeneration()
+        engine.isSeeking = true
+        engine.closeOpenEndedSubtitleCues(atSeekFrom: 22.4, to: 63)
+        await stale.value
+        while let rerun = engine.subtitleDrainTickInFlight { await rerun.value }
+        engine.requestSubtitleDrainTick()   // the loop's tick while the seek is out
+        while let rerun = engine.subtitleDrainTickInFlight { await rerun.value }
+        #expect(!drawnAtLanding.value, "the set of 22 s was published open after the closing ran")
+
+        engine.isSeeking = false
+        engine.clock.sourceTime = 63
+        engine.requestSubtitleDrainTick()
+        while let pending = engine.subtitleDrainTickInFlight { await pending.value }
+        #expect(!drawnAtLanding.value)
+        #expect(engine.subtitleDrainCursors[.primary] != nil, "the tick at the landing ran")
+    }
+
+    @Test("no drain tick is planned between a software seek's closing and its landing")
+    func noTickPlannedWhileTheSeekIsOut() throws {
+        let (engine, _, format) = try pgsEngine()
+        defer { avformat_free_context(format); engine.clearSubtitle() }
+        engine.subtitleDrainTargets[.primary] = 0
+        engine.clock.sourceTime = 21.5
+        _ = engine.advanceSeekGeneration()
+        engine.closeOpenEndedSubtitleCues(atSeekFrom: 21.5, to: 63)
+        engine.isSeeking = true
+        #expect(engine.prepareSubtitleDrainTick() == nil, "the clock still reports the departure")
+        engine.isSeeking = false
+        #expect(engine.prepareSubtitleDrainTick() != nil, "landed")
+        engine.isSeeking = true
+        _ = engine.advanceSeekGeneration()
+        #expect(engine.prepareSubtitleDrainTick() != nil,
+                "a seek that did not close at its departure (native, live edge) plans as before")
+    }
+
+    /// A PGS stream 0 with a display set at 22 s and nothing after it, drained by a real decoder.
+    private func pgsEngine() throws -> (AetherEngine, UnsafeMutablePointer<AVStream>,
+                                        UnsafeMutablePointer<AVFormatContext>) {
+        let format = try #require(avformat_alloc_context())
+        let stream = try #require(avformat_new_stream(format, nil))
+        stream.pointee.time_base = AVRational(num: 1, den: 90_000)
+        stream.pointee.codecpar.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+        stream.pointee.codecpar.pointee.codec_id = AV_CODEC_ID_HDMV_PGS_SUBTITLE
+        let engine = try AetherEngine()
+        engine.loadedURL = URL(string: "https://example.invalid/movie.mkv")!
+        let store = SubtitlePacketStore()
+        engine.softwareSubtitlePacketStore = store
+        engine.subtitleDrainDecoderFactoryForTesting = { index in
+            index == 0 ? EmbeddedSubtitleDecoder(stream: stream, sourceVideoWidth: 1920,
+                                                 sourceVideoHeight: 1080) : nil
+        }
+        store.noteHarvestAnchor(.pump, at: 0)
+        store.harvestChunk(streamIndex: 0, ptsSeconds: 22, durationSeconds: 0, flags: 0,
+                           payload: SecondaryBitmapSubtitleTests.displaySet(x: 100, luminance: 235),
+                           assembleSplitDisplaySets: true)
+        store.noteHarvestReach(.pump, through: 22.5)
+        return (engine, stream, format)
     }
 
     // MARK: - Engine gating

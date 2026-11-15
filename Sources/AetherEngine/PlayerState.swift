@@ -28,9 +28,10 @@ public enum PlaybackBackend: String, Sendable, Equatable {
     case none
     /// Removed in 1.0.0; reserved for hosts that still switch on it.
     case aether
-    /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC / H.264 / VP9.
+    /// HLS-fMP4 over loopback to AVPlayer + AVPlayerLayer. Default for HEVC, H.264 and hardware-decodable AV1.
     case native
-    /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Used for AV1 on tvOS (no HW decoder).
+    /// FFmpeg / dav1d + AVSampleBufferDisplayLayer. Every codec or shape the native route does not carry
+    /// (AV1 without a hardware decoder, VP9, MPEG-2, VC-1, interlaced H.264, FEL dual layer, ...).
     case software
     /// FFmpeg audio + AVSampleBufferAudioRenderer. No video pipeline.
     case audio
@@ -116,7 +117,9 @@ public enum AudioDelivery: String, Sendable, Equatable, CaseIterable {
     /// a TrueHD-MAT or JOC bitstream does not survive its PCM intermediate; under
     /// `LoadOptions.objectAudioRendering`, in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio`
     /// traits (off by default), TrueHD Atmos and DTS:X are rendered with their objects and heights into a
-    /// speaker bed and encoded as APAC instead, on the loopback route and on the software host alike.
+    /// speaker bed instead, delivered as linear PCM or, over AirPlay (or when forced), as APAC, on the
+    /// loopback route and on the software host alike. On tvOS the software host also decodes an E-AC-3
+    /// JOC track to a PCM bed through the system's Atmos decoder (AE#995) and reports this case.
     case bridged
     /// libavcodec decodes the audio to PCM and the engine renders it itself (the software path without an
     /// object-audio route, and the software audio-only host).
@@ -584,6 +587,34 @@ public struct LoadOptions: Sendable, Equatable {
     /// Ignored while `upscalesLowResolutionVideo` is off. A tuning field like it.
     public var upscaleScaler: UpscaleScaler = .automatic
 
+    /// Opt in to picture processing for HDR10 titles brighter than the display (#957). nil (the default)
+    /// is off.
+    ///
+    /// What it costs: a processed title plays on `SoftwarePlaybackHost`, not AVPlayer. There it has no
+    /// AVPlayer Picture in Picture (the host presents `softwarePiPSource` instead), less over AirPlay (the
+    /// sound goes to the receiver, the picture stays on this device), and an E-AC-3 Atmos (JOC) track
+    /// plays as its channel bed, without the objects, because on tvOS only AVPlayer emits them.
+    ///
+    /// What it does: every decoded frame runs a BT.2390 tone map in the PQ domain, from the source peak
+    /// (MaxCLL when it is below the mastering peak, else the mastering peak) to
+    /// `VideoProcessingOptions.targetPeakNits`, and the frame goes out with HDR10 metadata that says the
+    /// target, so the display does not tone map it again. Needs tvOS / iOS / macOS 26. These keep their
+    /// usual route: Dolby Vision, a source that is not HDR10 (SDR, HLG), a display that does not take
+    /// HDR10, a source whose container declares no mastering display and no MaxCLL, a source peak at or
+    /// below the target, a wireless AirPlay route and a demuxed-audio live stream. The load logs one
+    /// `[VideoProcessing]` line saying which.
+    ///
+    /// The processing never stops playback: a frame it cannot process is delivered as decoded, and
+    /// repeated failures, a sustained overrun of the frame budget or HDR10+ metadata in the stream switch
+    /// it off for the session (`AetherEngine.activeVideoProcessing`). A session it alone moved to the
+    /// software path then reloads on the native path (URL sources, not live).
+    ///
+    /// A tuning field: `reloadAtCurrentPosition(applying:)` carries a change on a URL source, which
+    /// re-runs `load()` and re-decides the route. On a custom `IOReader` source turning it off is honoured
+    /// in place, and turning it on or changing the target is refused with
+    /// `SessionReloadRefusal.videoProcessingRouteNeedsFreshLoad`.
+    public var videoProcessing: VideoProcessingOptions? = nil
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -666,6 +697,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// default): without a codec's trait this is a no-op for that codec, which keeps `audioBridgeMode`
     /// (`AetherEngine.OptionalComponent`).
     public var objectAudioRendering: ObjectAudioRendering
+
+    /// Whether `objectAudioRendering` applies to DTS:X. `true` (default) renders TrueHD Atmos and DTS:X
+    /// alike. `false` keeps every DTS track of this load on `audioBridgeMode`'s 7.1 channel decode while
+    /// TrueHD Atmos still renders into the asked layout, so one load covers a file that carries both, and
+    /// a switch between them needs no reload (AE#1060). Also stops the initial track pick from preferring
+    /// a DTS:X track for its heights.
+    public var rendersDTSXObjectAudio: Bool = true
 
     /// How a 3D source is presented where the system shows stereo (visionOS; elsewhere every source plays
     /// 2D as before). `.automatic` (default) keeps an MV-HEVC stream's second view and presents the frame
@@ -854,6 +892,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// Start the native WebVTT subtitle readers eagerly at load (instead of lazily on `setNativeSubtitleSelected`), so the `/subs_N_M.vtt` segments are already populated when AVKit fetches them under a host-independent selection (e.g. an `EXT-X-MEDIA ... DEFAULT=YES` rendition that AVKit auto-selects). Equivalent to a fully-populated static VOD subtitle file. Only meaningful with `prepareNativeSubtitles`. Default `false` (Sodalite#32 probe).
     public var eagerNativeSubtitleReaders: Bool = false
 
+    /// List every audio track of the source in the master's audio group, so a stock `AVPlayerViewController` offers all of them in its audio menu (AE#1049). Only the active track is muxed into the variant; the others are entries without a URI. When the viewer picks one, the engine switches to it through `selectAudioTrack(index:)`, which is a reload with a brief hold on the last frame. Off by default because a host with its own track picker gains nothing and the master changes shape. Applies to the loopback route only, and only where `selectAudioTrack` can switch (not live forward-only sources or a sequential origin). A tuning field: correctable through `reloadAtCurrentPosition(applying:)`.
+    public var nativeAudioTrackMenu: Bool = false
+
     /// Serve an I-frame rendition (`EXT-X-I-FRAME-STREAM-INF`) next to the master, so a stock `AVPlayerViewController` shows its own scrub thumbnails and can scan on I-frames, with no host code (AE#682). One still per served segment: the source's own keyframe at full resolution for SDR, and for HDR10, HLG and Dolby Vision a tone-mapped SDR Motion JPEG 640 pixels wide, since AVKit shows no scrub thumbnail from a PQ or Dolby Vision keyframe. Costs a second reader on the source for the whole session, opened shortly after load because AVKit asks for the first keyframe before anyone scrubs. Silently absent, with one log line naming the reason, when the session cannot answer every listed keyframe: live, a source without a trustworthy keyframe index (MPEG-TS), `sequentialOrigin`, `heldSourceConnection`, an origin limited to one request, a disc source, a custom reader that cannot clone, or media-playlist routing. A host with its own transport bar wants `scrubThumbnail` instead. A tuning field: correctable through `reloadAtCurrentPosition(applying:)`. Default `false`.
     public var serveIFramePlaylist: Bool = false
 
@@ -1040,6 +1081,10 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Optional temporary session-cache budget. Nil retains automatic sizing; zero keeps only the working window.
     public var sessionCacheByteBudget: Int? = nil
+    /// Opt-in hard total for resident AND in-flight fMP4 bytes. Unlike retention, this is not raised to the old hard window.
+    public var sessionCacheHardLimitBytes: Int? = nil
+    /// Free volume headroom preserved before every admitted disk write.
+    public var sessionCacheFreeReserveBytes: Int = 0
     /// Compressed-packet storage for seekable software VOD; automatic retains platform defaults.
     public var softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic
 
@@ -1152,6 +1197,13 @@ public struct LoadOptions: Sendable, Equatable {
     /// host's subtitle authority flag carries over. Consumed by the load; never persisted.
     var subtitleSessionCarryover: SubtitleSessionCarryover? = nil
 
+    /// ENGINE-INTERNAL: the engine read this URL's body and found an HLS playlist (the AE#154 / AE#246
+    /// reroute), which is why the session runs on the `nativeRemoteHLS` bypass. Not settable from the
+    /// public initializer. The bypass then declares the HLS MIME type on the asset, because AVFoundation
+    /// types a URL by its path extension and `Content-Type` and never by its body. Rides `loadedOptions`,
+    /// so every rebuild of a rerouted session keeps the declaration.
+    var hlsPlaylistProvenByBody: Bool = false
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -1165,12 +1217,14 @@ public struct LoadOptions: Sendable, Equatable {
         foldsDolbyVisionFEL: Bool = true,
         upscalesLowResolutionVideo: Bool = false,
         upscaleScaler: UpscaleScaler = .automatic,
+        videoProcessing: VideoProcessingOptions? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        rendersDTSXObjectAudio: Bool = true,
         stereoPresentation: StereoPresentation = .automatic,
         isLive: Bool = false,
         audioOnly: Bool = false,
@@ -1188,6 +1242,7 @@ public struct LoadOptions: Sendable, Equatable {
         preserveASSMarkup: Bool = false,
         prepareNativeSubtitles: Bool = false,
         eagerNativeSubtitleReaders: Bool = false,
+        nativeAudioTrackMenu: Bool = false,
         serveIFramePlaylist: Bool = false,
         generatesBackgroundScrubPreviews: Bool = true,
         confirmAtmos: Bool = false,
@@ -1205,6 +1260,8 @@ public struct LoadOptions: Sendable, Equatable {
         initialSubtitleTrackID: Int? = nil,
         forwardBufferSegments: Int? = nil,
         sessionCacheByteBudget: Int? = nil,
+        sessionCacheHardLimitBytes: Int? = nil,
+        sessionCacheFreeReserveBytes: Int = 0,
         softwarePacketCacheStorage: SoftwarePacketCacheStorage = .automatic,
         progressiveSegmentDelivery: Bool = false,
         autoplay: Bool = true,
@@ -1232,12 +1289,14 @@ public struct LoadOptions: Sendable, Equatable {
         self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.upscalesLowResolutionVideo = upscalesLowResolutionVideo
         self.upscaleScaler = upscaleScaler
+        self.videoProcessing = videoProcessing
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
         self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.rendersDTSXObjectAudio = rendersDTSXObjectAudio
         self.stereoPresentation = stereoPresentation
         self.isLive = isLive
         self.audioOnly = audioOnly
@@ -1255,6 +1314,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.preserveASSMarkup = preserveASSMarkup
         self.prepareNativeSubtitles = prepareNativeSubtitles
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
+        self.nativeAudioTrackMenu = nativeAudioTrackMenu
         self.serveIFramePlaylist = serveIFramePlaylist
         self.generatesBackgroundScrubPreviews = generatesBackgroundScrubPreviews
         self.confirmAtmos = confirmAtmos
@@ -1272,6 +1332,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.initialSubtitleTrackID = initialSubtitleTrackID
         self.forwardBufferSegments = forwardBufferSegments
         self.sessionCacheByteBudget = sessionCacheByteBudget
+        self.sessionCacheHardLimitBytes = sessionCacheHardLimitBytes
+        self.sessionCacheFreeReserveBytes = max(0, sessionCacheFreeReserveBytes)
         self.softwarePacketCacheStorage = softwarePacketCacheStorage
         self.progressiveSegmentDelivery = progressiveSegmentDelivery
         self.autoplay = autoplay
@@ -1558,6 +1620,10 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// that pass did not run for this track (not requested, not the targeted track, not TrueHD, or a session's
     /// track list). `.atmos` also sets `profile` to "Dolby TrueHD + Dolby Atmos".
     public internal(set) var trueHDAtmos: TrueHDAtmosVerdict?
+
+    /// AE#1050: the title the container or the host gave the track, nil when `name` is the engine's own
+    /// fallback ("ENG (subrip)", "Track 3 (subrip)"). Native subtitle renditions name themselves from it.
+    var sourceTitle: String? = nil
 
     public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isVisualImpaired: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false, sampleRate: Int = 0, bitsPerSample: Int = 0, sampleFormat: String? = nil, channelLayout: String? = nil, profile: String? = nil, isDTSX: Bool = false) {
         self.sampleRate = sampleRate
@@ -1959,5 +2025,71 @@ public struct UpscaleStatus: Sendable, Equatable {
         self.targetSize = targetSize
         self.degraded = degraded
         self.disabledReason = disabledReason
+    }
+}
+
+/// Picture processing for an HDR10 title on a display that cannot show all of it (#957), set as
+/// `LoadOptions.videoProcessing`. nil (the default) is off.
+public struct VideoProcessingOptions: Sendable, Equatable {
+    /// The display's peak luminance in nit: highlights above it are rolled off (BT.2390) before the
+    /// display gets the picture, and the HDR10 metadata sent with it says this peak, so the display does
+    /// not tone map a second time. A title whose source peak is at or below it is not processed.
+    public var targetPeakNits: Double
+
+    public init(targetPeakNits: Double) {
+        self.targetPeakNits = targetPeakNits
+    }
+}
+
+/// One stage of the picture processing (`VideoProcessingStatus.stages`).
+public enum VideoProcessingStage: String, Sendable, Equatable {
+    /// BT.2390 tone map in the PQ domain, from the source peak to `VideoProcessingOptions.targetPeakNits`.
+    case toneMap
+}
+
+/// What the picture processing is doing for the current session (#957), published as
+/// `AetherEngine.activeVideoProcessing` once the first processed frame is delivered, nil otherwise.
+public struct VideoProcessingStatus: Sendable, Equatable {
+    /// The stages that run on every frame, in order.
+    public let stages: [VideoProcessingStage]
+    /// The source peak the tone map starts from, in nit.
+    public let sourcePeakNits: Double
+    /// Which value set `sourcePeakNits`: the mastering display's peak, or MaxCLL when it is lower.
+    public let sourcePeak: ToneMapSourcePeak
+    /// The peak the picture is mapped to (`VideoProcessingOptions.targetPeakNits`).
+    public let targetPeakNits: Double
+    /// Set when the processing switched itself off mid-session (repeated failures, a sustained overrun
+    /// of the frame budget, or HDR10+ metadata in the stream); frames are then delivered as decoded.
+    public let disabledReason: String?
+
+    init(stages: [VideoProcessingStage], sourcePeakNits: Double, sourcePeak: ToneMapSourcePeak,
+         targetPeakNits: Double, disabledReason: String? = nil) {
+        self.stages = stages
+        self.sourcePeakNits = sourcePeakNits
+        self.sourcePeak = sourcePeak
+        self.targetPeakNits = targetPeakNits
+        self.disabledReason = disabledReason
+    }
+
+    /// The status of a plan before or without a processed frame.
+    init(plan: VideoProcessingPlan, disabledReason: String? = nil) {
+        self.init(stages: [.toneMap], sourcePeakNits: plan.curve.sourcePeakNits, sourcePeak: plan.sourcePeak,
+                  targetPeakNits: plan.curve.targetPeakNits, disabledReason: disabledReason)
+    }
+
+    /// A processed frame publishes what ran (the first one, and one that rebuilt the curve), unless a
+    /// disable was already published.
+    static func afterProcessedFrame(_ delivered: VideoProcessingStatus, current: VideoProcessingStatus?) -> VideoProcessingStatus {
+        if let current, current.disabledReason != nil { return current }
+        return delivered
+    }
+
+    /// A disable keeps what was published and adds the reason; `plan` stands in when nothing was.
+    static func afterDisable(reason: String, current: VideoProcessingStatus?, plan: VideoProcessingPlan)
+        -> VideoProcessingStatus {
+        let base = current ?? VideoProcessingStatus(plan: plan)
+        return VideoProcessingStatus(stages: base.stages, sourcePeakNits: base.sourcePeakNits,
+                                     sourcePeak: base.sourcePeak, targetPeakNits: base.targetPeakNits,
+                                     disabledReason: reason)
     }
 }
