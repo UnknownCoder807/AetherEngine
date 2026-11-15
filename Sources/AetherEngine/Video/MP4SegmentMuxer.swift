@@ -204,14 +204,13 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    /// Latched from `VideoConfig.convertsAnnexBSamples`.
+    private let convertsAnnexBVideoSamples: Bool
     #if os(tvOS)
-    private let hvc1Configuration: AnnexBSampleConverter.HVC1Configuration?
     /// The init segment's SPS lost its 2176-to-2160 padding crop (`HEVCConformanceCrop`), so in-band
     /// copies must lose it too.
     private let removesUHDPaddingCrop: Bool
     #endif
-    /// Latched from `VideoConfig.convertsAnnexBSamples`.
-    private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
@@ -335,23 +334,9 @@ final class MP4SegmentMuxer {
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
         self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
         #if os(tvOS)
-        let cropFreeConfiguration = Self.cropFreeConfiguration(for: video)
-        removesUHDPaddingCrop = cropFreeConfiguration != nil
-        if cropFreeConfiguration != nil {
+        removesUHDPaddingCrop = Self.cropFreeConfiguration(for: video) != nil
+        if removesUHDPaddingCrop {
             EngineLog.emit("[MP4SegmentMuxer] 3840x2176 HEVC cropped to 2160: conformance window cleared in the init segment and in-band SPS (Apple TV hardware decode)", category: .session)
-        }
-        if video.convertsAnnexBSamples, video.codecTagOverride == "hvc1",
-           video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
-           let record = cropFreeConfiguration ?? video.extradataOverride, record.first == 1 {
-            hvc1Configuration = record.withUnsafeBufferPointer { buffer in
-                guard let base = buffer.baseAddress else { return nil }
-                return AnnexBSampleConverter.HVC1Configuration(parameterSets: parseHVCCParameterSets(base, buffer.count))
-            }
-            if hvc1Configuration != nil {
-                EngineLog.emit("[MP4SegmentMuxer] hvc1 init supplies VPS/SPS/PPS; omitting byte-identical picture headers until a configuration change", category: .session)
-            }
-        } else {
-            hvc1Configuration = nil
         }
         #endif
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
@@ -758,9 +743,7 @@ final class MP4SegmentMuxer {
         // record declares. A packet with no start code is written as it came.
         if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
             #if os(tvOS)
-            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet, orderHEVCParameterSets: true,
-                                                             hvc1Configuration: hvc1Configuration,
-                                                             removeUHDPaddingCrop: removesUHDPaddingCrop)
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet, removeUHDPaddingCrop: removesUHDPaddingCrop)
             #else
             _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
             #endif

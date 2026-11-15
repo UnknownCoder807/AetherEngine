@@ -2,7 +2,7 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Rewrites an Annex-B video sample to 4-byte length-prefixed NALs, optionally omitting duplicates of a fixed hvc1 configuration on tvOS.
+/// Rewrites an Annex-B video sample to 4-byte length-prefixed NALs, keeping every NAL.
 ///
 /// movenc does this conversion itself whenever the extradata is Annex B, but for an `hvc1` sample
 /// entry it runs `ff_hevc_annexb2mp4` with `filter_ps` set and drops every in-band VPS, SPS and PPS.
@@ -47,104 +47,30 @@ enum AnnexBSampleConverter {
         return ranges
     }
 
-    /// Some TS encoders put timing SEI before the parameter sets it references. Move parameter sets
-    /// ahead of prefix SEI in the leading, single-layer HEVC headers. Preserve the delimiter, all
-    /// NAL payloads and the order within each group. Stop at a slice, another layer or any other NAL.
-    static func orderHEVCHeaders(_ ranges: inout [Range<Int>], in bytes: UnsafeRawBufferPointer) {
-        var firstSEI: Int?
-        var parameterSets: [Range<Int>] = []
-        var end = 0
-        for (index, range) in ranges.enumerated() {
-            guard range.count >= 2 else { break }
-            let first = bytes[range.lowerBound]
-            let second = bytes[range.lowerBound + 1]
-            // Base layer, valid temporal_id_plus1, forbidden_zero_bit clear.
-            guard first & 0x81 == 0, second & 0xf8 == 0, second & 7 != 0 else { break }
-            let type = first >> 1
-            if type == 35 && index == 0 { continue }
-            if type == 39 {
-                if firstSEI == nil { firstSEI = index }
-            } else if (32...34).contains(type) {
-                if firstSEI != nil { parameterSets.append(range) }
-            } else {
-                break
-            }
-            end = index + 1
-        }
-        guard let start = firstSEI, !parameterSets.isEmpty else { return }
-        let metadata = ranges[start..<end].filter { bytes[$0.lowerBound] >> 1 == 39 }
-        ranges.replaceSubrange(start..<end, with: parameterSets + metadata)
-    }
-
-    /// Owned by one muxer on its packet-writing thread. Once a source supplies a different
-    /// parameter set, all subsequent updates (including a return to the original) must pass.
-    final class HVC1Configuration {
-        private let initial: [[UInt8]]
-        private var changed = false
-
-        init?(parameterSets: [[UInt8]]) {
-            let ordered = parameterSets.sorted { ($0.first ?? 0) < ($1.first ?? 0) }
-            guard ordered.count == 3 else { return nil }
-            for (index, nal) in ordered.enumerated() {
-                guard nal.count >= 3, nal[0] == UInt8((32 + index) * 2), nal[1] == 1 else { return nil }
-            }
-            initial = ordered
-        }
-
-        func omitRepeatedHeaders(_ ranges: inout [Range<Int>], in bytes: UnsafeRawBufferPointer) {
-            guard !changed else { return }
-            var headers: [Int] = []
-            var hasPicture = false
-            for (index, range) in ranges.enumerated() {
-                let type = Int((bytes[range.lowerBound] >> 1) & 63)
-                if type < 32 { hasPicture = true }
-                guard (32...34).contains(type) else { continue }
-                guard bytes[range].elementsEqual(initial[type - 32]) else {
-                    changed = true
-                    return
-                }
-                headers.append(index)
-            }
-            // Keep parameter-only packets intact. Do not create empty or metadata-only samples.
-            if hasPicture {
-                for index in headers.reversed() { ranges.remove(at: index) }
-            }
-        }
-    }
-
     /// Replace the packet's payload with its length-prefixed form. False when the payload holds no
     /// start code (the packet is left untouched) or the new buffer could not be allocated.
     ///
     /// The payload goes into a new buffer rather than being rewritten in place: a demuxed packet's
     /// buffer can be shared with another reference.
+    ///
+    /// `removeUHDPaddingCrop` replaces an SPS that codes 3840x2176 cropped to 2160 with its crop-free
+    /// form (`HEVCConformanceCrop`), so the sample agrees with the init segment the tvOS remux wrote.
     static func convertToLengthPrefixed(_ packet: UnsafeMutablePointer<AVPacket>,
-                                        orderHEVCParameterSets: Bool = false,
-                                        hvc1Configuration: HVC1Configuration? = nil,
                                         removeUHDPaddingCrop: Bool = false) -> Bool {
-        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
-        let packetBytes = UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))
+        guard let packetData = packet.pointee.data, packet.pointee.size > 0 else { return false }
+        let packetBytes = UnsafeRawBufferPointer(start: packetData, count: Int(packet.pointee.size))
         let packetRanges = nalRanges(packetBytes)
         guard !packetRanges.isEmpty else { return false }
-        // An SPS that still carries the padding crop is replaced before anything compares or copies
-        // it, so the sample never reaches the decoder with the geometry the init segment dropped.
         if removeUHDPaddingCrop,
            let cropFree = HEVCConformanceCrop.removingUHDPaddingCrop(fromAnnexB: packetBytes, ranges: packetRanges) {
-            return cropFree.withUnsafeBytes { bytes in
-                write(packet, source: bytes, ranges: nalRanges(bytes),
-                      orderHEVCParameterSets: orderHEVCParameterSets, hvc1Configuration: hvc1Configuration)
-            }
+            return cropFree.withUnsafeBytes { write(packet, source: $0, ranges: nalRanges($0)) }
         }
-        return write(packet, source: packetBytes, ranges: packetRanges,
-                     orderHEVCParameterSets: orderHEVCParameterSets, hvc1Configuration: hvc1Configuration)
+        return write(packet, source: packetBytes, ranges: packetRanges)
     }
 
     private static func write(_ packet: UnsafeMutablePointer<AVPacket>, source: UnsafeRawBufferPointer,
-                              ranges: [Range<Int>], orderHEVCParameterSets: Bool,
-                              hvc1Configuration: HVC1Configuration?) -> Bool {
-        guard let data = source.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
-        var ranges = ranges
-        hvc1Configuration?.omitRepeatedHeaders(&ranges, in: source)
-        if orderHEVCParameterSets { orderHEVCHeaders(&ranges, in: source) }
+                              ranges: [Range<Int>]) -> Bool {
+        guard let data = source.baseAddress?.assumingMemoryBound(to: UInt8.self), !ranges.isEmpty else { return false }
         let total = ranges.reduce(0) { $0 + 4 + $1.count }
         guard total <= Int(Int32.max) else { return false }
 

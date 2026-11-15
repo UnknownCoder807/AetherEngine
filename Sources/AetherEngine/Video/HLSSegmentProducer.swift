@@ -5505,14 +5505,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         packet.pointee.stream_index = muxer.audioOutputStreamIndex
         av_packet_rescale_ts(packet, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-        #if os(tvOS)
-        if audio.stripAacAdts {
-            packet.pointee.duration = SourceTimestampBounds.aacDuration(
-                packet.pointee.duration, muxedDts: packet.pointee.dts, nextSourceDts: nextDts,
-                sourceTimeBase: audio.inputTimeBase, muxerTimeBase: muxer.muxerAudioTimeBase
-            )
-        }
-        #endif
         let prime = copyAudioPrimeCandidate(packet)
         if muxer.writePacket(packet).rc >= 0, let prime {
             audioMoovPrimeFrame = prime

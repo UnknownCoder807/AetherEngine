@@ -63,24 +63,9 @@ struct HEVCConformanceCropTests {
         #expect(HEVCConformanceCrop.removingUHDPaddingCrop(fromConfiguration: annexB) == expected)
     }
 
-    @Test("An in-band cropped SPS matches the rewritten init and is omitted with it")
-    func omitsInBandCopy() throws {
-        let config = try #require(AnnexBSampleConverter.HVC1Configuration(parameterSets: [vps, cropFree, pps]))
-        let sample: [UInt8] = [vps, cropped, pps, idr].flatMap { [0, 0, 1] + $0 }
-        var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
-        defer { av_packet_free(&packet) }
-        let pkt = try #require(packet)
-        try #require(av_new_packet(pkt, Int32(sample.count)) == 0)
-        sample.withUnsafeBytes { _ = memcpy(pkt.pointee.data, $0.baseAddress, sample.count) }
-        #expect(AnnexBSampleConverter.convertToLengthPrefixed(
-            pkt, orderHEVCParameterSets: true, hvc1Configuration: config, removeUHDPaddingCrop: true))
-        let out = Array(UnsafeBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
-        #expect(out == [0, 0, 0, UInt8(idr.count)] + idr)
-    }
-
-    @Test("Without an init to compare against, the in-band SPS is replaced rather than passed")
+    @Test("An in-band cropped SPS is replaced and every other NAL is kept")
     func replacesInBandCopy() throws {
-        let sample: [UInt8] = [cropped, idr].flatMap { [0, 0, 1] + $0 }
+        let sample: [UInt8] = [vps, cropped, pps, idr].flatMap { [0, 0, 1] + $0 }
         var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
         defer { av_packet_free(&packet) }
         let pkt = try #require(packet)
@@ -88,6 +73,7 @@ struct HEVCConformanceCropTests {
         sample.withUnsafeBytes { _ = memcpy(pkt.pointee.data, $0.baseAddress, sample.count) }
         #expect(AnnexBSampleConverter.convertToLengthPrefixed(pkt, removeUHDPaddingCrop: true))
         let out = Array(UnsafeBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
-        #expect(out == [0, 0, 0, UInt8(cropFree.count)] + cropFree + [0, 0, 0, UInt8(idr.count)] + idr)
+        let expected: [UInt8] = [vps, cropFree, pps, idr].flatMap { [0, 0, 0, UInt8($0.count)] + $0 }
+        #expect(out == expected)
     }
 }

@@ -717,7 +717,7 @@ extension HLSVideoEngine {
                 EngineLog.emit(
                     "[HLSVideoEngine] #365 HEVC on Annex-B packets: the muxer gets a length-prefixed "
                     + "record (\(source.count) B → \(record.count) B) and converts the samples itself, "
-                    + "preserving in-band configuration changes",
+                    + "keeping their in-band parameter sets",
                     category: .session
                 )
                 var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
