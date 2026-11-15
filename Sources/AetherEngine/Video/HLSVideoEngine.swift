@@ -918,6 +918,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
     let restartLock = NSLock()
+    #if os(tvOS)
+    private var producerLifetime = HLSProducerLifetime()
+    #endif
 
     /// AE#464: the host's audio presentation offset, in seconds, that `makeProducer` hands to every
     /// muxer it builds. A muxer's offset is fixed for its life, so setting this alone changes nothing
@@ -3554,6 +3557,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // while the pump exits a parked HTTP byte-range read).
         restartLock.lock()
         sessionEpoch &+= 1
+        #if os(tvOS)
+        let outgoingLifetime = producerLifetime
+        producerLifetime = HLSProducerLifetime()
+        #endif
         retentionClaim?.release()
         retentionClaim = nil
         let p = producer
@@ -3634,7 +3641,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
             previewBuilder?.close()
             ladder?.keyframes.shutdown()
             ladder?.builder.close()
+            #if os(tvOS)
+            // Includes a producer retired by a seek or live reopen and a seek
+            // restart still using the audio bridge outside restartLock.
+            let drainStarted = ContinuousClock.now
+            await withCheckedContinuation { (drained: CheckedContinuation<Void, Never>) in
+                outgoingLifetime.close { drained.resume() }
+            }
+            let elapsed = drainStarted.duration(to: .now)
+            if elapsed >= .seconds(3) {
+                EngineLog.emit("[HLSVideoEngine] cleanup waited \(elapsed) for outgoing producer work",
+                               category: .session)
+            }
+            #else
             _ = p?.waitForFinish(timeout: 3.0)
+            #endif
             s?.stop()
             if let c {
                 _ = c.close(reason: reason)
@@ -3650,7 +3671,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             d?.close()
             sd?.close()
             preopened?.close()
-            _ = ownedParams
+            withExtendedLifetime(ownedParams) {}
         }
     }
 
@@ -3892,6 +3913,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
         // below. The side readers read one gate for the whole session, so a restart must not leave
         // a gap where nobody claims the link.
+        #if os(tvOS)
+        prod.sessionLifetime = producerLifetime
+        #endif
         prod.sideReaderLinkGate = sideReaderLinkGate
         prod.playedMediaLedger = playedMediaLedger
         prod.sourceAnnouncesDiscontinuities = liveSourceAnnouncesDiscontinuities
@@ -5277,6 +5301,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
         let epoch = sessionEpoch
         let old = producer
+        #if os(tvOS)
+        let lifetime = producerLifetime
+        guard lifetime.begin() else { restartLock.unlock(); return }
+        defer { lifetime.end() }
+        #endif
         producer = nil
         let ab = audioBridge
         let targetStartPts = segmentPlan[idx].startPts

@@ -1025,6 +1025,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     private let stateLock = NSLock()
     private var pumpStarted = false
+    #if os(tvOS)
+    // Set by the HLS session before publishing this producer.
+    var sessionLifetime: HLSProducerLifetime?
+    #endif
     private var shouldStop = false
     /// #65: set when awaitBackpressureRelease breaks a frozen VOD park. runPumpLoop maps the resulting
     /// muxer-nil exit to .backpressureWedge so the host re-anchors rather than treating it as a failure.
@@ -2994,12 +2998,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                "a live producer started without its provider reports cuts segments no playlist lists (audit HLS-101)")
         stateLock.lock()
         guard !pumpStarted else { stateLock.unlock(); return }
+        #if os(tvOS)
+        let lifetime = sessionLifetime
+        guard !shouldStop, lifetime?.begin() != false else { stateLock.unlock(); return }
+        #endif
         pumpStarted = true
         stateLock.unlock()
 
         // AE#286: a thread we own rather than a dispatch queue, because the pump's urgency changes
         // within one long-running block and a queue's QoS is fixed at creation.
         let thread = Thread { [weak self] in
+            #if os(tvOS)
+            defer { lifetime?.end() }
+            #endif
             self?.runPumpLoop()
         }
         thread.name = "AetherEngine.HLSSegmentProducer.pump"
