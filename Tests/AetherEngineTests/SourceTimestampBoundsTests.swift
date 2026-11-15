@@ -7,6 +7,22 @@ import AetherLibavcodec
 /// trap the pump on Int64 overflow.
 struct SourceTimestampBoundsTests {
 
+    @Test func copiedAACDurationRespectsNextSampleWithoutFillingGaps() {
+        func duration(next: Int64?) -> Int64 {
+            SourceTimestampBounds.aacDuration(
+                1024, muxedDts: 959616, nextSourceDts: next,
+                sourceTimeBase: AVRational(num: 1, den: 90000),
+                muxerTimeBase: AVRational(num: 1, den: 48000)
+            )
+        }
+        #expect(duration(next: 1801170) == 1008)
+        #expect(duration(next: 1801200) == 1024)
+        #expect(duration(next: 1801260) == 1024)
+        #expect(duration(next: 1799000) == 1024)
+        #expect(duration(next: nil) == 1024)
+        #expect(duration(next: Int64.min) == 1024)
+    }
+
     private func withPacket(pts: Int64, dts: Int64, duration: Int64 = 0,
                             _ body: (UnsafeMutablePointer<AVPacket>) -> Void) throws {
         let packet = try #require(av_packet_alloc())

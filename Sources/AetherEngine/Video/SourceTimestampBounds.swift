@@ -68,6 +68,18 @@ enum SourceTimestampBounds {
         return true
     }
 
+    /// Limit a copied AAC sample to the next decode timestamp. Compare in the muxer's clock so that
+    /// rounding the duration separately from the two timestamps cannot reintroduce an overlap.
+    static func aacDuration(_ duration: Int64, muxedDts: Int64, nextSourceDts: Int64?,
+                            sourceTimeBase: AVRational, muxerTimeBase: AVRational) -> Int64 {
+        guard duration > 0, muxedDts != Int64.min, let nextSourceDts, nextSourceDts != Int64.min else {
+            return duration
+        }
+        let next = av_rescale_q(nextSourceDts, sourceTimeBase, muxerTimeBase)
+        guard next > muxedDts else { return duration }
+        return min(duration, difference(next, muxedDts))
+    }
+
     /// Saturating tick arithmetic. The floor is `Int64.min + 1` so a result never reads as AV_NOPTS_VALUE.
     static func difference(_ lhs: Int64, _ rhs: Int64) -> Int64 {
         let (value, overflow) = lhs.subtractingReportingOverflow(rhs)
