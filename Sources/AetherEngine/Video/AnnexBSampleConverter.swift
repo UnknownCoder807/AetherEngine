@@ -2,7 +2,7 @@ import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
-/// Rewrites an Annex-B video sample to 4-byte length-prefixed NALs, keeping every NAL.
+/// Rewrites an Annex-B video sample to 4-byte length-prefixed NALs, optionally omitting duplicates of a fixed hvc1 configuration on tvOS.
 ///
 /// movenc does this conversion itself whenever the extradata is Annex B, but for an `hvc1` sample
 /// entry it runs `ff_hevc_annexb2mp4` with `filter_ps` set and drops every in-band VPS, SPS and PPS.
@@ -76,17 +76,55 @@ enum AnnexBSampleConverter {
         ranges.replaceSubrange(start..<end, with: parameterSets + metadata)
     }
 
+    /// Owned by one muxer on its packet-writing thread. Once a source supplies a different
+    /// parameter set, all subsequent updates (including a return to the original) must pass.
+    final class HVC1Configuration {
+        private let initial: [[UInt8]]
+        private var changed = false
+
+        init?(parameterSets: [[UInt8]]) {
+            let ordered = parameterSets.sorted { ($0.first ?? 0) < ($1.first ?? 0) }
+            guard ordered.count == 3 else { return nil }
+            for (index, nal) in ordered.enumerated() {
+                guard nal.count >= 3, nal[0] == UInt8((32 + index) * 2), nal[1] == 1 else { return nil }
+            }
+            initial = ordered
+        }
+
+        func omitRepeatedHeaders(_ ranges: inout [Range<Int>], in bytes: UnsafeRawBufferPointer) {
+            guard !changed else { return }
+            var headers: [Int] = []
+            var hasPicture = false
+            for (index, range) in ranges.enumerated() {
+                let type = Int((bytes[range.lowerBound] >> 1) & 63)
+                if type < 32 { hasPicture = true }
+                guard (32...34).contains(type) else { continue }
+                guard bytes[range].elementsEqual(initial[type - 32]) else {
+                    changed = true
+                    return
+                }
+                headers.append(index)
+            }
+            // Keep parameter-only packets intact. Do not create empty or metadata-only samples.
+            if hasPicture {
+                for index in headers.reversed() { ranges.remove(at: index) }
+            }
+        }
+    }
+
     /// Replace the packet's payload with its length-prefixed form. False when the payload holds no
     /// start code (the packet is left untouched) or the new buffer could not be allocated.
     ///
     /// The payload goes into a new buffer rather than being rewritten in place: a demuxed packet's
     /// buffer can be shared with another reference.
     static func convertToLengthPrefixed(_ packet: UnsafeMutablePointer<AVPacket>,
-                                        orderHEVCParameterSets: Bool = false) -> Bool {
+                                        orderHEVCParameterSets: Bool = false,
+                                        hvc1Configuration: HVC1Configuration? = nil) -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return false }
         let source = UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size))
         var ranges = nalRanges(source)
         guard !ranges.isEmpty else { return false }
+        hvc1Configuration?.omitRepeatedHeaders(&ranges, in: source)
         if orderHEVCParameterSets { orderHEVCHeaders(&ranges, in: source) }
         let total = ranges.reduce(0) { $0 + 4 + $1.count }
         guard total <= Int(Int32.max) else { return false }

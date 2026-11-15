@@ -204,6 +204,9 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    #if os(tvOS)
+    private let hvc1Configuration: AnnexBSampleConverter.HVC1Configuration?
+    #endif
     /// Latched from `VideoConfig.convertsAnnexBSamples`.
     private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
@@ -328,6 +331,21 @@ final class MP4SegmentMuxer {
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
         self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
+        #if os(tvOS)
+        if video.convertsAnnexBSamples, video.codecTagOverride == "hvc1",
+           video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           let record = video.extradataOverride, record.first == 1 {
+            hvc1Configuration = record.withUnsafeBufferPointer { buffer in
+                guard let base = buffer.baseAddress else { return nil }
+                return AnnexBSampleConverter.HVC1Configuration(parameterSets: parseHVCCParameterSets(base, buffer.count))
+            }
+            if hvc1Configuration != nil {
+                EngineLog.emit("[MP4SegmentMuxer] hvc1 init supplies VPS/SPS/PPS; omitting byte-identical picture headers until a configuration change", category: .session)
+            }
+        } else {
+            hvc1Configuration = nil
+        }
+        #endif
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -725,7 +743,8 @@ final class MP4SegmentMuxer {
         // record declares. A packet with no start code is written as it came.
         if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
             #if os(tvOS)
-            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet, orderHEVCParameterSets: true)
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet, orderHEVCParameterSets: true,
+                                                             hvc1Configuration: hvc1Configuration)
             #else
             _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
             #endif

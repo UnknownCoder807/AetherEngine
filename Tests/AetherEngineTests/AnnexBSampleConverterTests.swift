@@ -24,13 +24,32 @@ struct AnnexBSampleConverterTests {
     }
 
     /// Run the packet-level conversion on a fresh packet holding `bytes`; nil when it declined.
-    private func convert(_ bytes: [UInt8], orderHEVCParameterSets: Bool = false) -> [UInt8]? {
+    private func convert(_ bytes: [UInt8], orderHEVCParameterSets: Bool = false,
+                         configuration: AnnexBSampleConverter.HVC1Configuration? = nil) -> [UInt8]? {
         var packet: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
         defer { av_packet_free(&packet) }
         guard let pkt = packet, av_new_packet(pkt, Int32(bytes.count)) == 0 else { return nil }
         bytes.withUnsafeBytes { _ = memcpy(pkt.pointee.data, $0.baseAddress, bytes.count) }
-        guard AnnexBSampleConverter.convertToLengthPrefixed(pkt, orderHEVCParameterSets: orderHEVCParameterSets) else { return nil }
+        guard AnnexBSampleConverter.convertToLengthPrefixed(pkt, orderHEVCParameterSets: orderHEVCParameterSets,
+                                                            hvc1Configuration: configuration) else { return nil }
         return Array(UnsafeBufferPointer(start: pkt.pointee.data, count: Int(pkt.pointee.size)))
+    }
+
+    @Test("hvc1 drops init duplicates until the first configuration change")
+    func repeatsAndUpdates() throws {
+        let sps: [UInt8] = [0x42, 1, 0x80]
+        let metadata: [UInt8] = [0x4e, 1, 0x80]
+        let initial = [vps, sps, pps]
+        let config = try #require(AnnexBSampleConverter.HVC1Configuration(parameterSets: initial))
+        func packet(_ units: [[UInt8]]) -> [UInt8]? {
+            convert(units.flatMap { [0, 0, 1] + $0 }, orderHEVCParameterSets: true, configuration: config)
+        }
+        #expect(packet(initial) == lengthPrefixed(initial))
+        #expect(packet([aud] + initial + [metadata, idr]) == lengthPrefixed([aud, metadata, idr]))
+        let update = [vps, sps, pps + [0x80], idr]
+        #expect(packet(update) == lengthPrefixed(update))
+        #expect(packet(initial + [idr]) == lengthPrefixed(initial + [idr]))
+        #expect(AnnexBSampleConverter.HVC1Configuration(parameterSets: [sps, pps]) == nil)
     }
 
     @Test("tvOS native remux keeps header payloads and preserves order within each group")
