@@ -48,6 +48,7 @@ struct FabricatedRangeOriginTests {
         let refill = AVIOReader.persistentRangeBytes - Int64(AVIOReader.rangeCheckBytes)
         #expect(server.requestLog.contains { $0.start == refill },
                 "no refill asked from \(refill): \(server.requestLog.map(\.start))")
+        #expect(!reader.detectedFabricatedRange)
         #expect(!FabricatedRangeOrigins.caughtRecently(url, within: 60))
     }
 
@@ -114,12 +115,21 @@ struct FabricatedRangeOriginTests {
         #expect(result.wrongAt == nil, "a fabricated byte reached the demuxer at \(result.wrongAt ?? -1)")
         #expect(result.failed, "the reads ran on to \(result.read) over a fabricated range")
         #expect(result.read <= headEnd)
+        #expect(reader.detectedFabricatedRange)
         let check = headEnd - Int64(AVIOReader.rangeCheckBytes)
         #expect(server.requestLog.contains { $0.start == check },
                 "no checked reconnect at the head's end: \(server.requestLog.map(\.start))")
         // Deliberately immediate: a failed read must already have published its cause.
         // Waiting for the registry would hide the wake-before-record race in AVIOReader.
         #expect(FabricatedRangeOrigins.caughtRecently(url, within: 60))
+    }
+
+    @MainActor
+    @Test("a fabricated range detected before native session installation has a typed failure")
+    func startupRangeMismatchIsTyped() throws {
+        let engine = try AetherEngine()
+        engine.publishLoadFailure(AVIOReaderError.fabricatedRange)
+        #expect(engine.errorInfo?.kind == .sourceFabricatesRanges)
     }
 
     @Test("the probe holds delivery back until its overlap is complete")

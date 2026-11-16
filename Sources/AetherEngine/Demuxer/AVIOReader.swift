@@ -1078,6 +1078,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#958: latched once a ranged answer carried bytes other than the ones it claimed. Every
     /// read fails from there: nothing this origin sends past byte 0 can be placed. winCond-guarded.
     private var rangeAnswersFabricated = false
+
+    var detectedFabricatedRange: Bool {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return rangeAnswersFabricated
+    }
     /// AE#958: how much of a ranged reconnect is spent re-reading bytes already held.
     static let rangeCheckBytes = 4096
     /// #331: latched once a live origin answers 416 to a nonzero offset, i.e. proves it has no
@@ -6424,6 +6430,7 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
     /// instead of the AVERROR_INVALIDDATA FFmpeg reports for an empty or error-page stream, and so the
     /// error page never reaches the demuxer.
     case httpStatus(Int)
+    case fabricatedRange
     /// AE#495: the transport was refused over certificate trust, so no body ever existed. Typed for
     /// the same reason `httpStatus` is: without it the open surfaces FFmpeg's invalid data and a
     /// self-signed origin reads as a corrupt file.
@@ -6450,6 +6457,8 @@ enum AVIOReaderError: Error, Equatable, CustomStringConvertible, LocalizedError 
         case .httpStatus(let status): return "Origin answered HTTP \(status) for the source"
         case .transportSecurityFailed(let code):
             return TransportSecurityFailure.sentence(for: code)
+        case .fabricatedRange:
+            return "Source origin answers byte ranges with other bytes"
         case .originIgnoresRange:
             return "The origin ignores HTTP Range requests, which a remote disc image needs"
         case .originIgnoresFlowControl:

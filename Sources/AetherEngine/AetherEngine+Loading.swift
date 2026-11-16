@@ -1405,6 +1405,14 @@ extension AetherEngine {
             session.stop(reason: .sourceChanged)
             try checkLoadCurrent(generation)
         }
+        #if os(tvOS)
+        // The first VOD producer can fail before onVODSourceFailed has an installed
+        // session to notify. Check this reader's verdict before attaching AVPlayer.
+        if !isLive, session.detectedFabricatedRange {
+            session.stop(reason: .loadFailed)
+            throw AVIOReaderError.fabricatedRange
+        }
+        #endif
         self.nativeVideoSession = session
         outputRouteHandedOver = true
         if let event = session.pendingVODVideoConfigurationMismatch {
