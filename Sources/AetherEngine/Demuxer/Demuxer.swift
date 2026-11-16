@@ -425,6 +425,8 @@ public final class Demuxer: @unchecked Sendable {
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
 
+    var detectedFabricatedRange: Bool { (avioProvider as? AVIOReader)?.detectedFabricatedRange == true }
+
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 

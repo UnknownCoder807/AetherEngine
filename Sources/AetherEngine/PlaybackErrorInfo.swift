@@ -211,6 +211,10 @@ extension AetherEngine {
     /// names the cause of a live start the error itself (an FFmpeg open failure) cannot.
     @MainActor
     func publishLoadFailure(_ error: Error, isLiveStart: Bool = false, transportFailureCode: Int? = nil) {
+        if error as? AVIOReaderError == .fabricatedRange {
+            publishError(.sourceFabricatesRanges, error.localizedDescription)
+            return
+        }
         if let ingest = error as? HLSIngestError {
             switch ingest {
             case .playlistUnreachable(let status) where status > 0:
