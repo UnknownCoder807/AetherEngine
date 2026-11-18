@@ -2,18 +2,8 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-/// A live stream read straight off its URL (an IPTV panel's continuous MPEG-TS form of a channel)
-/// and refused for a while, as a connection-limited panel refuses an account's requests with 509
-/// while another device holds its last slot, keeps its session: the reader asks again on a short,
-/// steady wait until it is served, the refusals arm no pacer, and a refused open is the origin's
-/// answer, typed, rather than a minute of the same request.
-///
-/// The loopback cases run with the reconnect backoff scaled down, the way the other reader suites
-/// do, and are judged by what came through and how many requests it took; the give-up case's only
-/// wall-clock check is a lower bound (time spent >= budget) that a slow runner can only satisfy.
-/// Scale and budget go to each reader at init: process-wide hooks raced between these tests, which
-/// run in parallel, and handed one test's one-second budget to its neighbour.
-/// The wait itself is a pure rule, tested as one.
+/// A live source gets bounded, increasing retries. Long server delays are either
+/// honoured or surfaced as a terminal error without an earlier replacement request.
 @Suite("Live stream reader rides out refusals", .offCooperativePool, .timeLimit(.minutes(3)))
 struct LiveStreamRefusalRetryTests {
 
@@ -128,13 +118,10 @@ struct LiveStreamRefusalRetryTests {
 
     // MARK: - The wait
 
-    @Test("the wait is a second, or the origin's Retry-After up to five seconds")
-    func waitIsASecondOrTheRetryAfterUpToFive() {
-        #expect(AVIOReader.liveRefusalWait(retryAfter: 0) == 1)
-        #expect(AVIOReader.liveRefusalWait(retryAfter: 0.3) == 1)
-        #expect(AVIOReader.liveRefusalWait(retryAfter: 2) == 2)
-        #expect(AVIOReader.liveRefusalWait(retryAfter: 5) == 5)
-        #expect(AVIOReader.liveRefusalWait(retryAfter: 30) == 5)
+    @Test("live waits increase and do not truncate Retry-After")
+    func waitsIncreaseAndHonourTheServer() {
+        #expect((1...5).map { AVIOReader.liveRefusalWait(streak: $0, retryAfter: 0) } == [1, 2, 4, 8, 8])
+        #expect(AVIOReader.liveRefusalWait(streak: 3, retryAfter: 30) == 30)
     }
 
     // MARK: - The stream
@@ -183,17 +170,46 @@ struct LiveStreamRefusalRetryTests {
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
-        let started = DispatchTime.now()
         let drained = Self.drain(reader, expectedBytes: first.count + 1)
-        let spent = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
 
         #expect(drained.bytes == first.count)
         #expect(drained.failure == FFmpegErr.eio)
-        // Given up only once the budget ran out: the old count-based ladder's six attempts at this
-        // pace end in a fraction of it. A slow runner only lengthens this, so it bounds nothing
-        // from above; how many requests fit in the second is the runner's business, not the rule's.
-        #expect(spent >= budget, "gave up after \(spent) s")
-        #expect(origin.requestCount - 1 >= 2, "\(origin.requestCount - 1) refused attempts")
+        // The next wait need not be spent when it cannot fit in the budget.
+        #expect(origin.requestCount - 1 <= LiveSourceRetryPolicy.maxRetries + 1)
+        #expect(reader.liveHTTPFailureStatus == 509)
+    }
+
+    @Test("repeated 503s exhaust the retry count and preserve the HTTP cause")
+    func repeated503HasABoundedCount() throws {
+        let first = Self.streamBytes(count: 400)
+        let origin = try #require(ScriptedOrigin { index in
+            index == 0 ? .init(status: 200, body: first) : .init(status: 503)
+        })
+        defer { origin.stop() }
+        let reader = Self.makeLiveReader(origin.url)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let drained = Self.drain(reader, expectedBytes: first.count + 1)
+        #expect(drained.failure == FFmpegErr.eio)
+        #expect(origin.requestCount <= LiveSourceRetryPolicy.maxRetries + 2)
+        #expect(reader.liveHTTPFailureStatus == 503)
+    }
+
+    @Test("Retry-After beyond the budget does not issue another request")
+    func longRetryAfterStopsInsteadOfRetryingEarly() throws {
+        let first = Self.streamBytes(count: 400)
+        let origin = try #require(ScriptedOrigin { index in
+            index == 0 ? .init(status: 200, body: first)
+                : .init(status: 503, headers: ["Retry-After": "120"])
+        })
+        defer { origin.stop() }
+        let reader = Self.makeLiveReader(origin.url, backoffScale: 1)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+        let drained = Self.drain(reader, expectedBytes: first.count + 1)
+        #expect(drained.failure == FFmpegErr.eio)
+        #expect(origin.requestCount == 2)
+        #expect(reader.liveHTTPFailureStatus == 503)
     }
 
     // MARK: - The open

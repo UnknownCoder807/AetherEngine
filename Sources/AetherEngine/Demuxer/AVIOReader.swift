@@ -474,7 +474,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                                    respondedBy: URL? = nil) {
         let refusing = respondedBy ?? requestURL()
         if isLive {
-            // A live stream's refusal is retried on its own short cadence (`liveRefusalRetryInterval`),
+            // A live stream's refusal is retried on its own bounded ladder,
             // which is the pacing: arming the pacer as well would hold the retry, and the reload or
             // reopen after it, for the quiet period (up to 15 s, and up to 10 s of waiting on each
             // request) over a refusal that clears in seconds. The books still carry the refusal, so
@@ -500,7 +500,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// to reach the budget as nil: a zero would arm a quiet period of nothing instead of the ladder.
     private func noteRateLimitedResponse(_ response: HTTPURLResponse?) {
         guard let response, Self.isRateLimitStatus(response.statusCode) else { return }
-        let retryAfter = Self.parseRetryAfter(response)
+        let retryAfter = parseRetryAfter(response)
         noteOriginRefusal(status: response.statusCode, retryAfter: retryAfter > 0 ? retryAfter : nil,
                           respondedBy: response.url)
     }
@@ -815,23 +815,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // Distinct axis from unproductiveReconnects: NOT reset by seekReconnect, so parse-driven
     // seeks cannot mask a throttled origin into an infinite reconnect loop (AetherEngine#71).
     private static let rateLimitMaxStreak = 6
-    /// A LIVE stream refused mid-session is asked for again on a steady, short cadence rather than
-    /// up the exponential ladder, and for a bounded while rather than a bounded count. The refusal
-    /// this answers is a connection-limited IPTV panel's 509 while another device on the account
-    /// holds its last slot: it lasts seconds to tens of seconds and clears the moment that slot is
-    /// free, and every second of waiting past that is a second the picture stays frozen with the
-    /// origin ready to serve. One small request a second is what the panel's own clients do, and
-    /// what the live HLS ingest does for the same refusal (`HLSLiveIngestReader`). The origin's own
-    /// Retry-After stretches the wait, up to `liveRefusalMaximumRetryWait`.
-    static let liveRefusalRetryInterval: TimeInterval = 1
-    static let liveRefusalMaximumRetryWait: TimeInterval = 5
-    /// How long a live stream keeps asking before the refusal is the session's answer.
-    static let liveRefusalRetryBudget: TimeInterval = 60
+    /// Live refusals use a bounded exponential ladder. A server's longer Retry-After
+    /// is honoured in full, or the reader gives up when it exceeds the remaining budget.
+    static let liveRefusalRetryBudget = LiveSourceRetryPolicy.budgetSeconds
 
-    /// The wait before a live stream's refused request is made again: a second, or the origin's
-    /// Retry-After (0 for none) when that is longer, never more than `liveRefusalMaximumRetryWait`.
-    static func liveRefusalWait(retryAfter: TimeInterval) -> TimeInterval {
-        min(max(liveRefusalRetryInterval, retryAfter), liveRefusalMaximumRetryWait)
+    static func liveRefusalWait(streak: Int = 1, retryAfter: TimeInterval) -> TimeInterval {
+        LiveSourceRetryPolicy.delay(streak: streak, retryAfter: retryAfter)
     }
     // Rate-limited attempts that keep the pinned redirect target before one attempt through the
     // source URL is spent on a fresh redirect. Three paced attempts (~7 s of ladder) ride out the
@@ -2502,6 +2491,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // (the old session's invalidateAndCancel + new task setup, all on this demux thread), so a
         // slow read that sinks its time into reconnecting names it as `connect=` instead of `unaccounted=`.
         func timedReconnect(seek: Bool, at offset: Int64) {
+            guard !isClosed else { return }
             diag.recordReconnect()
             let connectStart = DispatchTime.now()
             if seek { seekReconnect(at: offset) } else { startPersistentConnection(at: offset) }
@@ -2810,7 +2800,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // Origin is throttling the detour fetch too (#71). Back off in place and
                         // RETRY the detour fetch; do NOT open a fresh connection (that re-enters
                         // the 429 churn the cache exists to remove). Give up cleanly at the cap.
-                        if recordRateLimitAndShouldGiveUp() {
+                        if recordRateLimitAndShouldGiveUp(retryAfter: retryAfter) {
                             EngineLog.emit("[AVIOReader] Detour rate-limit gave up at offset \(curPosition) (\(rateLimitStreak) consecutive rate-limited)", category: .demux)
                             emitNetworkPhase(.exhausted)   // ladder spent on the detour arm too (#410)
                             return totalRead > 0 ? Int32(totalRead) : -1
@@ -2827,7 +2817,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         emitNetworkPhase(.reconnecting)
                         let repinned = dropPinIfTheRefusalCallsForIt(isRateLimited: true)
                         let backoffStart = DispatchTime.now()
-                        backoffBeforeReconnect(streak: repinned ? 0 : rateLimitStreak, retryAfter: retryAfter)
+                        backoffBeforeReconnect(streak: repinned ? 0 : rateLimitStreak, retryAfter: retryAfter,
+                                               isRateLimited: true)
                         diag.recordBackoff(ms: msSince(backoffStart))
                         continue
                     case .miss:
@@ -3016,7 +3007,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // A 429/503/509 is rate limiting, not a dead source: drive give-up + backoff off the
             // rate-limit streak, which (unlike unproductiveReconnects) survives the seekReconnect
             // that parse seeks fire, so a throttled origin fails cleanly instead of looping (#71).
-            let refusal = chargeRefusal(status: status)
+            let refusal = chargeRefusal(status: status, retryAfter: retryAfter)
             let isRateLimited = refusal.isRateLimited
             let isCredentialRefusal = refusal.isCredentialRefusal
             if refusal.giveUp {
@@ -3174,7 +3165,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// non-blocking one in `chargeFaultedRunwayRefill`, so both pace an origin identically.
     private func backoffDelay(streak: Int, retryAfter: TimeInterval, isRateLimited: Bool = false) -> TimeInterval {
         if isLive, isRateLimited {
-            return Self.liveRefusalWait(retryAfter: retryAfter) * backoffScale
+            return Self.liveRefusalWait(streak: streak, retryAfter: retryAfter) * backoffScale
         }
         let expo = streak <= 0 ? 0.0 : min(Double(1 << min(streak, 4)) * 0.5, 8.0)
         return min(max(expo, retryAfter), 15.0) * backoffScale
@@ -3193,10 +3184,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     /// Classifies the status, charges the matching streak and says whether the ladder is spent.
     /// Demux-thread-only, like the recorders it calls.
-    private func chargeRefusal(status: Int) -> RefusalCharge {
+    private func chargeRefusal(status: Int, retryAfter: TimeInterval) -> RefusalCharge {
         let isRateLimited = Self.isRateLimitStatus(status)
         let isCredentialRefusal = Self.isCredentialRefusalStatus(status)
-        let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp()
+        let giveUp = isRateLimited ? recordRateLimitAndShouldGiveUp(retryAfter: retryAfter)
             : isCredentialRefusal ? recordCredentialRefusalAndShouldGiveUp()
             : recordReconnectAndShouldGiveUp(status: status)
         let streak = isRateLimited ? rateLimitStreak
@@ -3230,7 +3221,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// when playback genuinely starves. Demux-thread-only.
     private func chargeFaultedRunwayRefill(at frontier: Int64, ahead: Int,
                                            status: Int, retryAfter: TimeInterval) -> Bool {
-        let refusal = chargeRefusal(status: status)
+        let refusal = chargeRefusal(status: status, retryAfter: retryAfter)
         let isRateLimited = refusal.isRateLimited
         let isCredentialRefusal = refusal.isCredentialRefusal
         if refusal.giveUp {
@@ -3263,6 +3254,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private func backoffBeforeReconnect(streak: Int, retryAfter: TimeInterval, isRateLimited: Bool = false) {
         let total = backoffDelay(streak: streak, retryAfter: retryAfter, isRateLimited: isRateLimited)
         if total <= 0 { return }
+        EngineLog.emit("[AVIOReader] \(label) reconnect wait=\(total)s streak=\(streak) retryAfter=\(retryAfter)s live=\(isLive)", category: .demux)
         var slept = 0.0
         while slept < total {
             if isClosed { return }
@@ -3276,17 +3268,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// Demux-thread-only. Deliberately NOT reset by `seekReconnect` (parse seeks must not mask a
     /// throttled origin into an endless reconnect loop, #71); only real read progress clears it.
     /// Internal (not private) so the bounded give-up is unit-tested without a live origin.
-    func recordRateLimitAndShouldGiveUp() -> Bool {
+    func recordRateLimitAndShouldGiveUp(retryAfter: TimeInterval = 0) -> Bool {
         rateLimitStreak += 1
         if isLive {
-            // A live stream is given a while, not a count: at one attempt a second the count would
-            // be spent in six seconds, inside the refusal this cadence exists to ride out.
+            // Both count and elapsed time bound recovery. Never shorten a server's wait
+            // to squeeze another request into the budget.
             let now = DispatchTime.now()
             let started = rateLimitStreakStartedAt ?? now
             rateLimitStreakStartedAt = started
             let budget = liveRefusalRetryBudgetSeconds
             let elapsed = Double(now.uptimeNanoseconds &- started.uptimeNanoseconds) / 1_000_000_000
-            return elapsed > budget
+            let shouldRetry = LiveSourceRetryPolicy.shouldRetry(
+                streak: rateLimitStreak, retryAfter: retryAfter,
+                elapsed: elapsed, budget: budget, scale: backoffScale)
+            if !shouldRetry {
+                EngineLog.emit("[AVIOReader] \(label) live refusal retry budget ended: streak=\(rateLimitStreak) elapsed=\(elapsed)s budget=\(budget)s retryAfter=\(retryAfter)s", category: .demux)
+            }
+            return !shouldRetry
         }
         return rateLimitStreak > Self.rateLimitMaxStreak
     }
@@ -3393,7 +3391,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 let status = http.statusCode
                 // Already charged to the origin by `syncRequest`, before it returned the slot.
                 if Self.isRateLimitStatus(status) {
-                    return .rateLimited(Self.parseRetryAfter(http))
+                    return .rateLimited(parseRetryAfter(http))
                 }
                 if status != 200 && status != 206 {
                     if Self.isResolvedExpiryStatus(status) { invalidateResolvedURL() }
@@ -4720,7 +4718,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var isOK = status == 200 || status == 206
         var retryAfter: TimeInterval = 0
         if Self.isRateLimitStatus(status) {
-            retryAfter = Self.parseRetryAfter(http)
+            retryAfter = parseRetryAfter(http)
             noteOriginRefusal(status: status, retryAfter: retryAfter > 0 ? retryAfter : nil,
                               respondedBy: respondedBy)
         }
@@ -4739,7 +4737,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if isLive, Self.isLiveTextNoticeCandidate(http) {
                 connTextNotice = (generation, Data())
                 connTextNoticeLength = http.expectedContentLength
-                connTextNoticeRetryAfter = Self.parseRetryAfter(http)
+                connTextNoticeRetryAfter = parseRetryAfter(http)
             }
         }
         // VOD: 200 at offset > 0 means server ignored Range and sent the full body
@@ -4857,7 +4855,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit(
                 "[AVIOReader] \(label) gen=\(generation) rejected response status=\(status) at offset \(requestedOffset)"
                     + respondingTargetDescription(respondedBy)
-                    + (retryAfter > 0 ? " retryAfter=\(Int(retryAfter))s" : ""),
+                    + (retryAfter > 0 ? " retryAfter=\(retryAfter)s" : ""),
                 category: .demux
             )
         }
@@ -4940,13 +4938,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
-    /// Parses delta-seconds Retry-After; HTTP-date form falls back to expo backoff. Cap 15s.
-    private static func parseRetryAfter(_ http: HTTPURLResponse) -> TimeInterval {
-        guard let raw = http.value(forHTTPHeaderField: "Retry-After"),
-              let seconds = TimeInterval(raw.trimmingCharacters(in: .whitespaces)) else {
-            return 0
-        }
-        return min(max(seconds, 0), 15)
+    /// The current live HTTP refusal, including after a watchdog cancels the read.
+    /// A successful response clears it by replacing connStatus; stale responses cannot set it.
+    var liveHTTPFailureStatus: Int? {
+        guard isLive else { return nil }
+        winCond.lock()
+        defer { winCond.unlock() }
+        return (400...599).contains(connStatus) ? connStatus : nil
+    }
+
+    /// Preserve the complete server delay; live recovery either honours it or stops.
+    private func parseRetryAfter(_ http: HTTPURLResponse) -> TimeInterval {
+        let delay = LiveSourceRetryPolicy.parseRetryAfter(http.value(forHTTPHeaderField: "Retry-After"))
+        return isLive ? delay : min(delay, 15) // Preserve the existing VOD pacing policy.
     }
 
     // MARK: - Seek

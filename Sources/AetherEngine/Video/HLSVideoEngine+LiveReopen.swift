@@ -390,6 +390,22 @@ extension HLSVideoEngine {
             return
         }
         guard isLiveSession else { return }
+        // A refusal is the source's answer. Neither a watchdog retune nor a fresh
+        // in-engine reader may reset its retry budget or bypass Retry-After.
+        switch reason {
+        case .readError, .eof, .segmentStall, .keyframeStarvation:
+            if let status = demuxer?.liveHTTPFailureStatus {
+                provider?.markLiveProductionHalted()
+                EngineLog.emit(
+                    "[HLSVideoEngine] live source recovery ended with HTTP \(status) (pump=\(reason)); "
+                    + "surfacing source failure without another reopen or host retune",
+                    category: .session)
+                surfaceVODSourceFailure(Int32(status), "Live source unavailable: HTTP \(status)",
+                                        kind: .liveSourceUnavailable)
+                return
+            }
+        default: break
+        }
         let reopenTransport = Self.liveReopenTransport(
             sourceReopenableByURL: sourceReopenableByURL,
             hasCustomSourceReopenFactory: customSourceReopenFactory != nil)
@@ -413,14 +429,11 @@ extension HLSVideoEngine {
                 category: .session
             )
         case .segmentStall:
-            // SSAI ad pod the cutter can't cut through; URL reopen would re-enter it. Delegate to host for server-muxed fallback.
-            //
-            // AE#446 round 8: unless the gate never opened, in which case there was no cutter to
-            // stall and no pod to blame. Same delegation, but the line has to say which of the two
-            // it saw, because the two send a reader looking in different places.
+            // No segment was cut, but that does not establish an ad insertion cause.
+            // HTTP refusals have already taken the typed terminal path above.
             EngineLog.emit(
                 (prod.videoGateOpened
-                 ? "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
+                 ? "[HLSVideoEngine] live segment production stalled without a recorded HTTP refusal; see producer diagnostics; "
                  : "[HLSVideoEngine] live join produced nothing at all (no video packet ever "
                    + "reached the cutter, so the source is not delivering the video it declares); ")
                 + "requesting host retune to the server route",
