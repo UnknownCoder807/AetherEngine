@@ -1425,7 +1425,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case keyframeStarvation
         /// Source replay cannot safely continue in place; the host must negotiate a fresh session.
         case sourceReplay
-        /// Pump read packets but finalized no segment for stall window (hostile SSAI ad pod wedge).
+        /// No segment was finalized within the stall window; the cause may be starvation or a cutter wedge.
         case segmentStall
         /// VOD backpressure park frozen past the break threshold (consumer fetch target stuck, AVPlayer
         /// wedged and issuing no forward request). Host re-anchors the producer on AVPlayer's real

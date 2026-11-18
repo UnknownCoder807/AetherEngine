@@ -301,6 +301,11 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
+    /// Preserve a live reader's HTTP cause across a producer exit instead of reopening blindly.
+    var liveHTTPFailureStatus: Int? {
+        (avioProvider as? AVIOReader)?.liveHTTPFailureStatus
+    }
+
     /// Audit NET-110: the disc reader `openHTTP` builds for a remote disc image. The disc adapter's
     /// `ConcatIOReader.close()` is a no-op and the bridge does not own its reader, so this is the only
     /// owner left to end the reader's `URLSession`. Guarded by `providerLock`.
