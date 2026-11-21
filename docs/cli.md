@@ -117,6 +117,7 @@ These flags mean the same on every subcommand that takes them. The per-command t
 | `--no-dv` | `serve`, `validate`, `segverify` | Forces the SDR / HDR10 route, see [Dolby Vision routes](#dolby-vision-routes). | off |
 | `--force-dv` | `serve`, `validate`, `segverify` | `LoadOptions.forceDolbyVisionOnNonDVDisplay`: serves Profile 8.1 as Profile 5 (AE#455). Only with `--no-dv`. | off |
 | `--dv-base-layer` | `serve`, `validate`, `segverify`, `play` | `LoadOptions.dolbyVisionHandling = .baseLayerOnly`. | off |
+| `--untagged-color hdr10\|hlg` | `probe`, `serve` | `LoadOptions.untaggedVideoColor` (AE#1103): a 10-bit stream with no colour description is shown as HDR10 or HLG. A stream that declares anything keeps it. | off |
 | `--audio-index <n>` | `serve`, `customio` | Names the source audio stream at load. | engine choice |
 | `--standard-join` | `play`, `live` | `LoadOptions.liveJoinProfile = .standard`, see [Live join and cushion](#live-join-and-cushion). | `.fastZap` |
 | `--fast-zap` | `play`, `live` | Accepted and ignored, kept for older scripts. | |
@@ -176,7 +177,7 @@ The [Works on](#shared-flags) column lists where it is accepted.
 - A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead.
 - On `play` the 1 Hz line adds `obj=<active>/<declared> up=<overhead> bed=<layout>`, and `hch=<n>` for height channels.
 
-**Use a release build** (`swift build -c release`) for anything that plays the bed. A debug build renders it about five times slower than real time, so `play` waits on audio and ends in `VERDICT: clock did not advance` although nothing is wrong. aetherctl prints a note when a debug build gets `--atmos-bed`.
+On an M1 a debug build plays the bed in real time too. Before AE#1106 the regression ran at about a fifth of real time there, and `play` ended in `VERDICT: clock did not advance`. Judge CPU from a release build (`swift build -c release`), because in a debug build the rest of the pipeline still costs more. A debug build on an Apple TV has not been measured since the change.
 
 With `--bed-format lpcm` it sets `.lpcm(layout)` instead, which serves the bed as 24-bit PCM (`CODECS="…,ipcm"`, log `delivered as ipcm (lossless 24-bit PCM)`). With `--bed-format auto` it sets `.render(layout)`, the form a host should use: PCM, or APAC when the route plays over AirPlay.
 
@@ -247,13 +248,14 @@ Opens the demuxer, prints what it finds, then exits. No HLS server is started. I
 - the subtitle track list with language, `(default)` and title,
 - the parsed container metadata (`MediaMetadata`): title, artist, album, and the size of embedded cover art (`artwork: N bytes`).
 
-**Usage:** `aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
+**Usage:** `aetherctl probe [--untagged-color hdr10|hlg] [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-dv-el] [--detect-atmos] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--detect-hdr10plus` | Adds the HDR10+ detail pass of `AetherEngine.probe(url:detecting:)`. | off |
 | `--detect-atmos` | Adds the Atmos detail pass: E-AC-3 JOC, and for TrueHD the major sync, printed as `truehd-atmos=atmos|noAtmos|unsettled` (#1035). | off |
 | `--detect-hdr-vivid` | Adds the HDR Vivid (CUVA) check to the same packet pass. Prints `HDR Vivid: CUVA metadata seen`. | off |
+| `--untagged-color hdr10\|hlg` | Probes with `LoadOptions.untaggedVideoColor` (AE#1103). The `colour:` line and `format:` then read what the session would play, and a `[Demuxer] AE#1103` line says whether it applied and why not. | off |
 | `--detect-dv-el` | Adds the Dolby Vision enhancement-layer check to the same packet pass (#1030). Prints `DV EL: FEL` or `DV EL: MEL`; `not Profile 7` when the container declares no Profile 7, `no RPU seen` when none turned up in the budget. | off |
 
 ```bash
@@ -612,6 +614,7 @@ Other lines `play` prints:
 | Flag | Meaning | Default |
 |---|---|---|
 | `--switch-audio <index>[@ms]` | Switches the audio stream just after playback starts (#337). | +20 ms |
+| `--live-reopen-param NAME` | Answers `liveReopenURL` by giving the query parameter `NAME` a new value on every reopen, the way a host mints a fresh HDHomeRun `SessionID` (AE#1100). Each answer prints a `LIVEREOPEN` line. | off |
 | `--audio-delay <ms>` | `LoadOptions.audioDelaySeconds` at load. See [Shared flags](#shared-flags). | 0 |
 | `--switch-audio-delay <ms>[@ms]` | Calls `setAudioDelay(_:)` mid-session. Repeatable. | +20 s |
 | `--audio-shaping <spec>` | `LoadOptions.audioShaping` at load. | off |
@@ -637,6 +640,7 @@ Other lines `play` prints:
 | `--line-art` | `LoadOptions.upscaleScaler = .lineArt` (AE#1039); implies `--upscale`. | off |
 | `--tone-map <nits>` | `LoadOptions.videoProcessing` with this `targetPeakNits` (#957). | off |
 | `--deinterlace-field-rate field\|frame` | `LoadOptions.deinterlaceFieldRate` (AE#492). | `field` |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` (#853). | `auto` |
 | `--native-video-frame-diagnostics` | `LoadOptions.nativeVideoFrameDiagnostics`. | off |
 | `--native-video-frame-recovery` | Bounded SDR native decoded-output repair. | off |
 
@@ -838,6 +842,17 @@ Serve an HLS master over https with a self-signed certificate, and the two arms 
 
 - Pick a stream whose first packet sits late in the mux. The defect reading (before the fix) is `state=playing cur=0.00` for the whole run with a first frame on screen. The end-of-run verdict names it.
 - `--audio-stats` with it re-installs the tap after the switch. The tap is bound to the software host the switch replaces, and would otherwise report silence for a session that is playing fine.
+- On a software live session with a ring the switch happens in place (AE#1100): no rebuild, and the log shows `AE#1100 live audio switched in place`. The tap re-install is then harmless.
+
+**A replaying live origin (AE#1100).** To see whether a live session opens its source twice, put an origin in front that behaves like an HDHomeRun tuner: a `SessionID` opened again replays from where that session began. Then read the origin's request log. Measured on a 720p MPEG-2 fixture with two AC-3 tracks (`-ac:a:0 2 -ac:a:1 6`):
+
+```bash
+aetherctl play --live --dvr-window 600 --switch-audio 2@25000 --seconds 45 "http://127.0.0.1:8912/auto/v4.1?ClientID=1&SessionID=101"
+aetherctl play --live --live-reopen-param SessionID --switch-audio 2@15000 --seconds 30 "<same URL>"
+```
+
+- With the ring, the switch opens nothing: one request in the origin log, `cur` runs on (23.42 to 24.36 s) and `range=` keeps its start.
+- Without a ring the switch reloads. Without the flag the reload replayed the session (the source PTS fell from 31.05 to 18.04 s); with `--live-reopen-param SessionID` it opened `SessionID=9r1` at live (31.29 to 32.96 s).
 
 Build a fixture with a late track by offsetting one input:
 
@@ -926,6 +941,7 @@ The mid-session switch is the harder case. At load the offset is just a number h
 | `preferred-audio` | comma list of languages | preferred audio languages |
 | `decode-path` | a `DecodePath` raw value, for example `software` | `preferredDecodePath` |
 | `dolby-vision` | a `DolbyVisionHandling` raw value, for example `baseLayerOnly` | `dolbyVisionHandling` |
+| `untagged-color` | `standard\|hdr10\|hlg` | `untaggedVideoColor` (AE#1103), the per-title "Force HDR" switch a host offers |
 | `prefer-dual-layer-dv` (alias `fel-mode`) | `true\|false` | `LoadOptions.preferDualLayerDolbyVision`, so a running session can move on or off the Profile 7 FEL route |
 | `is-live` | `true\|false` | Drives the refusal: a field that names the session must be observably refused, not observably ignored. |
 | `autoplay` | `true\|false` | Drives the third answer: a field the session owns, neither refused nor applied. |
@@ -1005,6 +1021,18 @@ The run then prints `audio delivery=droppedNoPipeline pipeline=none`, the pair a
 Measured on a 480i fixture through the hardware chain, four runs per arm: 59.9 fps and 17.47 drops/s at `field`, against 30.0 fps and 7.49 at `frame`. That is 0.291 against 0.250 per frame delivered, with the progressive arm at 0.254.
 
 Nothing binds a render surface in a CLI run, so the absolute drop level belongs to the harness. Only the ratio between arms is a measurement.
+
+### Inverse telecine (#853)
+
+`--inverse-telecine auto|off|force` sets `LoadOptions.inverseTelecine`. On a hard-telecined NTSC MPEG-2 source the load logs its decision before the `[AetherEngine] load` line, and that line's `rate=` is the rate asked of the display:
+
+```
+[Deinterlace] inverse telecine on: film, progressive 100% of 60 decided frames, cadence 100%, 61 frames in 155 ms, 155 ms with the rewind (#853)
+[AetherEngine] load url=... rate=23.976
+[Deinterlace] engaged [hardware]: 720x480 pixFmt=0 (fieldmatch=order=auto:combmatch=full,decimate,format=nv12,hwupload,bwdif_videotoolbox=mode=send_frame:parity=auto:deint=interlaced) outTB=1001/48000 built in 3.3ms
+```
+
+With `--frame-times` the output reads `ft=24` a second and the `[SWDiag]` lines `dpts=41.7/41.7`; the deinterlacer alone reads `ft=60` at field rate. The sample's cost to the first frame over a throttled origin is in [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
 
 ### Frame times (`--frame-times`, `--present-times`)
 
@@ -1269,7 +1297,7 @@ Tests scrub previews. By default it covers Dolby Vision Profile 5 / 10.0 sources
 
 The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. With the trait such a source serves reshaped stills instead of drawing in a view, so the default mode fails with exit 1; use `--stills` there.
 
-**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>`
+**Usage:** `aetherctl scrubpreview [--warm S] [--at s1,s2,...] [--keep DIR] [--throttle-kbps N] [--stills [--max-concurrent-requests N] [--forward-buffer-segments N] [--inverse-telecine auto|off|force]] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
@@ -1280,6 +1308,7 @@ The default mode needs a build WITHOUT the `DolbyVisionStillReshaping` trait. Wi
 | `--stills` | Asks `scrubPreviewFrame` instead, for any source. | off |
 | `--max-concurrent-requests N` | Only with `--stills`. See [Shared flags](#shared-flags). | engine default |
 | `--forward-buffer-segments N` | Passes through to `LoadOptions`. Only with `--stills`. | engine default |
+| `--inverse-telecine auto\|off\|force` | `LoadOptions.inverseTelecine` for the playing session, only with `--stills`. The stills themselves always come off the plain deinterlacer (#853). | `auto` |
 
 **Default mode.** Loads the source on the native path, plays it for `--warm` seconds, then asks `showScrubPreview(atSeconds:in:)` for each position. For each it prints whether a picture came, how long it took, the span it stands for, and whether the position was resident.
 

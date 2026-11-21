@@ -22,8 +22,10 @@ extension AetherEngine {
             .withHeldSourceConnection(options.heldSourceConnection)
             .skippingAttachments(options.skipsContainerAttachments)
             .withSourceOpenPolicy(options.sourceOpenPolicy)
+            .withUntaggedVideoColor(options.untaggedVideoColor)
             .withDiagnosticContext(options.sourceDiagnosticsContext)
             .withRequestHeaders(sessionRequestHeaders)
+            .withLiveReopenURL(options.isLive && !isCustomSource ? liveReopenURL : nil)
     }
 
     /// Apply an AVPlayer clock tick (native VOD/live path) to the engine clock. `nativeClockSeconds`
@@ -966,6 +968,7 @@ extension AetherEngine {
             // path only for the host's explicit fastZap profile.
             liveJoinProfile: loadedOptions.liveJoinProfile,
             sourceOpenPolicy: loadedOptions.sourceOpenPolicy,
+            untaggedVideoColor: loadedOptions.untaggedVideoColor,
             diagnosticContext: loadedOptions.sourceDiagnosticsContext,
             liveStartupGraceSeconds: loadedOptions.liveStartupGraceSeconds,
             liveStartupSingleSegmentMinimumSeconds: loadedOptions.liveStartupSingleSegmentMinimumSeconds,
@@ -980,6 +983,7 @@ extension AetherEngine {
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,
             customSourceReopenFactory: ingestReopenFactory,
+            liveReopenURL: loadedOptions.isLive && !isCustomSource ? liveReopenURL : nil,
             refusalBooksURL: (customReader as? HLSVODIngestReader)?.budgetOriginURL,
             companionAudioReader: companionAudioReader,
             liveSourceAnnouncesDiscontinuities: liveIngest != nil,
@@ -2036,6 +2040,9 @@ extension AetherEngine {
     /// in #114 and the teardown deactivation in #215. Only the track lookup, which reads published state, stays here.
     func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) async {
         guard rendererAudioSessionActivationEnabled else { return }
+        #if DEBUG
+        rendererAudioActivationForTesting?()
+        #endif
         #if os(iOS) || os(tvOS)
         // Resolve the active audio track's channel count from the already-published track list.
         // so the HDMI / AirPlay link negotiates at the correct channel count.
@@ -2073,6 +2080,27 @@ extension AetherEngine {
     }
     #endif
 
+    /// AE#1099: a fresh software load starts its audio output after the display play gate, the way AVKit
+    /// does on the native path, where the session goes active at `play()`. Activated before the host was
+    /// built, it negotiated the HDMI audio link while the panel was still switching modes for this load,
+    /// and a reporter's Atmos chain then stayed silent for some whole sessions. The Atmos activator waits
+    /// too: its looping player activates the session on its own.
+    ///
+    /// The session is still active before the first audio sample: the host enqueues nothing until its
+    /// loops start in `play()` / `pause()`, and both come after this. Activating over a filled queue would
+    /// let a route change flush it (AE#549). Costs one activation round trip (about 14 ms measured by the
+    /// reporter) that used to overlap the host build. A reload has no play gate and keeps the early start
+    /// inside `loadSoftware`.
+    func startSoftwareAudioOutputAfterPlayGate(audioSourceStreamIndex: Int32?, gateHeldMs: Int) async {
+        if rendererAudioSessionActivationEnabled {
+            EngineLog.emit(
+                "[AetherEngine] AE#1099: software load activates the renderer audio session after the "
+                + "play gate (gate held \(gateHeldMs)ms)",
+                category: .engine)
+        }
+        await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
+    }
+
     func loadSoftware(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -2082,9 +2110,11 @@ extension AetherEngine {
         dvrWindowSeconds: Double? = nil,
         preopenedDemuxer: Demuxer?,
         requiresDeinterlaceWarmup: Bool,
+        inverseTelecine: Bool = false,
         autostarts: Bool,
         generation: UInt64,
-        elType: String? = nil
+        elType: String? = nil,
+        audioOutputWaitsForPlayGate: Bool = false
     ) async throws {
         try checkLoadCurrent(generation)
         sessionCacheStatusToken &+= 1
@@ -2109,8 +2139,10 @@ extension AetherEngine {
             }
         }
 
-        await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
-        try checkLoadCurrent(generation)
+        if !audioOutputWaitsForPlayGate {
+            await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
+            try checkLoadCurrent(generation)
+        }
         // Drop the previous session's sinks BEFORE anything wires this one's. Standing further down,
         // between two groups of `.store(in:)` calls, this cancelled everything wired above it: the
         // SW-PiP cue mirror never delivered a cue after the frame compositor was armed. Both halves
@@ -2144,9 +2176,12 @@ extension AetherEngine {
                                                   closedCadence: ingest?.closedLiveCadenceSeconds)
             }
         }
+        // #853: inverse telecine is the load's decision (it chose the display rate), never re-read from
+        // the options here: a rebuild hands in the session's decision.
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
-            fieldRate: loadedOptions.deinterlaceFieldRate
+            fieldRate: loadedOptions.deinterlaceFieldRate,
+            inverseTelecine: inverseTelecine
         )
         host.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
@@ -2347,7 +2382,7 @@ extension AetherEngine {
         if let status = processingRebuild.status { activeVideoProcessing = status }
         wireVideoProcessingStatus(from: host)
         // The audio route is settled by `load`: an object-audio one keeps the HDMI link in Atmos.
-        followAtmosOutput()
+        if !audioOutputWaitsForPlayGate { followAtmosOutput() }
     }
 
     /// Open `AudioPlaybackHost` for an audio-only source. No HLS pipeline, display layer, or display-criteria handshake. Same lifecycle as `loadSoftware`.
@@ -2539,6 +2574,7 @@ extension AetherEngine {
         resumeOverride: Double? = nil,
         resumePlaying: Bool? = nil,
         restoredDeinterlaceWarmupDecision: Bool? = nil,
+        restoredInverseTelecine: Bool? = nil,
         keepsDisplayRefusedMediaRoute: Bool = false
     ) async -> Error? {
         // Liveness guard: a stop()/load() between scheduling and here would resurrect a dismissed session or kill the successor. Generation captured at schedule time; both stop() and load() invalidate it.
@@ -2546,6 +2582,8 @@ extension AetherEngine {
             EngineLog.emit("[AetherEngine] reload superseded before start; ignored", category: .engine)
             return nil
         }
+        // AE#1100: a live URL that replays its session when opened twice gets a fresh one from the host.
+        let url = urlForLiveReopen(of: url, site: "session rebuild")
         // #227 round 2: this is a session-preserving rebuild exactly like `reloadAtCurrentPosition`'s
         // URL branch, and it tears down the very item the external-playback KVO watches, so it has to
         // hold the same edge. #227 put the hold on that one branch only, which left the three rebuilds
@@ -2654,6 +2692,10 @@ extension AetherEngine {
         let preservedSourceSeekable = isSourceSeekable
         let preservedRequiresDeinterlaceWarmup =
             restoredDeinterlaceWarmupDecision ?? lastRequiresDeinterlaceWarmup
+        // #853: the session's inverse telecine decision. This rebuild keeps the display mode, so it keeps
+        // the decision that chose it too; it never samples again. A disc title switch is the exception,
+        // see `reopenedInverseTelecine` below.
+        let preservedInverseTelecine = restoredInverseTelecine ?? lastInverseTelecine
         let reloadStart = DispatchTime.now()
         EngineLog.emit("[AetherEngine] reload: stopInternal start", category: .engine)
         // resetDisplayCriteria: false: video format is unchanged; resetting triggers a full waitForSwitch Stage 2 timeout (5 s at the 2026-05-26 device test, ~2 s cap since #117; Bose SLIII A2DP + 4K HDR10 PQ: each switch added ~12 s black-screen). On the same route a panel SDR drop during the reset window failed the PQ variant with AVFoundationErrorDomain -11868 / CoreMediaErrorDomain -17223.
@@ -2708,6 +2750,7 @@ extension AetherEngine {
         adoptSessionLiveness(from: loadedOptions)
         lastDetectedVideoCodec = preservedVideoCodec
         lastRequiresDeinterlaceWarmup = preservedRequiresDeinterlaceWarmup
+        lastInverseTelecine = preservedInverseTelecine
 
         // Custom sources: no URL to reopen; rebuild on the retained reader. Demuxer opens at byte 0; loadSoftware/loadNative seek to startPosition.
         // Preserve the caller's probe budget (#68) across the reopen so an audio/title switch doesn't re-incur the full find_stream_info cost the caller paid to avoid.
@@ -2844,6 +2887,24 @@ extension AetherEngine {
         }
 
         do {
+            // #853: another disc title is another stream. Carrying the outgoing title's decision over would
+            // decimate a video-shot extra after a film title (one frame in five lost), and dropping it would
+            // deinterlace the next episode of a film-shot series. So the new title is sampled like a fresh
+            // load. The display criteria stay as they are (this reload writes none), so a title that
+            // decides differently plays on the rate the first title asked for.
+            var reopenedInverseTelecine = preservedInverseTelecine
+            lastInverseTelecineVerdict = nil  // a rebuild samples nothing unless the title changed
+            if targetSoftwarePath, restoredInverseTelecine == nil, titleToReopen != outgoingDiscTitleID,
+               let pre = customPreopened, let stream = pre.stream(at: pre.videoStreamIndex),
+               let codecpar = stream.pointee.codecpar {
+                var sampleOptions = loadedOptions
+                sampleOptions.inverseTelecineCarryover = nil
+                reopenedInverseTelecine = try await decideInverseTelecine(
+                    options: sampleOptions, probe: pre, probeOpened: true,
+                    codecID: codecpar.pointee.codec_id, fieldOrder: codecpar.pointee.field_order,
+                    frameRate: Self.detectFrameRate(stream: stream), codedHeight: codecpar.pointee.height,
+                    startPosition: resumeAt, generation: gen)
+            }
             let loadStart = DispatchTime.now()
             if targetSoftwarePath {
                 EngineLog.emit("[AetherEngine] reload: loadSoftware enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
@@ -2857,6 +2918,7 @@ extension AetherEngine {
                     dvrWindowSeconds: loadedOptions.dvrWindowSeconds,
                     preopenedDemuxer: customPreopened,
                     requiresDeinterlaceWarmup: reopenedRequiresDeinterlaceWarmup,
+                    inverseTelecine: reopenedInverseTelecine,
                     autostarts: transportIntentUnderReconstruction ?? resumesPlaying,
                     generation: gen,
                     elType: sourceElType
@@ -2865,6 +2927,7 @@ extension AetherEngine {
                 isSourceSeekable = preservedSourceSeekable
                 playbackBackend = .software
                 lastRequiresDeinterlaceWarmup = reopenedRequiresDeinterlaceWarmup
+                lastInverseTelecine = reopenedInverseTelecine
                 activeAudioTrackIndex = Self.softwareReloadAudioIndex(
                     hostIndex: softwareHost?.audioStreamIndex ?? -1, requested: audioStreamIndex)
                 activeVideoDecoder = Self.videoDecoderLabel(
@@ -2969,6 +3032,7 @@ extension AetherEngine {
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native
                 lastRequiresDeinterlaceWarmup = reopenedRequiresDeinterlaceWarmup
+                lastInverseTelecine = false
                 // Publish the session's actual pick (invalid override falls back to auto; demuxed-audio resolves in side-demuxer numbering).
                 syncPublishedAudioStateFromNativeSession()
                 activeVideoDecoder = Self.videoDecoderLabel(

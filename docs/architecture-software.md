@@ -66,6 +66,8 @@ Source URL ──► Demuxer ──┬─► video decoder ──► [UpscalingF
 - One trigger is described in [AVC configuration changes](architecture-native.md#avc-configuration-changes).
 - `videoRoute` reports the move ([Effective video route](architecture.md#effective-video-route-videoroute)).
 
+**Inverse telecine on VOD.** Hard-telecined NTSC MPEG-2 film is sampled before the display criteria are written (`TelecineCadenceProbe`, #853). On film the deinterlace graph becomes `fieldmatch`, the deinterlacer for frames left combed, then `decimate` (on the GPU engine `decimate` runs before the upload, since it takes CPU frames only), and the session runs at 23.976 fps. See [formats › Inverse telecine](formats.md#inverse-telecine).
+
 **Interlace check on VOD.** Interlaced H.264 comes here to be deinterlaced. On seekable VOD (#232) the declared field order is first checked against decoded frames (`InterlaceProbe`). The deinterlace filter engages on `AV_FRAME_FLAG_INTERLACED` alone. So if that flag never appears in a sample, the detour would do nothing, and the stream goes back to the native path.
 
 **AV1 capability registration is lazy.** The engine registers the supplemental VideoToolbox AV1 decoder and checks `VTIsHardwareDecodeSupported` (`VTCapabilityProbe`) only when routing an AV1 source, so devices with hardware AV1 take the native path. Loading H.264, HEVC or audio-only content does not consult it.
@@ -435,6 +437,12 @@ The 2:3 pulldown retimer is not an optional stage. It is part of the native rout
 One table, kept with the native side, shows how each audio route sits on this host next to the native one: stream copy of E-AC-3 JOC, PCM decode, the object-audio render through `SoftwareAPACProducer`, and how `SoftwareAtmosRoute` picks per track. See [architecture-native.md, Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio).
 
 The channel layout and timestamp rules of the PCM decode are under [Audio channel layout and timestamps](#audio-channel-layout-and-timestamps).
+
+**AC-3 and E-AC-3 play with their full dynamics.** FFmpeg's Dolby decoders apply the stream's dynamic range compression unless told otherwise. Apple's decoder on the native path does not (unless the viewer turns on Reduce Loud Sounds). So every FFmpeg decoder whose output is heard opens through `AudioDecoderOptions` with `drc_scale` 0. That covers `AudioDecoder` (this host, the audio-only host and the lazy tap use it), the `AudioBridge` decode and `AudioTapDecoder`. Apple's decoder ignores dialnorm just like FFmpeg's, measured on AC-3 encoded at dialnorm -31 and -20. Both decoders put out the same level for both.
+
+- Before, a session that moved here (for example for upscaling) played quieter than the same title on the native path. On an E-AC-3 5.1 film it was -18.6 LUFS against Apple's -16.8, with peaks 1.5 dB lower, and -16.6 LUFS once the compression was off.
+- A host that wants a compressed sound sets it with `AudioShaping`, the same on both paths.
+- E-AC-3 JOC on this host goes through Apple's converter (`SoftwareEAC3AtmosDecoder`) or stays compressed, so it was never affected.
 
 ## Audio tap
 

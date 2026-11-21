@@ -239,6 +239,11 @@ A restart is the expensive path: it re-seeks the demuxer, which is slow on remot
 
 The key that decides reuse is the URL, the options without the diagnostics label, the session's own derived output configuration (`ParkingOutputConfiguration`) and the segment plan.
 
+Two things keep a Resume of a file without a keyframe index from paying the index work again:
+
+- The candidate is taken before the cue prewarm. When the parked session's prewarm hit its cap and its plan fell back to the uniform stride (`ParkedSegmentSession.UnindexedSource`, the file's byte size and duration), a load of the same file skips the prewarm. On a remote MKV without Cues that was the whole 10 s cap before every Resume.
+- A session that adopted segments seeks its first producer on the pump thread (`HLSSegmentProducer.positionBeforeFirstRead`) instead of in `prepare()`. Without an index that seek is a linear read up to the frontier, and the playhead has the adopted span to play meanwhile. A restart that meets the pump still in it takes the wedged-read path (fresh demuxer after 5 s).
+
 **Whole-source prefetch (opt-in).** A forward window larger than that is an explicit host opt-in through `LoadOptions.forwardBufferSegments` (up to 2700 segments, ~3 h, #207). It drops the budget's 2 GiB default cap but keeps the quarter-of-free-space clamp.
 
 The producer parks once the segments it has written ahead of the consumer target fill that budget, and resumes as eviction behind the playhead frees room (`PrefetchDiskBudget`). So an opt-in prefetch follows the disk budget, not the source length.
@@ -691,6 +696,16 @@ The coverage ledger ([below](#the-landing-after-a-seek)) knows both cases. `harv
 - So every pair at the main reader's front descends. A drain that stopped at each one would never get more than a few seconds ahead of the playhead, and a host's advance offset would show nothing until the first seek.
 
 So where the ledger has heard from a reader, it is the whole answer, both for a cut and for the end of a wait. A pair whose span some run read is decoded through; one nobody read is a hole, whatever the sequences say. Order stays the rule only on a store whose readers never report coverage.
+
+**The ground in front of the first packet (AE#1104).** A reset after a seek has no packet in front of its first entry, so no pair covers that stretch. A backward seek past the session's earliest reading shows why it matters:
+
+- A file opened at 46.2 s holds only what the load read, from 27.5 s on.
+- After a seek to 0 that island is the first entry in the window, and the stretch from 0 to 27.5 s is unread.
+- Decoding the island first put the cursor past it, so the cues the readers then found from 0 s on were stored behind the cursor and never shown.
+
+So a reset also asks the ledger about the stretch from its window start (clamped at 0, like every reader's read start) to the first entry. Unread means the tick decodes nothing, leaves the cursor at the window start and waits there, under the same rules as any other wait. Without a ledger the reset decodes as before, since order has nothing to compare at a window boundary.
+
+One case is still open. A first entry that is already due (within the release lead of the playhead) decodes at once, so the landing line is never held back. If the ground in front of it is unread, a cue that starts there and is still on screen at the landing arrives behind the cursor and is not shown. That takes a short backward seek into a stretch the session never read. A cursor that steps back for packets stored behind it would close it.
 
 On a link near the media bitrate, two more rules make this work:
 

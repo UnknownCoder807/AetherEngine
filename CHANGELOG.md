@@ -12,6 +12,134 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.72.0] - 2026-11-21
+
+### Added
+
+- **`untaggedVideoColor` lets a host show an untagged 10-bit stream as HDR10 or HLG (AE#1103).** Some IPTV
+  files are HDR10 with every colour tag stripped, and since #654 the engine plays them as BT.709, which looks
+  pale. With `.hdr10` or `.hlg` set, a 10-bit stream that declares no primaries, transfer or matrix and is not
+  Dolby Vision gets that description, and the route, display criteria, `colr` box, software frame tags and
+  `probe` follow it. A stream that declares anything keeps it, and an HEVC stream with a Dolby Vision RPU is
+  left alone even without a record. Measured on such an HEVC encode, the served `init.mp4` carries
+  `colr nclx` 9 / 16 / 9, and Apple's decoder reads it as BT.2020 / PQ instead of guessing BT.709.
+- **Hard-telecined film plays as film: inverse telecine on the software path (#853).** An NTSC DVD of a
+  film-shot series (24p film put on 29.97i MPEG-2 with the 3:2 pulldown baked into the pictures) used to be
+  deinterlaced, which interpolated half of every film frame and kept the pulldown judder. A load now samples
+  such a source before it writes the display criteria (`fieldmatch` + `idet` and the repeated frame of each
+  five), and on film it matches the fields back into the original frames, drops the repeated one and asks for
+  23.976 Hz. Titles and credits made at video rate still go through the deinterlacer. True interlaced video,
+  live, HD and PAL keep today's path. `LoadOptions.inverseTelecine` (`.auto` by default, `.off`, `.force`) and
+  `VideoDeinterlace.inverseTelecine` / `outputFrameRateFactor` are new. Measured on the Friends S1 DVDs: every
+  episode detected from its first frame and from every resume point tried, no false detection on true
+  interlaced video. The sample adds 0.3 s to the first frame over an 80 Mbit/s link and up to 2 s on slow
+  ones, where it then keeps the deinterlacer (issue and measurements by @andreiborisov).
+- **`liveReopenURL` lets a host hand the engine a fresh URL whenever it opens a live source again (AE#1100).**
+  An HDHomeRun tuner opened twice with the same `SessionID` replays that session from its start, so every
+  reopen of the loaded URL put the viewer minutes behind live. The engine now asks the closure before an
+  audio switch that reloads, before `reloadAtCurrentPosition()` (the background return included), and before
+  every reconnect of a dropped live connection on both routes. Measured against a replaying origin: a dropped
+  connection used to fall back from 27.71 to 16.67 s of source time, and now joins at live.
+
+### Changed
+
+- **The GPU deinterlacer is bwdif now, the same algorithm as the CPU fallback (AE#1102).** With
+  FFmpegBuild 3.17.0, which carries `bwdif_videotoolbox`, `DeinterlaceMode.auto` builds it in place of
+  `yadif_videotoolbox`, so the GPU path and the CPU fallback use one algorithm. bwdif reconstructs
+  fine detail and slow pans better (luma PSNR +0.8 to +1.2 dB on film material, about +5.7 dB on a smooth
+  pan) for about 15% more GPU time per field. `yadif_videotoolbox` takes over when bwdif's graph does not
+  build. `$sourceVideoStreamFormat`'s `deinterlace.filter` reads `bwdif_videotoolbox` on such sessions.
+- **GPU deinterlacing waits on the GPU once per frame instead of once per plane (AE#1101).** FFmpegBuild
+  3.17.0's `yadif_videotoolbox` submits both planes of an NV12 or P010 frame in one command buffer, with the
+  same output. A 1080p59.94 field went from 2.34 to 1.86 ms on an M1; most of it was the decode thread
+  waiting. `bwdif_videotoolbox` submits the same way.
+- **An audio-track switch on a software live session no longer reopens the source (AE#1100).** A session on
+  the software path with a packet ring (`dvrWindowSeconds` or the live edge cushion) now stores every audio
+  track of the source in it, and a pick switches in place: new decoder, feeder reseeded at the playhead. The
+  position, the rewind window and the source connection all stay, a rewind behind the switch plays the new
+  track, and it works on forward-only custom sources too. The ring grows by the other tracks' bitrate, a few
+  percent next to broadcast MPEG-2. Thanks to sunnierseattle for the report and the probe of the tuner.
+
+### Fixed
+
+- **AC-3 and E-AC-3 are no longer quieter on the software host.** FFmpeg's Dolby decoders apply the
+  stream's dynamic range compression by default, and Apple's decoder on the native path does not. So a
+  session on the software host, for example one that moved there for upscaling, played compressed and about
+  2 dB quieter. An E-AC-3 5.1 film read -18.6 LUFS against Apple's -16.8. Every decoder whose output is
+  heard (software host, audio-only host, audio bridge, audio tap) now opens AC-3 and E-AC-3 with `drc_scale` 0, which reads
+  -16.6 LUFS. Through the engine's own tap, the first 90 s of that film went from 20.8 to 24.8 LU of
+  loudness range at the same integrated level.
+
+- **The TrueHD Atmos and DTS:X bed regression runs in real time in a host's Debug build (AE#1106).** The
+  bed regression computed its band statistics, its weights and its mix in per-bin Swift loops. A host's Debug build compiles the package without
+  optimisation, and there the regression ran at 0.2x real time, so a TrueHD Atmos session stalled on every
+  segment. The three steps now run through Accelerate (one matrix product per band, the weights interpolated
+  with `vDSP_vlint`). On an M1, 16 elements into 9.1.6 went from 5.8 s to 0.09 s of CPU per second of audio
+  in a debug build, and from 112 ms to 53 ms optimised. The output matches the old code within float rounding.
+  Not yet measured on an Apple TV.
+
+- **Subtitles before a session's start position come back after a backward seek on the software path
+  (AE#1104).** A file opened at 46.2 s and then sought to 0 showed no subtitles until 27.5 s. The store held
+  only what the load had read, from 27.5 s on, and the seek decoded that first. The drain cursor then sat
+  past it, and the cues the readers found from 0 s on were stored behind the cursor and never decoded. The
+  reset after a seek now waits until the stretch in front of its first stored cue has been read. Measured
+  with `aetherctl play --sw` on such a file, all cues from 7.25 s on arrive 0.14 s after the landing. Thanks
+  to sarathm09 for the report and the log.
+
+## [7.71.2] - 2026-11-20
+
+### Fixed
+
+- **A Dolby Vision live recording reads back as HEVC again, not as `DOVI`.** FFmpegBuild 3.16.1 brings the
+  mpegts Dolby Vision patch in line with its upstream review (FFmpeg PR 26097). The `DOVI` registration
+  descriptor now precedes the `HEVC` one, and since the demuxer keeps the last registration as the codec
+  tag, a recording reports `HEVC` again. The `DOVI` registration is also written only for Profile 5
+  (compatibility ID 0), as Dolby's TS spec asks, and a base layer whose RPU was stripped is no longer
+  announced as Dolby Vision. The configuration record itself is unchanged.
+
+- **A live source that answers every request with a few bytes no longer gets asked hundreds of times a
+  second.** A channel that is still starting can answer each request with HTTP 200 and a short body such as
+  `Channel starting.`. Sent as `text/plain` with a length, 7.53.0 already reads that as a refusal (AE#925).
+  Labelled as TS or sent without a length, the reader counted the bytes as progress, reset its reconnect
+  streak and asked again at once: 46,000 requests in 40 s against a loopback origin, 4,330 in 19 s in the
+  field. Now a live connection that ends with 64 KiB or less delivered goes through the reconnect ladder
+  with backoff, and a source that never delivered 512 KB in total gets the short never-productive budget. The
+  same origin now sees five requests over about 15 s, then the load fails with `.liveSourceUnavailable`.
+  A live source that delivers real data before ending its connection still reconnects at once. The short
+  budget now also applies to a VOD source that failed before delivering 512 KB, which used to get the full
+  twelve attempts (reported by StreamX).
+
+## [7.71.1] - 2026-11-20
+
+### Fixed
+
+- **A software-path video now turns its audio on after the TV has switched modes.** The software path
+  activated the audio session before it built its host, while the panel could still be switching refresh
+  rate or dynamic range for that load, so the HDMI audio link was negotiated mid-switch. It now activates
+  after the play gate and before the first `play()`, the way AVKit does on the native path, and the silent
+  Atmos stream for a receiver's Atmos indicator waits for the same point. A reporter with an Atmos receiver
+  saw some whole sessions stay silent on mode-changing AV1 loads; that this ordering caused them is not
+  proven yet. The start costs one activation round trip (about 14 ms) that used to overlap the host build
+  (AE#1099, reported by @nulltuple).
+
+- **A Resume of a file without a keyframe index no longer pays the 10 s index scan again.** On an MKV
+  without Cues the start scans the file for keyframes until a 10 s cap, then falls back to a fixed segment
+  grid. With `retainsSessionCacheAfterStop` the kept session now remembers that, and the next load of the
+  same file (same size and duration) skips the scan. The first producer of a session that adopted kept
+  segments also positions itself on its own thread, so the load no longer waits for a linear seek past
+  them. Measured on a 300 s cue-less MKV from an origin with 150 ms per response and 2 MB/s: the clock moved
+  0.9 to 1.0 s after the reopen instead of 15.7 s (AE#1095, reported with device numbers by @samimt55).
+
+- **A software-path video no longer waits on low-priority work to start.** Every load waits for its packet
+  cache setup, and that setup ran at utility priority. Since the move to `BlockingWork` (7.31.2) an await no
+  longer raised it, so on a busy CPU the start waited behind everything else. In a full test run the load
+  took 11.7 s before and 4.4 s after; a device under load was not measured. It also was what pushed the
+  AE#1023 paused-seek test over its CI time limit.
+- **A scrub preview no longer waits on low-priority work either.** Three lookups each preview still waits
+  for (the segment that holds the position, whether it is still the same one after the decode, and the
+  keyframe ladder's rung) ran at utility priority the same way. They now run at the priority of the finger on
+  the scrubber. Not measured separately; the cause is the one above.
+
 ## [7.71.0] - 2026-11-19
 
 ### Added

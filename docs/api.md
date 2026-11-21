@@ -137,6 +137,7 @@ How these kinds arrived in earlier releases is in [measurements.md › API histo
 - **A plain-URL live open** (`isLive`) that the origin answers with a status fails the same way (#796). A 500 or 502 is asked once more first. A 2xx answer with a short text notice instead of media fails the same way too: that is how an Xtream panel at its connection cap answers, and it publishes `.sourceRateLimited` with 509 (#925).
 - **A TLS trust refusal** on either publishes `.sourceCertificateRejected`.
 - **Only a live open that reaches nothing** publishes `.liveSourceUnavailable`. The reconnect ladder first tries to ride out a transport failure. When the start gives up, the last connection's URL error domain and code are in `underlyingDomain` / `underlyingCode`. A transport failure does not prove that the media format is unsupported.
+- **A live open that gets only a few bytes per request** publishes `.liveSourceUnavailable` too. Some panels answer a channel that is still starting with a short body labelled as TS, or with text and no length. A connection that ends with 64 KiB or less does not count as delivering, so the open retries on the never-productive ladder (five requests, about 15 s) and then fails. A low-bitrate stream that closes its connection every few hundred KB still reconnects at once.
 
 #### Origin refusals: `.sourceRefused` and `.sourceRateLimited`
 
@@ -254,6 +255,30 @@ A URL with a rotated per-session token misses that memory, so every retune pays 
 - by handing `HLSLiveIngestReader` to `.custom(_:formatHint: "mpegts")` itself, which costs nothing at all
 
 Either way skips the native mount and up to 4 s of carriage-watchdog grace per retune, whatever the URL looks like this time.
+
+### Live: a one-shot live URL
+
+**What the host must do, if its origin replays:** set `liveReopenURL` before `load`, and return the URL with a fresh session id. Return nil to reopen the loaded URL.
+
+```swift
+player.liveReopenURL = { loaded in
+    var parts = URLComponents(url: loaded, resolvingAgainstBaseURL: false)
+    parts?.queryItems = parts?.queryItems?.map {
+        $0.name == "SessionID" ? URLQueryItem(name: "SessionID", value: UUID().uuidString) : $0
+    }
+    return parts?.url
+}
+```
+
+**Why.** Some origins treat a live URL as one session. An HDHomeRun tuner opened a second time with the same `ClientID` and `SessionID` replays that session from its start instead of joining at live (AE#1100: the second open delivered the first one's bytes again, 25 MB in 6 s). Every reopen of the loaded URL then puts the viewer minutes behind.
+
+**When the engine asks.** Before each time it opens a live URL source again inside the session:
+
+- an audio-track switch that reloads the session (not the in-place switch of the software live route)
+- `reloadAtCurrentPosition()`, which the return from the background also runs
+- each reconnect of a live connection that dropped, on both routes, and each attempt of the native route's own source reopen
+
+It is handed the URL the session loaded, every time, so the closure needs no state of its own. The reconnects run off the main actor, so keep it quick and never block in it. It is not asked for a custom source or for VOD. The native route reads the value the session loaded with, so set it before `load`.
 
 ### Live: exhausted verified replay
 
@@ -412,6 +437,12 @@ The result is `@discardableResult`, so a host that only needs the refusals can i
 - It costs no teardown and comes back as `sessionOwned` (round 4).
 - The one rebuild that DOES apply the flag is the resume after a background teardown (#357). It has no session transport left to keep, so there the field is named as applied.
 
+**`inverseTelecine` belongs to the load, not to the session** (#853). The load decided it together with the display rate it asked for, and every rebuild keeps both.
+
+- A correction of it comes back in `sessionOwned` and does not change the running session. The engine keeps it for the loads it makes itself later (a disc title switch), and a host's own `load()` takes what it passes.
+- With a session up, it costs no teardown (`rebuilt` false).
+- After a background teardown (#357) the call is the restore itself, so it still rebuilds (`rebuilt` true) and keeps the session's old decision.
+
 #### Refusals
 
 Both refusals are thrown BEFORE any teardown, so a refused correction leaves the session playing. Both are all-or-nothing: if one field is refused, none of the correction is installed.
@@ -424,6 +455,7 @@ Both refusals are thrown BEFORE any teardown, so a refused correction leaves the
 | `AetherEngineError.sessionNotReloadable(.dualLayerRouteNeedsFreshLoad)` | the correction changes `preferDualLayerDolbyVision` (or `dolbyVisionHandling` or `dualLayerRoute` while the preference is on) on a custom `IOReader` Profile 7 session. The in-place rebuild keeps the route the session was loaded with; call `load()` again with the new option. |
 | `AetherEngineError.sessionNotReloadable(.upscaleRouteNeedsFreshLoad)` | the correction turns `upscalesLowResolutionVideo` on, or changes `upscaleScaler` while it is on (AE#1039), for a custom `IOReader` session. Call `load()` again with the new option. See note 2. |
 | `AetherEngineError.sessionNotReloadable(.videoProcessingRouteNeedsFreshLoad)` | the correction turns `videoProcessing` on, or changes its target while it is on, for a custom `IOReader` session (#957). Call `load()` again with the new option. See note 2. |
+| `AetherEngineError.sessionNotReloadable(.untaggedVideoColorNeedsFreshLoad)` | the correction changes `untaggedVideoColor` for a custom `IOReader` session (AE#1103). Call `load()` again with the new option. See note 2. |
 | `AetherEngineError.sessionNotReloadable(.demuxedAudioLiveIsNativeOnly)` | the correction moves a demuxed-audio live session onto the software path. The side-audio merge does not exist there, so it would play silent. |
 
 1. **Identity fields.** These name the session rather than tune it: each opens the source on a different pipeline or gives the session a different role. Changing one makes a different item, not a correction.
@@ -1279,7 +1311,7 @@ It is per engine instance, so several engines at once can be told apart without 
 
 - `frame` is a `VideoStreamFormat` for the decoded picture: libavcodec's output pixel format, or the libav name of the VideoToolbox buffer on the software host's hardware decoder.
 - `pixelBufferFormat` is the CoreVideo buffer it was displayed from (`420v`, `x420`); `pixelBufferLabel` reads "P010 (x420)".
-- `deinterlace` is a `VideoDeinterlace?` (AE#983) naming the deinterlace graph the frames pass through: `filter` (`yadif_videotoolbox`, `bwdif`, `yadif`), `isHardware`, `fieldRate`, and `outputFramesPerSourceFrame` (2 at field rate, so "deinterlaced to 50 fps" is `sourceVideoFrameRate * 2`). nil while frames go out as decoded. The graph starts on the first frame flagged interlaced and stays until a seek. A filter error drops the graph and the next interlaced frame builds a new one (a hardware graph that failed is replaced by the software one). After three errors in a session the frames go out as decoded. At the end of a stream the graph is flushed first, so the last picture is not lost.
+- `deinterlace` is a `VideoDeinterlace?` (AE#983) naming the deinterlace graph the frames pass through: `filter` (`bwdif_videotoolbox`, `yadif_videotoolbox`, `bwdif`, `yadif`), `isHardware`, `fieldRate`, `inverseTelecine` (#853: `fieldmatch` and `decimate` run around `filter`, which then only touches frames left combed, and the output is film at 4/5 of the source rate), `outputFramesPerSourceFrame` (frames the deinterlacer emits per frame it takes in: 2 at field rate) and `outputFrameRateFactor` (multiply `sourceVideoFrameRate` by it for the output rate: 2 at field rate, 1 at frame rate, 0.8 under inverse telecine). nil while frames go out as decoded. The graph starts on the first frame flagged interlaced and stays until a seek. A filter error drops the graph and the next interlaced frame builds a new one (a hardware graph that failed is replaced by the software one; a GPU filter that fails to build is passed over for the next, `yadif_videotoolbox` after `bwdif_videotoolbox`). After three errors in a session the frames go out as decoded. At the end of a stream the graph is flushed first, so the last picture is not lost.
 - Republished when any of these changes mid-stream.
 - **nil on every native route.** AVPlayer decodes there, and its frames never pass through the engine. A panel shows `$sourceVideoStreamFormat` and names AVPlayer as the decoder, instead of inventing a pixel format nobody measured.
 
@@ -1299,7 +1331,7 @@ A settings screen reads `AetherEngine.displayCapabilities` instead of guessing f
 | --- | --- |
 | `$audioTracks` | `[TrackInfo]`. Republished when `LoadOptions.confirmAtmos` confirms a track, and when the DTS:X decoder confirms the playing track as DTS:X (`isDTSX`). On `.remoteBypass`, see below. |
 | `$activeAudioTrackIndex` | The selected track's id. On `.remoteBypass`, the enabled item track's. |
-| `selectAudioTrack(index:)` | Session-preserving reload. `index` is `TrackInfo.id`. See [Switching audio tracks](#switching-audio-tracks). |
+| `selectAudioTrack(index:)` | Session-preserving reload, or an in-place switch on a software live session with a ring. `index` is `TrackInfo.id`. See [Switching audio tracks](#switching-audio-tracks). |
 | `audioShaping`, `setAudioShaping(_:)`, `$audioShapingState` | Shape the session's audio before it reaches the output (AE#923). See [Audio shaping](#audio-shaping). |
 | `normalizationGainDB`, `setNormalizationGain(_:)`, `normalizationGainReport` | Per-track loudness gain on audio-only sessions, lift included. See [Track loudness on audio-only sessions](#track-loudness-on-audio-only-sessions). |
 | `installAudioTap(channels:)`, `removeAudioTap()`, `audioTapHasDeliverySource`, `AetherEngine.audioTapFormat` | Opt-in decoded PCM, mono Float32 48 kHz with source-PTS stamps, off the render path. `channels` is an `AudioTapChannels`: `.downmix` (default) or `.dialogue` (the centre channel alone). See [the audio tap contract](#the-audio-tap-ends-with-its-session). |
@@ -1314,7 +1346,18 @@ The ids are synthetic (from 400000 up), because there is no stream index on that
 
 ### Switching audio tracks
 
-`selectAudioTrack(index:)` is a session-preserving reload.
+`selectAudioTrack(index:)` is a session-preserving reload. The one exception is the software live route, which switches in place (next paragraph).
+
+**Software live with a ring: no reload (AE#1100).** A live session on the software path that has a packet ring (`dvrWindowSeconds`, or `liveEdgeCushionSeconds`) keeps every audio track of the source in that ring, not only the one playing. A pick opens a decoder for the new track and reseeds the feeder at the playhead, the way a DVR seek to the same spot would. So:
+
+- the source is not opened again, and an origin that replays a session opened twice (HDHomeRun) cannot put the viewer back at the tune-in
+- the position and the whole rewind window stay, and a rewind behind the switch plays the new track too
+- it also works on a forward-only custom source, which could not switch at all before
+- the picture holds through the reseed, like a DVR seek
+
+The extra tracks cost ring space: each one adds its own bitrate (an AC-3 track at 192 to 448 kbit/s next to 8 to 19 Mbit/s of broadcast MPEG-2, so a few percent). A session that cannot switch in place, for example one whose clock has not started yet, falls back to the reload and logs why. Every other live session reloads, which opens the source again; see [Live: a one-shot live URL](#live-a-one-shot-live-url).
+
+The rest of this section describes the reload.
 
 - **Native path.** The old item stays mounted while the source reopens. Its last picture is held until the new item's first frame, so the switch shows a still, not black. How and where it is held (still view, PiP, Dolby Vision, software path): [Held pictures across an audio switch](#held-pictures-across-an-audio-switch). Audio is not gapless, and a media-services reset still discards the item.
 - **Elsewhere** expect roughly 0.5 to 1 s of black.
@@ -1327,7 +1370,7 @@ The ids are synthetic (from 400000 up), because there is no stream index on that
 It does nothing in these cases. Every refusal is logged, so a picker that does nothing can be explained:
 
 - when out of range or already active
-- on a forward-only custom source (live ingest included), which cannot rebuild its pipeline. There a track change is a fresh `load` naming the stream.
+- on a forward-only custom source (live ingest included), which cannot rebuild its pipeline, unless the software live route switches it in place (above). Otherwise a track change there is a fresh `load` naming the stream.
 - on a sequential origin (`$isSequentialOrigin`): a track change there is a fresh `load`, see [`sequentialOrigin`](#sequentialorigin).
 - on `.remoteBypass`, where AVPlayer owns the audio selection and the track list is informational. A different language there is a different URL.
 
@@ -1533,6 +1576,7 @@ Hosts can supply other positive limits. Ordinary subtitle selection behaves as b
 | `nativeLiveDVRMandatoryBytes` | The finite pinned playback payload that may exceed that allowance. Excludes init and subtitle data, muxer staging, AVPlayer's buffers, filesystem overhead and recordings. |
 | `setSoftwareLiveDVRLimits(_:availableCapacityBytes:)`, `softwareLiveDVRBytes` | The same lease for the software live spool, which needs `LoadOptions.softwareDVRRetention`. `softwareLiveDVRBytes` is the retained packet payload. See [DVR limits](#dvr-limits). |
 | `liveSourceReset` | The [retune contract](#live-the-retune-request). |
+| `liveReopenURL` | `(@Sendable (URL) -> URL?)?`. The URL to open when the engine opens a live URL source again inside one session. See [Live: a one-shot live URL](#live-a-one-shot-live-url). |
 | `liveSourceReplayExhausted` | Verified replay exhausted one bounded recovery round. Cached DVR stays readable; retry via `retryLiveSourceRecovery()` under the host's backoff without losing packet history. See [exhausted verified replay](#live-exhausted-verified-replay). |
 | `liveResumeClamped`, `LiveResumeClamp` | A resume that found the playhead outside the window and moved it; see [a resume that had to move](#live-a-resume-that-had-to-move). |
 | `liveScrubThumbnail(atSessionSeconds:maxWidth:)` | Still on the live session axis, decoded from what the session already holds. A native session reads its DVR segment cache; a software session reads its DVR packet ring (#544). So a tuner channel the box decodes in software has a scrub preview too. |
@@ -1988,7 +2032,8 @@ The centers are process-wide. The engine writes `MPNowPlayingInfoCenter.default(
 
 - **Route-sharing policy differs by platform (#116).** tvOS declares `.longFormAudio`, iOS declares `.default`. `.longFormAudio` marks the process as a long-form audio client. That pins `AVPictureInPictureController.isPictureInPicturePossible` to false for any PiP controller a host builds around the engine's player layer, which is why iOS does not use it. Hosts do not need to re-declare the session for PiP.
 - **Why not at launch (#24).** Activating at launch pins the route to whatever the HDMI link reports at that moment. With tvOS Continuous Audio Connection off, the link idles at stereo. The route would be negotiated to 2 channels and stay there, downmixing non-Atmos multichannel for the whole session.
-- **Who activates.** On the native video path the host's `AVPlayerViewController` activates the session per playback. The renderer paths (software decode, audio-only) activate it themselves, off the main actor and before their host is built (AE#538). A host that mounts the bare `AVPlayerLayer` (`nativePlayerLayer`) instead of an `AVPlayerViewController` must make sure the session is active at playback.
+- **Who activates.** On the native video path the host's `AVPlayerViewController` activates the session per playback. The renderer paths (software decode, audio-only) activate it themselves, off the main actor (AE#538). A host that mounts the bare `AVPlayerLayer` (`nativePlayerLayer`) instead of an `AVPlayerViewController` must make sure the session is active at playback.
+- **When a software video load activates (AE#1099).** After the play gate, the wait for the display mode switch, and before the first `play()` or the paused mount. The native path activates at `play()`, so both paths now negotiate the HDMI audio link with the panel already in its new mode. Before, the software path activated before it built its host, while the panel could still be switching. The silent Atmos stream that keeps a receiver in Atmos (`AtmosOutputActivator`) starts at the same point. A track reload has no play gate and still activates before its host is built. Audio-only loads activate before their host too.
 - **Stereo from the receiver.** An AVR that caches its HDMI EDID wrongly after standby can still report 2 channels and force a downmix. Power-cycling the receiver fixes it.
 - **Atmos is unaffected** either way: E-AC-3 with JOC ships as MAT 2.0 over a 2-channel carrier.
 
@@ -2405,6 +2450,10 @@ Measured with `aetherctl play --host-calls stopreopen@25` on a 1080p MKV from an
 
 The new session takes the kept segments below the first one missing at or after its start position, and its producer starts there. Its first segment lands at once, and so does its clock.
 
+**A per-play id in the URL or the headers defeats it.** The URL is compared with every query item, and the options with every header in `httpHeaders`. A server API that puts a fresh session id into each play request (a `PlaySessionId` query item, a session header) makes every reopen a different source, and the log says `discarded the parked session … a load of another source` (or `the next load differs in its load options` for a header). For a Resume of the same item and version, hand the engine the URL and headers of the previous load, and keep the fresh id for the progress reports.
+
+**A file without a keyframe index.** On an MKV without Cues the start scans for keyframes until a 10 s cap and then cuts on a fixed grid. The kept session remembers that it hit the cap, and the next load of the same file (same byte size and duration) skips the scan instead of paying it again. The segment plan is still compared, so a file replaced under the same URL is caught there.
+
 **When it is deleted.**
 
 - A `load()` of any other source, or a load without the option.
@@ -2556,6 +2605,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `panelIsInHDRMode` | false | **Host assertion** that the panel is presenting HDR right now. See [`panelIsInHDRMode`](#panelisinhdrmode). |
 | `attemptsHDRMasterOnUnprovenPanel` | true | Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's answer be the readout (AE#459). See [`attemptsHDRMasterOnUnprovenPanel`](#attemptshdrmasteronunprovenpanel). |
 | `panelPresentsDolbyVision` | false | **Host assertion** that this display presents Dolby Vision, for the platforms where the engine cannot observe it (AE#493). See [`panelPresentsDolbyVision`](#panelpresentsdolbyvision). |
+| `untaggedVideoColor` | `.standard` | An `UntaggedVideoColor`. `.hdr10` or `.hlg` shows a 10-bit stream with no colour description at all as HDR10 or HLG (AE#1103). See [`untaggedVideoColor`](#untaggedvideocolor). |
 | `omitCriteriaColorExtensions` | false | Diagnostic lever: leave colour out of `AVDisplayCriteria` so AVPlayer re-reads it from the bitstream. |
 | `keepDvh1TagWithoutDV` | false | Diagnostic lever: force dvh1 tags and a master playlist regardless of display capability. |
 | `stereoPresentation` | `.automatic` | How a 3D source is presented where the system shows stereo. See [`stereoPresentation`](#stereopresentation). |
@@ -2582,6 +2632,7 @@ Neither live startup option (`liveStartupGraceSeconds`, `liveStartupSingleSegmen
 | `videoProcessing` | nil | A `VideoProcessingOptions`: tone map HDR10 titles brighter than the display to its peak (#957). nil is off. See [`videoProcessing`](#videoprocessing). |
 | `deinterlaceMode` | `.auto` | A `DeinterlaceMode` for the software path: the Metal / VideoToolbox graph with a CPU bwdif fallback, or `.software` to force the CPU path. |
 | `deinterlaceFieldRate` | `.field` | A `DeinterlaceFieldRate`: the hardware deinterlacer emits one frame per field (25i to 50p) or one per frame. The software fallback always runs at frame rate: doubling a CPU bwdif is the wrong trade, and a fallback should not jump to a higher cost. |
+| `inverseTelecine` | `.auto` | An `InverseTelecineMode` (#853) for hard-telecined film on the software path: `.auto` samples SD NTSC MPEG-2 at load and, on film, matches the fields back into 23.976 fps film frames and asks the display for 23.976 Hz; `.off` always deinterlaces; `.force` matches fields without the sample. Decided per load and kept for the session, see [formats › Inverse telecine](formats.md#inverse-telecine). A host that owns the display criteria (`displayCriteriaOwner = .host`) writes them before the decision exists; on a 59.94 Hz mode the film frames then show in a 3:2 rhythm, as before. |
 | `nativeVideoFrameDiagnostics` | false | Decoded-frame observation on SDR native loopback playback. See [Native video frame diagnostics and recovery](#native-video-frame-diagnostics-and-recovery). |
 | `nativeVideoFrameRecovery` | false | Bounded recovery when native output stops advancing. See [Native video frame diagnostics and recovery](#native-video-frame-diagnostics-and-recovery). |
 
@@ -2846,6 +2897,28 @@ How a 3D source is presented where the system shows stereo (visionOS; every othe
 - A tuning field, correctable through `reloadAtCurrentPosition(applying:)`. Under it, a Profile 5 record the VUI contradicts also stops refusing the software path.
 
 See [formats.md](formats.md#dolby-vision-signaling).
+
+#### `untaggedVideoColor`
+
+Tells the engine what a video stream is when the stream says nothing about its colour (AE#1103). `.standard` is the default and keeps the engine's own reading, which is SDR shown as BT.709 (AE#654). `.hdr10` makes the stream BT.2020 / PQ and `.hlg` makes it BT.2020 / HLG, both with the BT.2020 non-constant-luminance matrix.
+
+**When to use it.** Some IPTV and re-encoded files are HDR10 with every tag stripped. They carry no VUI colour, no HDR SEI and no container colour, so nothing tells them from SDR and they play pale. A host that knows better sets the option, from its own check of the decoded frames or from a per-title "Force HDR" switch.
+
+**Applies only when all of these hold**, so it is safe to set for a whole library:
+
+- the stream is at least 10 bit,
+- primaries, transfer and matrix are all unspecified, in the bitstream and in the container,
+- the stream is not Dolby Vision. A container record rules it out, and so does a Dolby Vision RPU in the first video packets of an HEVC stream, which catches a Profile 5 without a record on every source type.
+
+A stream that declares even one of the three keeps its own description. The range stays as declared, and is limited where the stream says nothing.
+
+**What follows from it.** The demuxer writes the description into the stream's parameters right after the stream analysis, so every later reader sees the same answer. That covers the route, the display criteria, `VIDEO-RANGE`, the `colr` box of the native stream, the software path's frame tags, the session's scrub previews, `videoFormat` and `probe(url:options:)`. Every reopen and rebuild of the session carries it.
+
+- The log says `AE#1103 ... shown as hdr10` when it applied. A refusal because of Dolby Vision is logged too. A tagged or 8-bit stream only gets a verbose line, so a library-wide setting does not fill the host's log.
+- No HDR10 mastering metadata is invented. The display gets PQ without static metadata, as it would for an HDR10 encode that carries none.
+- A `FrameExtractor` the host builds itself opens the file as it is and does not know the option.
+
+**Correcting it.** A tuning field, correctable through `reloadAtCurrentPosition(applying:)` on a URL source, which re-runs `load()`. That is how a per-title switch takes effect on the playing title. On a custom `IOReader` source any change is refused with `SessionReloadRefusal.untaggedVideoColorNeedsFreshLoad`, because the in-place rebuild keeps the route and display criteria it chose for the old description. Call `load()` again there.
 
 #### `forceDolbyVisionOnNonDVDisplay`
 

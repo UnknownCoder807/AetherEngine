@@ -31,6 +31,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `LiveReloadPolicy.swift` | Pure decisions for live reloads: rejoin at the live edge (no stale resume position), skip the pre-readiness zero seek. |
 | `TransportControllable.swift` | Common transport surface of the four playback hosts (single active-host dispatch). |
 | `FFmpegErrorConstants.swift` | AVERROR sentinels Swift cannot import from the C macros. |
+| `AetherEngine+LiveReopenURL.swift` | AE#1100: asks the host's `liveReopenURL` before a live URL is opened again, and publishes an in-place live audio switch. |
 | `AetherEngine+LiveSubtitleRenditions.swift` | Live: the upstream master's `EXT-X-MEDIA:TYPE=SUBTITLES` renditions as tracks (#359). See note. |
 | `AetherEngine+SubtitleOCR.swift` | Arming, per-ordinal cursors and the MainActor tick of the bitmap-subtitle OCR worker. It fills a text rendition for PiP / AirPlay / external display while a PGS / DVB / DVD track's rendition is selected natively. |
 | `AetherEngine+AudioShaping.swift` | `setAudioShaping(_:)`: audio shaping as a live setting. Each change is a session-preserving rebuild, with presses folded into the one in flight (AE#923). |
@@ -63,6 +64,7 @@ Which file owns what, folder by folder. Paths are relative to `Sources/AetherEng
 | `AetherEngine+RetainedSessionCache.swift` | `discardRetainedSessionCache()` and `retainedSessionCacheBytes`, the host's handle on the kept segment cache (AE#1095). |
 | `AetherEngine+Prewarm.swift` | `prewarmDualLayerDolbyVision()` (compiles the FEL composer's shaders ahead of time) and `prewarm(url:...)`, the source warm (#551). |
 | `AetherEngine+Upscale.swift` | #846: the load's side of the upscale stage. Reads probe, display and device once per load; publishes the stage's status. |
+| `AetherEngine+InverseTelecine.swift` | #853: the load's inverse telecine decision, taken before the display criteria; a rebuild reuses its session's decision. |
 | `AetherEngine+VideoProcessing.swift` | #957: the load's side of the picture processing (`LoadOptions.videoProcessing`). Reads the probe's stream once per load; publishes the stage's status and latches its disable. |
 | `AetherEngine+Recording.swift` | `startRecording(to:)` / stop: records the playing live stream from the connection the session already holds (AE#560). |
 | `PlaybackErrorInfo.swift` | `PlaybackErrorKind` (stable string tokens, #376) and `PlaybackErrorInfo` behind a published `PlaybackState.error`. |
@@ -102,6 +104,7 @@ Notes:
 | `AudioBridge.swift` | Native path: decode and re-encode per `AudioBridgeMode` (EAC3 5.1 default, or lossless FLAC opt-in) for source codecs that cannot stream-copy into fMP4. |
 | `AudioClockAnchor.swift` | Software path: sample-count PTS anchor so consecutive buffers line up exactly; re-anchors on >100 ms drift (AVSampleBufferAudioRenderer crackle, #89). |
 | `AudioDecoder.swift` | Software path: libavcodec → PCM → `CMSampleBuffer`, with channel-layout tagging that names the resampler's own order (#401). |
+| `AudioDecoderOptions.swift` | How every audible FFmpeg audio decoder opens: AC-3 and E-AC-3 without the stream's dynamic range compression (`drc_scale` 0), as Apple's decoder plays them. |
 | `AudioOutput.swift` | Software path: `AVSampleBufferAudioRenderer` + synchronizer (master clock). |
 | `AudioPlaybackHost.swift` | Audio-only path: FFmpeg demux and decode into `AVSampleBufferAudioRenderer` for codecs off the whitelist. |
 | `AudioTailPadding.swift` | Native path: writes silence in the delivered codec from where a title's audio ends to where its video ends, into the final segment at end of file, because AVPlayer ends an item when its audio runs out (AE#847). |
@@ -192,10 +195,11 @@ Notes:
 | `OrderedDelivery.swift` | Software FEL path (`DualLayerDolbyVision` trait): hands composed frames from the Metal completion queue to the renderer in decode order, with an epoch for seeks and a stall guard (#702). |
 | `CCDataParser.swift` | Parses the bare cc_data triplet stream from a demuxable CEA-608 caption track (#77). |
 | `CEA608Decoder.swift` | In-house CEA-608 line-21 decoder (field 1 / CC1), checked against FFmpeg `ccaption_dec.c` (#77). |
-| `DeinterlaceFilter.swift` | Software path: persistent bwdif / yadif libavfilter graph; engages on the first interlaced frame. |
+| `DeinterlaceFilter.swift` | Software path: persistent bwdif / yadif libavfilter graph; engages on the first interlaced frame. Under inverse telecine `fieldmatch` and `decimate` run around it (#853). |
 | `FFmpegDecoderContext.swift` | The one libavcodec decoder-context open (allocate, copy codecpar, configure, `max_pixels`, open, free on failure) behind the video, probe and subtitle decoders (audit DEC-R202). |
 | `EmbeddedSubtitleDecoder.swift` | Inline subtitle decode from demuxed packets. Opens DVB teletext with libzvbi_teletextdec text-format options (#107). |
 | `InterlaceProbe.swift` | Decodes a sample and applies the deinterlacer's own engagement test, so a declared field order that no frame backs up (PsF) stops costing a software decode (#232). |
+| `TelecineCadenceProbe.swift` | The load-time inverse telecine sample (#853): which sources are sampled, the `fieldmatch` + `idet` sampler, the film / video decision over its samples, and the frame, packet and wall-clock budgets. |
 | `ParserInit.swift` | `parserInit(_:)`: calls `av_parser_init` with whichever parameter type the linked libavcodec declares (`int` in FFmpeg 8, `enum AVCodecID` from FFmpeg 9). |
 | `VideoRoutingPolicy.swift` | Pure dispatch rule by codec and field order. See note. |
 | `HardwareVideoDecoder.swift` | Software path: VideoToolbox hardware decoder (HEVC, VP9, AV1 Dolby Vision) for sources routed away from AVPlayer. |
@@ -442,6 +446,7 @@ On-demand MPEG-DASH (AE#859): one static Period, each representation a single `S
 | `SoftwarePacketCacheTiming.swift` | A separate presentation axis for packets whose PTS the AVI MPEG-4 repair withholds, qualified against the decoder's own frames. |
 | `SoftwareReadAdmission.swift` | Read generations: packets, EOF and errors of a superseded seek or stop are rejected. |
 | `SoftwareEndOfMediaClock.swift` | AE#374: stops the software master clock at end of media so `currentTime` does not walk past `duration`. |
+| `LiveAudioSelection.swift` | AE#1100: the audio track the software live feeder plays, swapped in place by an audio pick; also which other tracks the reader stores in the ring. |
 | `SoftwareLiveJoinPolicy.swift` | Where a software live session starts playing once the connect burst has landed, and the holdback behind the edge. |
 | `DirectLiveAudioReadAhead.swift` | Software live without a DVR feeder: a forward-only read-ahead on the one existing source connection. |
 | `SoftwareStillExtractor.swift` | #544: decodes one still from the software live path's packet window with a real `SoftwareVideoDecoder`. |

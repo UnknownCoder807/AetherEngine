@@ -348,8 +348,9 @@ public struct DisplayCapabilities: Sendable, Equatable {
 /// interlaced H.264, which routes software because AVPlayer does not deinterlace, #107 /
 /// `VideoRoutingPolicy`).
 public enum DeinterlaceMode: String, Sendable, Equatable {
-    /// yadif_videotoolbox (Metal compute over VideoToolbox frames) when the linked FFmpeg build
-    /// ships it AND a Metal device exists at runtime; otherwise falls back to software bwdif.
+    /// A Metal deinterlacer over VideoToolbox frames when the linked FFmpeg build ships one AND a
+    /// Metal device exists at runtime: bwdif_videotoolbox, the software path's algorithm on the
+    /// GPU (AE#1102), else yadif_videotoolbox. Otherwise falls back to software bwdif.
     /// The hardware path also skips the sws_scale copy: the filter sink emits IOSurface-backed
     /// CVPixelBuffers that go straight to the renderer.
     case auto
@@ -366,6 +367,25 @@ public enum DeinterlaceFieldRate: String, Sendable, Equatable {
     case field
     /// One output frame per FRAME (25i -> 25p): halves filter output, matches the sw path.
     case frame
+}
+
+/// Inverse telecine on the software-decode path (#853): film that was put on NTSC video with 3:2
+/// pulldown baked into the pictures (hard telecine, the usual NTSC DVD of a film-shot series) has
+/// its fields matched back into the original film frames, the repeated frame of each five dropped,
+/// and the display asked for 23.976 Hz, instead of being deinterlaced. Residual combed frames
+/// (titles and credits made at video rate) still go through the deinterlacer `DeinterlaceMode`
+/// picks.
+public enum InverseTelecineMode: String, Sendable, Equatable {
+    /// A load-time sample decides (VOD, SD NTSC-rate interlaced MPEG-2 only). A sample that is not
+    /// clearly film keeps the deinterlacer, so true interlaced video plays as before.
+    case auto
+    /// Never: interlaced sources are deinterlaced, as before #853.
+    case off
+    /// Always, without the sample, on any interlaced NTSC-rate (29.97 / 30 fps) source of a codec
+    /// that has no native route (MPEG-2, VC-1, MPEG-4 Part 2, not H.264 / HEVC / AV1), so the
+    /// display rate it asks for always meets the graph. On true interlaced video it drops one frame
+    /// in five.
+    case force
 }
 
 /// Live-join latency profile for loopback live sessions (`LoadOptions.liveJoinProfile`, AetherEngine#195).
@@ -425,6 +445,16 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// A Profile 5 or AV1 Profile 10.0 whose VUI says nothing carries IPT-PQ-c2 and has no base layer to
     /// present, so it keeps its Dolby Vision route and the engine says so in the log.
     case baseLayerOnly
+}
+
+/// What an untagged video stream is shown as. See `LoadOptions.untaggedVideoColor` (AE#1103).
+public enum UntaggedVideoColor: Sendable, Equatable {
+    /// The engine's own reading. An untagged stream is SDR and is presented as BT.709 (AE#654).
+    case standard
+    /// HDR10, which is BT.2020 primaries, PQ transfer (SMPTE ST 2084) and the BT.2020 non-constant-luminance matrix.
+    case hdr10
+    /// HLG, which is BT.2020 primaries, HLG transfer (ARIB STD-B67) and the BT.2020 non-constant-luminance matrix.
+    case hlg
 }
 
 public struct LoadOptions: Sendable, Equatable {
@@ -519,6 +549,25 @@ public struct LoadOptions: Sendable, Equatable {
     /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
     /// contradicts.
     public var dolbyVisionHandling: DolbyVisionHandling
+
+    /// What to show a video stream as when it carries no colour description at all (AE#1103). Some
+    /// IPTV and re-encoded files are HDR10 with every tag stripped (no VUI colour, no HDR SEI, no
+    /// container colour). The engine cannot tell such a stream from SDR and plays it as BT.709 (AE#654),
+    /// so the picture looks pale. A host that knows better (its own frame check, a per-title switch)
+    /// sets `.hdr10` or `.hlg` here.
+    ///
+    /// It applies only when the stream is at least 10 bit, declares none of primaries, transfer and
+    /// matrix (neither in the bitstream nor in the container) and is not Dolby Vision. A stream that
+    /// declares anything keeps what it declares, so the option is safe to set for a whole library.
+    /// The range stays as declared and is limited where the stream says nothing. When it applies, the
+    /// whole session follows, which means the route, the display criteria, the `colr` box of the
+    /// native stream, the software path's frame tags and `probe(url:options:)`. The log says when it
+    /// was used.
+    ///
+    /// A tuning field, correctable on the playing session through `reloadAtCurrentPosition(applying:)`
+    /// on a URL source. A custom `IOReader` source refuses the change with
+    /// `SessionReloadRefusal.untaggedVideoColorNeedsFreshLoad`. Default `.standard`.
+    public var untaggedVideoColor: UntaggedVideoColor = .standard
 
     /// Opt in to full dual-layer Dolby Vision decoding of Profile 7 FEL streams, composed on the GPU, instead of
     /// the native route (the single-layer Profile 8.1 conversion, or the HDR10 base layer). When true, `dolbyVisionHandling` is `.automatic`, the stream's
@@ -1218,6 +1267,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// rate). See `DeinterlaceFieldRate`.
     public var deinterlaceFieldRate: DeinterlaceFieldRate = .field
 
+    /// Inverse telecine for hard-telecined film on the software path (#853): `.auto` (default)
+    /// decides from a load-time sample, `.off` always deinterlaces, `.force` always matches fields.
+    /// While it runs the output is 23.976 fps whatever `deinterlaceFieldRate` says. See
+    /// `InverseTelecineMode`.
+    public var inverseTelecine: InverseTelecineMode = .auto
+
     /// AE#461: which decode path this session runs on when the host needs to overrule the engine's
     /// own routing. `.automatic` (default) leaves the routing alone. `.software` serves the source
     /// through `SoftwarePlaybackHost` (libavcodec / dav1d) whatever the routing concluded, scoped to
@@ -1281,6 +1336,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// so every rebuild of a rerouted session keeps the declaration.
     var hlsPlaylistProvenByBody: Bool = false
 
+    /// ENGINE-INTERNAL: the inverse telecine decision (#853) of the session a session-preserving reload
+    /// (`reloadAtCurrentPosition`) rebuilds. Not settable from the public initializer. When present the
+    /// load takes it instead of sampling again, so a rebuild never pays the sample twice and never moves
+    /// the display rate the first load chose. Consumed by the load; never persisted.
+    var inverseTelecineCarryover: Bool? = nil
+
     public init(
         omitCriteriaColorExtensions: Bool = false,
         suppressDisplayCriteria: Bool = false,
@@ -1290,6 +1351,7 @@ public struct LoadOptions: Sendable, Equatable {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         preferHDR10PlusOverForcedDolbyVision: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        untaggedVideoColor: UntaggedVideoColor = .standard,
         preferDualLayerDolbyVision: Bool = false,
         dualLayerRoute: DualLayerRoute = .softwareHost,
         foldsDolbyVisionFEL: Bool = true,
@@ -1351,6 +1413,7 @@ public struct LoadOptions: Sendable, Equatable {
         normalizationGainDB: Double? = nil,
         deinterlaceMode: DeinterlaceMode = .auto,
         deinterlaceFieldRate: DeinterlaceFieldRate = .field,
+        inverseTelecine: InverseTelecineMode = .auto,
         preferredDecodePath: DecodePath = .automatic,
         escalatesToSoftwarePath: Bool = true,
         sharedOutputRole: SharedOutputRole = .primary,
@@ -1366,6 +1429,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
         self.preferHDR10PlusOverForcedDolbyVision = preferHDR10PlusOverForcedDolbyVision
         self.dolbyVisionHandling = dolbyVisionHandling
+        self.untaggedVideoColor = untaggedVideoColor
         self.preferDualLayerDolbyVision = preferDualLayerDolbyVision
         self.dualLayerRoute = dualLayerRoute
         self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
@@ -1428,6 +1492,7 @@ public struct LoadOptions: Sendable, Equatable {
             $0.isFinite ? NormalizationGainProcessor.clampedGainDB($0) : nil }
         self.deinterlaceMode = deinterlaceMode
         self.deinterlaceFieldRate = deinterlaceFieldRate
+        self.inverseTelecine = inverseTelecine
         self.preferredDecodePath = preferredDecodePath
         self.escalatesToSoftwarePath = escalatesToSoftwarePath
         self.sharedOutputRole = sharedOutputRole

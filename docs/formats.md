@@ -327,9 +327,26 @@ This covers H.264 that carries both stereo views inside one track. That is how a
 
 ### Deinterlacing
 
-Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent filter graph. By default it runs on the GPU (`yadif_videotoolbox`, a Metal kernel, at field rate), with CPU bwdif (yadif on older builds) as the fallback. It engages on the first interlaced frame and costs nothing on progressive content.
+Interlaced sources (DVD-rip MPEG-2, SD / HD broadcast H.264) are deinterlaced through a persistent filter graph. By default it runs on the GPU at field rate, with CPU bwdif (yadif on older builds) as the fallback. It engages on the first interlaced frame and costs nothing on progressive content.
+
+The GPU filter is `bwdif_videotoolbox`, a Metal port of bwdif from FFmpegBuild, so the GPU path and the CPU fallback deinterlace with the same algorithm (AE#1102). Given the same frames, the GPU filter's output equals CPU bwdif's sample for sample. The two paths still differ in cadence (the GPU runs at field rate by default, the CPU at frame rate) and the GPU path converts to 4:2:0 first.
+
+When the linked FFmpegBuild has no `bwdif_videotoolbox`, or its graph fails to build, the engine uses FFmpeg's `yadif_videotoolbox` instead. A GPU graph that errors while it runs falls back to the CPU. `$sourceVideoStreamFormat`'s `deinterlace.filter` names the one that runs.
 
 `AetherEngine.load` decides the route (`VideoRoutingPolicy`), per source, from `VTCapabilityProbe`, the codec id, the declared field order, and on VOD the decode sample that verifies it.
+
+#### Inverse telecine
+
+Film put on NTSC video with its 3:2 pulldown baked into the pictures (hard telecine, the usual NTSC DVD of a film-shot series) gets its film frames back instead of being deinterlaced (#853). `fieldmatch` pairs each frame's fields with their matching ones, `decimate` drops the repeated frame of each five, and the display is asked for 23.976 Hz. The deinterlacer still runs, but only on the frames `fieldmatch` could not match: titles and credits made at video rate.
+
+- **Which sources.** `LoadOptions.inverseTelecine = .auto`, the default, samples a VOD, seekable, 29.97 / 30 fps MPEG-2 source of 576 lines or fewer whose frames decode interlaced. Soft telecine (the decoder repeats fields) already decodes to film frames and is left alone. Live, HD, PAL (25 fps, 2:2 pulldown) and other codecs keep the deinterlacer.
+- **`.force` and `.off`.** `.force` matches fields without the sample on any NTSC-rate interlaced source of a codec that always decodes on the software path; on true interlaced video it loses one frame in five. `.off` never matches fields.
+- **The sample.** Before the display criteria are written, the load decodes from its start position through `fieldmatch` and `idet`. It decides film when, over the last 60 decided frames, at least 90% read progressive after matching and the repeated frame of each five keeps one phase in at least 15% of the cycle pairs (four at least). The repeat is judged by the worst 16x16 block, so video made from film by motion interpolation is not mistaken for it. It decides video early after 20 cycles in which every frame moved, with at most one such repeat. The sample stops at 300 frames, 3000 packets or 2 s, then rewinds. Anything short of film keeps the deinterlacer. Measurements: [measurements › Inverse telecine](measurements.md#inverse-telecine-853).
+- **The session keeps it.** Seeks, audio-track switches, `reloadAtCurrentPosition` and the return from background keep the first load's decision and display rate. A changed `inverseTelecine` takes effect at the next load.
+- **A disc title switch decides again.** Another title is another stream, so the new title is sampled like a fresh load, on a URL source and on a custom source (an ISO through a reader) alike. On a custom source the display keeps the rate the first title asked for, so a title that decides differently (a video-shot extra after a film episode) plays on that rate.
+- **Only when the graph can run.** The load decides film only when the linked FFmpeg has `fieldmatch` and `decimate` and the stream states its frame rate, because the decision also sets the display rate. An `audioOnly` load is never sampled.
+- **The output.** 23.976 fps on a 1001/24000 timeline that starts again at every seek or timestamp gap, at frame rate whatever `deinterlaceFieldRate` says. Scrub stills keep the plain deinterlacer.
+- `decodedVideoFormat?.deinterlace?.inverseTelecine` tells a host it runs ([api › Stream and decoded format](api.md#stream-and-decoded-format)).
 
 `$sourceVideoScan` tells a host whether the source is progressive or interlaced, from the same evidence (AE#983, [api › Scan type](api.md#scan-type)).
 
@@ -405,8 +422,11 @@ An explicit decode-path choice and disabled escalation are honored; the load the
 | HEVC Main10 (HLG) | BT.2020 / HLG |
 | HEVC / H.264 with a BT.2020 SDR VUI and an alternative-transfer SEI naming HLG | BT.2020 / HLG (AE#839) |
 | AV1 HDR | BT.2020 / PQ |
+| 10-bit stream with no colour description, `untaggedVideoColor = .hdr10` / `.hlg` | BT.2020 / PQ or BT.2020 / HLG (AE#1103). Without the option it is SDR, BT.709 |
 
 Broadcast HLG (BBC iPlayer, UK DVB-T2 UHD) names HLG only in the `alternative_transfer_characteristics` SEI. Its VUI keeps a backward-compatible transfer (BT.709, BT.2020 10 or 12 bit, or unspecified) over BT.2020 primaries, so an SDR set still shows a picture. The demuxer reads the first video packets (at most 8) for that SEI. When it names HLG, the stream is marked HLG for every later reader: format detection, display criteria, `VIDEO-RANGE`, the muxer's `colr` and `probe(url:)` (AE#839).
+
+A stream with no colour description at all cannot be told from SDR, so it plays as BT.709 (AE#654). A host that knows such a stream is HDR sets `LoadOptions.untaggedVideoColor` (AE#1103). The demuxer then marks the stream the same way as the HLG case above, so every later reader agrees. It only touches a stream of at least 10 bit that declares none of primaries, transfer and matrix and is not Dolby Vision. Details: [api › `untaggedVideoColor`](api.md#untaggedvideocolor).
 
 By default AetherEngine does not tone-map (convert HDR to SDR, or to a dimmer display) on the host. It tells the system "this is BT.2020 PQ" (or DV, or HLG) through the HLS-fMP4 sample description. AVPlayer and the system compositor then map HDR to SDR as the connected display needs. tvOS / iOS pick the right path.
 
@@ -777,6 +797,8 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 - **Why `dialoguenhance`.** It beat a mid/side lift, measured on a mix of centred speech and wide music: at +6 dB the mid/side lift gained 2.0 dB against the wide music, `dialoguenhance` 5.1 to 7.2 dB. Neither separates speech from music mixed to the centre itself (0 to 1.2 dB); no stereo method can.
 - A mono source is left alone.
 
+**The decoder does not compress.** AC-3 and E-AC-3 reach this graph with their full dynamics. The engine opens FFmpeg's Dolby decoders with `drc_scale` 0, as Apple's decoder plays them on the native path. Night mode below is the one place dynamics get compressed. See [architecture-software.md › Audio on the software host](architecture-software.md#audio-on-the-software-host).
+
 **Night mode (`compressor`).** libavfilter's `acompressor`, peak detection, one gain for all channels so the image does not move. The `night` preset compresses everything above -30 dBFS 4:1 and adds 10 dB. Measured on a steady 1 kHz tone: 0 dBFS in comes out at -12.2 dBFS, -20 at -17.2, -40 at -30.0.
 
 **Plain gain.** A compressor with `ratio: 1` compresses nothing, so `AudioShaping(compressor: .init(thresholdDB: 0, ratio: 1, makeupGainDB: g))` is a plain gain of `g` dB (up to 24) into the limiter. This is a supported use. Measured on a steady 997 Hz tone: -20 dBFS at +6 dB comes out at -14.0 dBFS, 0 dBFS at +12 dB stays at the -1 dBFS ceiling. A fixed gain is the same for every film; the loudness target below adapts it per film.
@@ -950,6 +972,8 @@ The object presentation is decoded without matrix interpolation. LibTrueHD 3.2.0
 - `R` is the elements' gains into the layout.
 
 So each output takes from the bed exactly the part of it that belongs to the elements the layout places there. No element is reconstructed from the bed or mixed into an output.
+
+**Cost.** Each hop runs through Accelerate. Per band, the statistics are one matrix product of the spectra with the conjugated bed, and the weights are interpolated across the bins with `vDSP_vlint`. On an M1, 16 elements into 9.1.6 take about 53 ms of CPU per second of audio, and about 90 ms in a host's Debug build, which compiles the package without optimisation. With the earlier per-bin Swift loops a Debug build took 5.8 s per second of audio and stalled playback (AE#1106). Numbers: [measurements.md › Bed regression in a Debug build](measurements.md#bed-regression-in-a-debug-build-ae1106).
 
 **Energy bound.** Per band the output carries 0.9 to 1.6 times the bed's energy (a constant-power layout over Dolby's 7.1, whose objects measure 0.7 to 1.0 in power, lands inside). An element the decode got wrong can misplace energy but not add or remove it, and the output cannot click. The LFE is the bed's own.
 

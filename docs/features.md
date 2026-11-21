@@ -40,7 +40,8 @@ The engine sends a format to hardware when the platform can decode it, and to it
 - Software is the default route. Only HEVC, H.264 and hardware-decodable AV1 go native.
 - H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext go to software where VideoToolbox has no hardware decoder for them (Intel Macs, older chips).
 - **Interlaced H.264** goes to software, because AVPlayer does not deinterlace. On VOD (on-demand files, not live) the engine checks the declared field order against decoded frames. Progressive video that is only packed as interlaced therefore keeps hardware decode. While the host reports an AirPlay receiver that shows video, it plays natively instead, so the TV gets the picture (AE#1070).
-- **Deinterlacing** runs on the GPU (yadif_videotoolbox, Metal, field rate by default), with a CPU bwdif fallback.
+- **Deinterlacing** runs on the GPU (bwdif_videotoolbox, Metal, field rate by default; yadif_videotoolbox on older FFmpegBuilds), with a CPU bwdif fallback that runs the same algorithm.
+- **Inverse telecine** for hard-telecined NTSC film (the usual DVD of a film-shot series): a load-time sample finds the 3:2 pulldown, the fields are matched back into 23.976 fps film frames and the display is asked for 23.976 Hz, instead of deinterlacing (#853). See [formats › Inverse telecine](formats.md#inverse-telecine).
 - **Upscaling (opt-in):** `LoadOptions.upscalesLowResolutionVideo` scales SDR video below 1080p up to the display. It uses VideoToolbox super resolution, then MetalFX, and needs OS 26. HDR, Dolby Vision and AirPlay keep their usual route, and the upscaling stage never stops playback. For animation, `upscaleScaler = .lineArt` runs a line-art network instead, which also takes 1080p. See [api.md › upscalesLowResolutionVideo](api.md#upscaleslowresolutionvideo).
 - **Tone mapping (opt-in):** `LoadOptions.videoProcessing` maps an HDR10 title whose declared peak is above `targetPeakNits` down to that peak (BT.2390), and the frame tells the display the target, so it does not map a second time. It plays the title on the software path and needs OS 26. Dolby Vision, HDR10+, HLG and SDR keep their usual route. See [api.md › videoProcessing](api.md#videoprocessing).
 - **3D on visionOS:** an MV-HEVC second view and side-by-side or over-under frame packing (HEVC) play in stereo (`LoadOptions.stereoPresentation`). Other platforms play 2D. See [api.md › stereoPresentation](api.md#stereopresentation).
@@ -154,6 +155,7 @@ How to use all of this: [guide.md › Live TV and DVR](guide.md#live-tv-and-dvr)
 **Streaming.**
 
 - One long-lived forward-streaming connection, reconnected when it drops. It rides out CDN stutter.
+- A reconnect that brings back only a few bytes is not counted as progress. A live source that answers every request with a short notice ("Channel starting.") gets five requests over about 15 s, then the open fails, instead of being asked again hundreds of times a second.
 - Optional open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`): how much the engine reads to analyse a file before playing. A smaller budget cuts first-frame latency on sparse remote remuxes.
 - Configurable forward buffer (`LoadOptions.forwardBufferSegments`): from the 40 s default up to an opt-in whole-source pre-buffer. That pre-buffer is bounded in bytes by the session's disk budget, not in segments.
 

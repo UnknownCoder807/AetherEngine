@@ -47,6 +47,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// backing off included) without a rebuild. Nil for every reader opened outside a session (a probe,
     /// a sidecar, a still), which keep the headers they were opened with.
     private let requestHeaderStore: RequestHeaderStore?
+    /// AE#1100: asked for the URL of each live reconnect, so an origin that replays a session opened
+    /// twice on one URL (HDHomeRun's `SessionID`) is joined at live again. Nil: reconnect as before.
+    private let liveReopenURL: (@Sendable (URL) -> URL?)?
     private var extraHeaders: [String: String] { requestHeaderStore?.current ?? openedHeaders }
     /// #450: connections the BOUNDED pool may hold to one host. A throttle, and it is allowed to be
     /// one: every request on that pool ends (a 4 MB detour block, a size probe, the tail prefetch),
@@ -220,6 +223,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// refusing, which is the reading that puts metering back on the table. Two different causes,
     /// two different fixes, one log line to tell them apart.
     private var _droppedResolvedURL: URL?
+
+    /// The URL a persistent connection opens: the host's fresh one for a live reconnect when it
+    /// gave one (AE#1100), otherwise the pinned or loaded URL.
+    private func connectionURL(generation: Int) -> URL {
+        guard isLive, generation > 1, let provider = liveReopenURL, let fresh = provider(url) else {
+            return requestURL()
+        }
+        EngineLog.emit("[AVIOReader] \(label) AE#1100 live reconnect gen=\(generation) on the URL the host handed over",
+                       category: .demux)
+        return fresh
+    }
 
     private func requestURL() -> URL {
         resolvedURLLock.lock()
@@ -1424,7 +1438,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#927: grows a controlled probe's sequential ranges. Demux thread only, like `position`.
     private var probeRangeGrowth: ProbeRangeGrowth?
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false, liveReopenURL: (@Sendable (URL) -> URL?)? = nil) {
         self.diagnosticContext = diagnosticContext
         self.routesDiscMediaType = routesDiscMediaType
         self.sourceOpenPolicy = sourceOpenPolicy
@@ -1438,6 +1452,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.label = label
         self.openedHeaders = extraHeaders
         self.requestHeaderStore = requestHeaderStore
+        self.liveReopenURL = liveReopenURL
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
@@ -2725,8 +2740,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // `.reconnecting`, bounded give-up. Planned ends stay here — a completed range
             // (connEndedAtRangeEnd) and a hard-cap end delivered their bytes, and any
             // generation that delivered at least one byte keeps the fast path.
-            let endedInError = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
-                && !connFirstDataSeen
+            //
+            // Except on live, where nothing ends a connection on plan: a live generation that
+            // ended within `liveTextNoticeMaxBytes` is charged like an error end. A channel still
+            // spinning up answered every request 200 with "Channel starting.\n" as TS (no AE#925
+            // suspect), and each 18 B answer took this branch: 46,000 requests in 40 s on
+            // loopback (StreamX, 4,330 in 19 s in the field). A live source that ends its
+            // connections after real data, even a low-bitrate one closing every few hundred KB,
+            // still reconnects here, unpaced and off the books.
+            let endedUnplanned = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
+            let endedInError = endedUnplanned
+                && (!connFirstDataSeen || (isLive && genDeliveredBytes <= Self.liveTextNoticeMaxBytes))
             if activeTransfer == nil, !connEndedByBackpressure, !windowCanServe, !endedInError {
                 let target = position
                 winCond.unlock()
@@ -2852,7 +2876,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // storm held streak=1 across 4 MB of served reads, and the bounded give-up and the
                 // re-resolve rung were both unreachable until the window hit empty).
                 if connFirstDataSeen {
-                    unproductiveReconnects = 0      // real progress
+                    // On live a generation's first bytes are not progress yet: a source answering
+                    // every request with 18 B cleared the streak on each serve and was retried at
+                    // backoff zero forever. `recordReconnectAndShouldGiveUp` resets it once a
+                    // reconnect has really delivered.
+                    if !isLive || genDeliveredBytes > Self.liveTextNoticeMaxBytes {
+                        unproductiveReconnects = 0  // real progress
+                    }
                     rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
                     credentialRefusalStreak = 0     // and the credential one (#792)
                     rateLimitStreakStartedAt = nil
@@ -3083,9 +3113,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if now == 0 && isHardError {
             return unproductiveReconnects > 1
         }
-        // Dead-on-arrival sources (never produced data) get a reduced budget;
-        // sources that ever produced data keep the full budget for mid-stream resilience.
-        let cap = now == 0
+        // Dead-on-arrival sources get a reduced budget; sources that ever produced data keep the
+        // full budget for mid-stream resilience. A few bytes are not data: a channel answering
+        // "Channel starting.\n" to every request had delivered something, and got the full twelve.
+        let cap = now < Self.minReconnectProgress
             ? Self.reconnectMaxUnproductiveNeverProductive
             : Self.reconnectMaxUnproductive
         return unproductiveReconnects > cap
@@ -4220,7 +4251,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         if isClosed { return }
 
-        var request = URLRequest(engineURL: requestURL())
+        var request = URLRequest(engineURL: connectionURL(generation: generation))
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
         // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
         // carries the total size, so fileSize resolution (issue #70) is unaffected.

@@ -1688,6 +1688,9 @@ public final class AetherEngine: ObservableObject {
     /// AE#973: runs on a software host that has loaded and not yet started its loops. A paused mount
     /// starts them for the first frame, so a hook installed after `load` returns can miss it.
     var softwareHostLoadedForTesting: (@MainActor (SoftwarePlaybackHost) -> Void)?
+    /// AE#1099: runs where a renderer path asks for its audio session, on every platform, so the order
+    /// against the software host build and the play gate is observable without a session.
+    var rendererAudioActivationForTesting: (@MainActor () -> Void)?
     /// AE#628: lets a test drive the drain tick with a real decoder but no playback session.
     var subtitleDrainDecoderFactoryForTesting: ((Int32) -> EmbeddedSubtitleDecoder?)?
     #endif
@@ -2831,6 +2834,10 @@ public final class AetherEngine: ObservableObject {
     /// would be lost at the next audio-track switch or background return.
     func setLoadedAudioDelay(_ seconds: Double) { loadedOptions.audioDelaySeconds = seconds }
 
+    /// #853: the narrow write for a correction of `inverseTelecine`. The session keeps its own decision;
+    /// the loads the engine later builds from these options (a title switch, the ingest reroute) take this.
+    func setLoadedInverseTelecine(_ mode: InverseTelecineMode) { loadedOptions.inverseTelecine = mode }
+
     /// AE#923: the narrow write for `setAudioShaping`, for the same reason as the delay above.
     func setLoadedAudioShaping(_ shaping: AudioShaping) { loadedOptions.audioShaping = shaping }
 
@@ -2934,6 +2941,14 @@ public final class AetherEngine: ObservableObject {
     var lastDetectedVideoCodec: AVCodecID = AV_CODEC_ID_NONE
     /// Preserved through same-source reloads; cleared when the session stops.
     var lastRequiresDeinterlaceWarmup = false
+    /// #853: whether this session runs inverse telecine. Preserved through same-source reloads (the load
+    /// that decided it also chose the display rate); cleared when the session stops.
+    var lastInverseTelecine = false
+    /// #853: the last load's cadence sample; nil when no sample ran (not a candidate, `.force`, a rebuild).
+    var lastInverseTelecineVerdict: TelecineCadenceProbe.Verdict?
+    /// #853: the refresh rate the last load asked the display for, for tests on platforms where the
+    /// criteria write does nothing (macOS).
+    var lastRequestedDisplayRate: Double?
     /// AE#1070: set when the declared-interlace rule decided this session's route, to whether a video
     /// receiver held the AirPlay route at that load (true: native, so the receiver gets a picture; false:
     /// the software deinterlacer). nil when interlace had no say. Cleared in stopInternal.
@@ -5030,6 +5045,9 @@ public final class AetherEngine: ObservableObject {
         // the branches that return before it); it must not persist into loadedOptions where a later
         // host-initiated reload would resurrect a stale session snapshot.
         loadedOptions.subtitleSessionCarryover = nil
+        // #853: same reason. A later load built from loadedOptions (a title switch, the ingest reroute)
+        // plays another stream and decides inverse telecine for itself.
+        loadedOptions.inverseTelecineCarryover = nil
         adoptSessionLiveness(from: options)
         state = .loading
         // AE#464 round 2: park the position THIS load is rebuilding toward before the clock that held
@@ -5562,7 +5580,14 @@ public final class AetherEngine: ObservableObject {
         ) ?? (probeOpened ? nil : audioSourceStreamIndex)
         let resolvedInitialAudio = selectedAudio ?? probedDefaultAudioIndex
         activeAudioTrackIndex = resolvedInitialAudio >= 0 ? Int(resolvedInitialAudio) : nil
-        let snappedRate = FrameRateSnap.snap(detectedRate ?? 0)
+        // #853: decided here, before the criteria, because inverse telecine changes the rate they ask for.
+        let inverseTelecine = try await decideInverseTelecine(
+            options: options, probe: probe, probeOpened: probeOpened, codecID: detectedCodecID,
+            fieldOrder: detectedFieldOrder, frameRate: detectedRate,
+            codedHeight: probedGeometry?.height ?? 0, startPosition: startPosition, generation: gen)
+        let presentationRate = Self.presentationFrameRate(source: detectedRate, inverseTelecine: inverseTelecine)
+        let snappedRate = FrameRateSnap.snap(presentationRate ?? 0)
+        lastRequestedDisplayRate = snappedRate
         EngineLog.emit("[AetherEngine] load url=\(url.absoluteString) source-format=\(detectedFormat) effective-format=\(effectiveFormat) rate=\(snappedRate.map { String(format: "%.3f", $0) } ?? "n/a")", category: .engine)
 
         // 1.5 Audio-only fast path: no display-criteria handshake, no video dispatch.
@@ -6314,7 +6339,8 @@ public final class AetherEngine: ObservableObject {
                 wirelessAirPlayRoute: wirelessAirPlayRoute,
                 demuxedAudioLive: SessionOptionCorrection.isDemuxedAudioLive(
                     isLive: options.isLive,
-                    hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil))
+                    hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil),
+                outputFrameRate: inverseTelecine ? presentationRate : nil)
         if let line = upscaleDecision.logLine {
             EngineLog.emit(line, category: .engine)
         }
@@ -6422,12 +6448,15 @@ public final class AetherEngine: ObservableObject {
                     dvrWindowSeconds: options.dvrWindowSeconds,
                     preopenedDemuxer: probeOpened ? probe : nil,
                     requiresDeinterlaceWarmup: requiresDeinterlaceWarmup,
+                    inverseTelecine: inverseTelecine,
                     autostarts: Self.loadPerformsAutostart(options),
                     generation: gen,
-                    elType: elType
+                    elType: elType,
+                    audioOutputWaitsForPlayGate: true
                 )
                 playbackBackend = .software
                 lastRequiresDeinterlaceWarmup = requiresDeinterlaceWarmup
+                lastInverseTelecine = inverseTelecine
                 // AE#550: the one thing a viewer on a receiver needs said out loud. This backend's
                 // picture cannot leave the device, so a wireless route carries the sound alone, and
                 // the report that opened this was someone hearing a film they could not see.
@@ -6457,6 +6486,7 @@ public final class AetherEngine: ObservableObject {
                 // so without this the host starts playing into a dark panel. There is no AVPlayerItem here
                 // for AVKit to read criteria from, so a host that leaves the write to AVKit expects no
                 // inbound write.
+                let playGateEntry = DispatchTime.now()
                 await awaitingDisplaySwitch(generation: gen) {
                     await displayCriteria.waitForSwitch(
                         startGrace: Self.playGateGrace(
@@ -6471,6 +6501,14 @@ public final class AetherEngine: ObservableObject {
                         isCurrent: { self.loadGeneration == gen })
                 }
                 try checkLoadCurrent(gen)
+                // AE#1099: the audio output starts here, after the panel's switch, for a playing and a
+                // paused mount alike, so a later play() finds an active session.
+                await startSoftwareAudioOutputAfterPlayGate(
+                    audioSourceStreamIndex: selectedAudio,
+                    gateHeldMs: Int((DispatchTime.now().uptimeNanoseconds
+                                     - playGateEntry.uptimeNanoseconds) / 1_000_000))
+                try checkLoadCurrent(gen)
+                followAtmosOutput()
                 // #124: a paused mount skips autostart; loadSoftware's host.$isReady settles .paused.
                 if Self.loadPerformsAutostart(options) {
                     softwareHost?.play()
@@ -6483,7 +6521,7 @@ public final class AetherEngine: ObservableObject {
                 startMemoryProbe()
                 startLiveTelemetrySampler()
                 armDisplayModeDiagnostic(gen: gen, backend: "software",
-                                         contentRate: detectedRate, requestedRate: snappedRate)
+                                         contentRate: presentationRate, requestedRate: snappedRate)
                 armPlaybackPanelProbe(gen: gen, effectiveFormat: effectiveFormat,
                                       panelPresentedHDRAtLoad: panelHDRAfterHandshake,
                                       sessionIsPlaying: Self.loadPerformsAutostart(options))
@@ -6574,6 +6612,7 @@ public final class AetherEngine: ObservableObject {
                 playbackBackend = .native
                 // Preserve source evidence for a later native-to-software recovery.
                 lastRequiresDeinterlaceWarmup = requiresDeinterlaceWarmup
+                lastInverseTelecine = false
                 activeVideoDecoder = Self.videoDecoderLabel(
                     codecID: detectedCodecID, isSoftware: false
                 )
@@ -6638,7 +6677,7 @@ public final class AetherEngine: ObservableObject {
                 startMemoryProbe()
                 startLiveTelemetrySampler()
                 armDisplayModeDiagnostic(gen: gen, backend: "native",
-                                         contentRate: detectedRate, requestedRate: snappedRate)
+                                         contentRate: presentationRate, requestedRate: snappedRate)
                 armPlaybackPanelProbe(gen: gen, effectiveFormat: effectiveFormat,
                                       panelPresentedHDRAtLoad: panelHDRAfterHandshake,
                                       sessionIsPlaying: Self.loadPerformsAutostart(options))
@@ -6820,7 +6859,8 @@ public final class AetherEngine: ObservableObject {
                 expectedGeneration: loadGeneration,
                 discTitleIDOverride: selection.discTitleID,
                 resumePlaying: loadedOptions.autoplay,
-                restoredDeinterlaceWarmupDecision: selection.requiresDeinterlaceWarmup
+                restoredDeinterlaceWarmupDecision: selection.requiresDeinterlaceWarmup,
+                restoredInverseTelecine: selection.inverseTelecine
             )
             // AE#460 follow-up: a rebuild that died leaves the session in `.error`, and this branch
             // used to return as if it had come back, so `reloadAtCurrentPosition(applying:)`
@@ -6871,7 +6911,11 @@ public final class AetherEngine: ObservableObject {
         var options = loadedOptions
         options.isLiveRejoin = options.isLive
         options.subtitleSessionCarryover = carryover
-        try await load(url: url, startPosition: resume, options: options,
+        // #853: the rebuilt session keeps the inverse telecine decision (and with it the display rate)
+        // instead of sampling again.
+        options.inverseTelecineCarryover = selection.inverseTelecine
+        try await load(url: urlForLiveReopen(of: url, site: "reload at current position"),
+                       startPosition: resume, options: options,
                        audioSourceStreamIndex: audioToRestore.map { Int32($0) }, discTitleID: titleID)
         // AE#711 follow-up: `load` autostarts from the flag it was handed; a play/pause that arrived
         // while it ran is the newer word.
@@ -8544,6 +8588,22 @@ public final class AetherEngine: ObservableObject {
     /// answers by starting the item over. Runs on the main actor.
     public var nowPlayingCommandInterceptor: (@MainActor (NowPlayingRemoteCommand) -> Bool)?
 
+    /// The URL to open when the engine opens a live URL source again inside the same session
+    /// (AE#1100). Handed the URL the session loaded; return a fresh one, or nil to reopen that URL.
+    ///
+    /// For an origin whose live URL is one-shot: an HDHomeRun tuner opened twice with the same
+    /// `SessionID` replays that session from its start instead of joining at live, so every reopen
+    /// put the viewer minutes behind. A host there returns the URL with a new `SessionID`.
+    ///
+    /// Asked before each reopen: an audio-track switch that rebuilds the session, a rebuild at the
+    /// current position (`reloadAtCurrentPosition()`, the return from the background), and each
+    /// attempt of the native route's own reconnect after the source dropped. That last one runs off
+    /// the main actor, so the closure must be quick and must not block. Not asked for a custom
+    /// source, for VOD, or for the switch the software route serves from its ring without reopening
+    /// anything (see `selectAudioTrack(index:)`). Set it before `load`; the native reconnect keeps the
+    /// value the session loaded with.
+    public var liveReopenURL: (@Sendable (_ loadedURL: URL) -> URL?)?
+
     /// Takes the shared Now-Playing surface for this engine when several engines in the process publish
     /// there (one per player window on macOS). An engine claims it on its own when it starts playing; call
     /// this when the user brings its player to the front. No effect on a route published through an
@@ -8665,6 +8725,12 @@ public final class AetherEngine: ObservableObject {
     ///
     /// Not available on a sequential origin either (AE#958): the rebuild could only reopen it at byte 0,
     /// which restarted the programme on the native route and failed the software route's reposition.
+    ///
+    /// A live session on the software route with a ring (`dvrWindowSeconds`, or the live edge cushion)
+    /// switches in place instead (AE#1100): the ring holds every audio track of the source, so the
+    /// switch keeps the position, the rewind window and the source connection, and works on a
+    /// forward-only custom source too. Every other live session rebuilds, which opens the source again
+    /// (see `liveReopenURL`).
     public func selectAudioTrack(index: Int) {
         if videoRoute == .remoteBypass {
             EngineLog.emit(
@@ -8674,9 +8740,12 @@ public final class AetherEngine: ObservableObject {
             )
             return
         }
+        // AE#1100: a switch the software host serves from its own ring never reads the source again,
+        // so the two refusals below, both about reopening it, do not apply.
+        let switchesInPlace = softwareHost?.canSwitchLiveAudioInPlace(to: Int32(index)) ?? false
         // Forward-only custom sources (incl. live HLS-ingest) can't rewind; rebuilding would re-consume a
         // drained FIFO and stall silently. Logged so a picker that does nothing is explainable.
-        if isCustomSource && !customSourceIsSeekable {
+        if !switchesInPlace, isCustomSource && !customSourceIsSeekable {
             EngineLog.emit(
                 "[AetherEngine] selectAudioTrack(\(index)) ignored: forward-only custom "
                 + "source cannot rebuild its pipeline (live ingest / demuxed-audio "
@@ -8729,6 +8798,24 @@ public final class AetherEngine: ObservableObject {
                 let selected = self.pendingAudioSelection ?? selected
                 self.pendingAudioSelection = nil
                 if self.activeAudioTrackIndex == selected { continue }
+                if let host = self.softwareHost, host.canSwitchLiveAudioInPlace(to: Int32(selected)) {
+                    let outcome = await host.switchLiveAudioInPlace(to: Int32(selected))
+                    guard !Task.isCancelled, self.audioSelectionEpoch == epoch, self.softwareHost === host else { return }
+                    switch outcome {
+                    case .switched:
+                        self.noteLiveAudioSwitchedInPlace(host: host)
+                        continue
+                    case .superseded:
+                        return
+                    case .unavailable(let reason):
+                        EngineLog.emit(
+                            "[AetherEngine] AE#1100 selectAudioTrack(\(selected)): no in-place switch (\(reason)); "
+                            + "rebuilding the session instead",
+                            category: .engine)
+                    }
+                }
+                // The in-place switch was the only way on a forward-only custom source.
+                if self.isCustomSource && !self.customSourceIsSeekable { return }
                 let beforeReload = self.loadGeneration
                 let failure = await self.reloadWithAudioOverride(
                     url: url, audioStreamIndex: Int32(selected), expectedGeneration: beforeReload,
@@ -9234,6 +9321,7 @@ public final class AetherEngine: ObservableObject {
         activeAudioDecoder = nil
         lastDetectedVideoCodec = AV_CODEC_ID_NONE
         lastRequiresDeinterlaceWarmup = false
+        lastInverseTelecine = false
         interlaceRouteReceiverAtLoad = nil
         playlistShiftSeconds = 0
         liveDisplayShiftSeconds = nil
