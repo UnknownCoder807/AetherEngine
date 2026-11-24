@@ -31,9 +31,14 @@ final class ClockOutput {
     func pause() { rate = 0 }
     func setRate(_ value: Float) { rate = value }
 }
+struct DirectLiveSource {
+    struct PacketQueue { var queuedPacketCount = 0 }
+    var packets = PacketQueue()
+}
 final class SoftwareClockHarness {
     var isLive = false
     var decoupleAudio = true
+    var directLiveSource: DirectLiveSource?
     var audioOutput: ClockOutput? = ClockOutput()
     var playing = true
     var armed = true

@@ -54,6 +54,32 @@ struct SnappierSeekClockTests {
         #expect(host.publishedBuffering.isEmpty)
     }
 
+    @Test func directLiveUsesQueueDrynessWithoutOpeningTheVODPauseArm() throws {
+        let host = SoftwareClockHarness()
+        host.isLive = true
+        host.directLiveSource = DirectLiveSource()
+        let output = try #require(host.audioOutput)
+
+        host.completeSeek()
+        #expect(output.rate == 1)
+        #expect(host.publishedBuffering.isEmpty)
+
+        host.lastEnqueuedAudioPtsSec = 100
+        host.directLiveSource?.packets.queuedPacketCount = 1
+        host.applyAudioClockAction()
+        #expect(output.rate == 1)
+
+        host.directLiveSource?.packets.queuedPacketCount = 0
+        host.applyAudioClockAction()
+        #expect(output.rate == 0)
+        #expect(host.pauseArmOpen == false)
+
+        host.lastEnqueuedAudioPtsSec = 102
+        host.applyAudioClockAction()
+        #expect(output.rate == 1)
+        #expect(host.publishedBuffering == [true, false])
+    }
+
     @Test func anotherSeekReplacesThePreviousBufferingHold() throws {
         let host = SoftwareClockHarness()
         let output = try #require(host.audioOutput)
