@@ -152,6 +152,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     var position: Int64 = 0
     private var fileSize: Int64 = -1
 
+    /// Snappier: the origin said this file is still being written (a recording in progress,
+    /// `X-Snappier-Growing: 1` on its answer). Reaching `fileSize` then waits for the file to
+    /// grow instead of ending playback, until the origin answers without the marker (the
+    /// recording finished) or the file stops growing. Read and written under winCond.
+    private var growingSource = false
+    /// The origin answered a growing file without the marker: it has finished, so the next
+    /// read at `fileSize` is the real end.
+    private var growingFinished = false
+
     /// Typed source-fetch network phase, pushed on every stall/reconnect/recovery transition (#85).
     /// Mirrors `HLSVideoEngine.onSeekStateChanged`. `@Sendable`: invoked from the demux thread, the
     /// consumer hops to the main actor. Set only on the MAIN playback reader, never the subtitle side reader.
@@ -2712,6 +2721,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // end and dropped a window the parse was still reading. Skipped for live, where the
             // length is not authoritative.
             if !isLive, fileSize > 0, position >= fileSize {
+                // Snappier: a recording still in progress. Hand back what this read has first;
+                // the next read at the end waits for the file to grow.
+                if growingSource, !growingFinished, totalRead == 0 {
+                    let knownSize = fileSize
+                    winCond.unlock()
+                    let growth = awaitGrowingSource(beyond: knownSize)
+                    winCond.lock()
+                    switch growth {
+                    case .grew(let size, let finished):
+                        if size > fileSize { fileSize = size }
+                        if finished { growingFinished = true }
+                    case .ended:
+                        growingFinished = true
+                    }
+                    winCond.unlock()
+                    continue
+                }
                 winCond.unlock()
                 return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eof
             }
@@ -4820,6 +4846,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if generation == connGeneration, !isLive, isOK, openContentType == nil {
             openContentType = http.value(forHTTPHeaderField: "Content-Type")
         }
+        // Snappier: a recording in progress says so on every answer, and its Content-Range
+        // total is the size written so far. Learn growth from every answer, and the finish
+        // from the first answer without the marker.
+        if generation == connGeneration, !isLive, isOK {
+            if Self.isGrowingAnswer(http) {
+                growingSource = true
+                if fileSize > 0, !rangeIgnoredAtOpen,
+                   let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset), total > fileSize {
+                    fileSize = total
+                }
+            } else if growingSource {
+                growingFinished = true
+            }
+        }
         if generation == connGeneration, !isLive, fileSize <= 0, !rangeIgnoredAtOpen,
            let total = Self.sizeFromResponse(http, requestedOffset: requestedOffset) {
             fileSize = total
@@ -5364,6 +5404,100 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             EngineLog.emit("[AVIOReader] Range probe (\(range)) didn't yield a size", category: .demux, level: .verbose)
         }
         return delegate.totalSize
+    }
+
+    // MARK: - Snappier: recordings in progress
+
+    /// The header Snappier Server puts on every answer for a recording still being written.
+    static let growingHeader = "X-Snappier-Growing"
+
+    static func isGrowingAnswer(_ http: HTTPURLResponse) -> Bool {
+        http.value(forHTTPHeaderField: growingHeader) == "1"
+    }
+
+    enum GrowingSourceWait: Equatable {
+        /// The file is now `size` bytes; `finished` when the origin also said it is complete.
+        case grew(size: Int64, finished: Bool)
+        /// Finished with nothing more, stopped growing, the reader closed, or a read deadline passed.
+        case ended
+    }
+
+    /// How often a read waiting at the end of a growing file asks for its size again.
+    static let growingPollSeconds: TimeInterval = 1
+    /// How long a growing file may stand still before playback ends at what there is. A
+    /// recorder writes every second or two; a minute without a byte is a stopped recording.
+    static let growingStallSeconds: TimeInterval = 60
+
+    /// Waits at the end of a recording still being written until it has more bytes, it
+    /// finishes, or it stops growing. Called by `read` with winCond NOT held. Each poll is a
+    /// one-byte closed range on the last known byte: the origin answers with the size written
+    /// so far in Content-Range, and the delegate hangs up before any body.
+    private func awaitGrowingSource(beyond knownSize: Int64) -> GrowingSourceWait {
+        let started = Date()
+        while !isClosed, !readDeadlinePassedOrAborted {
+            let probe = growingSizeProbe(lastByte: knownSize - 1)
+            // The file is gone: a finished recording the server remuxed and removed.
+            if probe.status == 404 || probe.status == 410 {
+                EngineLog.emit("[AVIOReader] \(label) growing source answered \(probe.status) at \(knownSize) bytes; ending there", category: .demux)
+                return .ended
+            }
+            if let response = probe.response {
+                let finished = !Self.isGrowingAnswer(response)
+                if let size = probe.size, size > knownSize {
+                    return .grew(size: size, finished: finished)
+                }
+                if finished {
+                    EngineLog.emit("[AVIOReader] \(label) growing source finished at \(knownSize) bytes", category: .demux)
+                    return .ended
+                }
+            }
+            if Date().timeIntervalSince(started) >= Self.growingStallSeconds {
+                EngineLog.emit("[AVIOReader] \(label) growing source stood still for \(Int(Self.growingStallSeconds))s at \(knownSize) bytes; ending there", category: .demux)
+                return .ended
+            }
+            Thread.sleep(forTimeInterval: Self.growingPollSeconds)
+        }
+        return .ended
+    }
+
+    /// One size question to a growing source: its 2xx answer and the Content-Range total, and
+    /// the status of any answer (0 when none came).
+    private func growingSizeProbe(lastByte: Int64) -> (response: HTTPURLResponse?, size: Int64?, status: Int) {
+        var request = URLRequest(engineURL: requestURL())
+        request.setValue("bytes=\(max(0, lastByte))-\(max(0, lastByte))", forHTTPHeaderField: "Range")
+        request.timeoutInterval = 10
+        applyExtraHeaders(&request)
+
+        let ticket: OriginRequestBudget.Ticket?
+        do {
+            ticket = try requestTicket(for: request.url ?? url, label: "\(label) growing size",
+                                       timeout: Self.shortFetchSlotWaitSeconds)
+        } catch {
+            return (nil, nil, 0)
+        }
+        let lease = OriginRequestBudget.Lease(ticket)
+        defer { lease.release() }
+
+        let delegate = ProbeDelegate(extraHeaders: headers(for: request.url), diagnosticContext: diagnosticContext)
+        let task = (probeRequestSession ?? Self.probeSession).dataTask(with: request)
+        task.delegate = delegate
+        let semaphore = DispatchSemaphore(value: 0)
+        delegate.onCompletion = { [weak self] response in
+            self?.noteRateLimitedResponse(response)
+            lease.release()
+            semaphore.signal()
+        }
+        task.resume()
+        if Self.awaitSignal(semaphore, budget: 10, pollInterval: 0.1,
+                            shouldAbort: { [weak self] in self?.isClosed == true }) != .signaled {
+            task.cancel()
+            finishCancelledProbeRequest(semaphore)
+            return (nil, nil, 0)
+        }
+        guard let response = delegate.response, (200...299).contains(response.statusCode) else {
+            return (nil, nil, delegate.statusCode)
+        }
+        return (response, delegate.totalSize, response.statusCode)
     }
 
     /// HEAD probe fallback for live-transcode endpoints that reject Range.
